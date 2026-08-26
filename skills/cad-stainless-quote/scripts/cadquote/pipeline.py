@@ -19,7 +19,10 @@ from .ingest import IngestLimits, IngestResult, ingest_input
 from .io import write_json_atomic
 from .linking import rank_evidence_edges
 from .materials import (
+    DEFAULT_REVIEW_CODE_FAMILIES,
+    DEFAULT_STAINLESS_CODE_FAMILIES,
     annotate_material_conflicts,
+    load_docx_material_specs,
     load_material_specs,
     normalize_text,
     parse_cad_material_specs,
@@ -27,6 +30,7 @@ from .materials import (
 from .models import (
     CadEntity,
     EvidenceEdge,
+    MaterialMention,
     MaterialSpec,
     MeasurementCandidate,
     MtOccurrence,
@@ -38,7 +42,12 @@ from .models import (
     SourceFile,
     TakeoffItem,
 )
-from .mt import detect_mt_occurrences
+from .mt import (
+    deduplicate_occurrences,
+    detect_material_mentions,
+    detect_mt_occurrences,
+    link_docx_material_mentions,
+)
 from .panels import PanelExpansion, choose_analysis_view, expand_viewport_panels
 from .pricing import apply_price, load_price_book
 from .render import render_regions
@@ -148,11 +157,17 @@ def _is_material_workbook(file: SourceFile) -> bool:
     return any(term in name for term in _MATERIAL_WORKBOOK_TERMS)
 
 
-def _load_materials(files: Sequence[SourceFile]) -> tuple[list[MaterialSpec], list[RunIssue]]:
+def _load_materials(
+    files: Sequence[SourceFile],
+    *,
+    stainless_code_families: Sequence[str] | None = None,
+    review_code_families: Sequence[str] | None = None,
+) -> tuple[list[MaterialSpec], list[RunIssue]]:
     materials: list[MaterialSpec] = []
     issues: list[RunIssue] = []
-    candidates = [file for file in files if _is_material_workbook(file)]
-    for file in candidates:
+    workbook_candidates = [file for file in files if _is_material_workbook(file)]
+    docx_candidates = [file for file in files if file.suffix == ".docx"]
+    for file in workbook_candidates:
         try:
             values = load_material_specs(file.absolute_path, source_file_id=file.id)
         except Exception as exc:
@@ -169,7 +184,46 @@ def _load_materials(files: Sequence[SourceFile]) -> tuple[list[MaterialSpec], li
             )
         else:
             materials.extend(values)
-    if not candidates:
+    recovered_docx_count = 0
+    for file in docx_candidates:
+        try:
+            values = load_docx_material_specs(
+                file.absolute_path,
+                source_file_id=file.id,
+                expected_sha256=file.sha256,
+                stainless_families=stainless_code_families,
+                review_families=review_code_families,
+            )
+        except Exception as exc:
+            issues.append(
+                _issue(
+                    "materials",
+                    Severity.WARNING,
+                    "DOCX_MATERIAL_BOOK_READ_FAILED",
+                    f"DOCX项目物料书读取失败：{type(exc).__name__}: {exc}",
+                    source_id=file.id,
+                    evidence=[file.relative_path, f"sha256:{file.sha256}"],
+                    action="确认DOCX为有效Office Open XML文件，并人工复核物料编号映射",
+                )
+            )
+        else:
+            materials.extend(values)
+            recovered_docx_count += len(values)
+    if recovered_docx_count:
+        issues.append(
+            _issue(
+                "materials",
+                Severity.INFO,
+                "DOCX_MATERIAL_SPECS_RECOVERED",
+                f"从DOCX项目物料书恢复{recovered_docx_count}条显式材料编号映射；均保持REVIEW。",
+                evidence=[
+                    material.id
+                    for material in materials
+                    if material.source_type == "docx_material_book"
+                ][:24],
+            )
+        )
+    if not workbook_candidates and not docx_candidates:
         issues.append(
             _issue(
                 "materials",
@@ -181,6 +235,42 @@ def _load_materials(files: Sequence[SourceFile]) -> tuple[list[MaterialSpec], li
         )
     unique = {material.id: material for material in materials}
     return sorted(unique.values(), key=lambda value: (value.mt_code, value.id)), issues
+
+
+def _block_docx_cross_source_conflicts(
+    materials: Sequence[MaterialSpec],
+) -> tuple[list[MaterialSpec], list[RunIssue]]:
+    """Keep DOCX/CAD or DOCX/workbook conflicts explicit and non-commercial."""
+
+    by_code: dict[str, list[MaterialSpec]] = defaultdict(list)
+    for material in materials:
+        by_code[material.mt_code].append(material)
+    blocked_codes = {
+        code
+        for code, values in by_code.items()
+        if any(value.source_type == "docx_material_book" for value in values)
+        and any(value.source_type != "docx_material_book" for value in values)
+        and any(value.conflicts for value in values)
+    }
+    if not blocked_codes:
+        return list(materials), []
+    updated = [
+        material.model_copy(update={"status": ReviewStatus.BLOCK})
+        if material.mt_code in blocked_codes
+        else material
+        for material in materials
+    ]
+    return updated, [
+        _issue(
+            "materials",
+            Severity.BLOCK,
+            "DOCX_MATERIAL_DEFINITION_CONFLICT",
+            f"DOCX物料书与其他材料证据对{code}的定义冲突；未覆盖任一来源。",
+            evidence=[value.id for value in by_code[code]],
+            action="人工核对DOCX物料书、CAD材料表和材料清单后确认唯一版本",
+        )
+        for code in sorted(blocked_codes)
+    ]
 
 
 def _selected_candidates(value: Any, *, label: str) -> dict[str, str | list[str]]:
@@ -504,6 +594,9 @@ def _build_review_pack(
     confirmations: ConfirmationBundle,
     *,
     source_files: Sequence[SourceFile] = (),
+    materials: Sequence[MaterialSpec] = (),
+    material_mentions: Sequence[MaterialMention] = (),
+    material_mention_edges: Sequence[EvidenceEdge] = (),
     issues: Sequence[RunIssue] = (),
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -513,6 +606,8 @@ def _build_review_pack(
     entity_by_id = {entity.id: entity for entity in entities}
     source_by_id = {source.id: source for source in source_files}
     occurrence_by_id = {occurrence.id: occurrence for occurrence in occurrences}
+    material_by_id = {material.id: material for material in materials}
+    mention_by_id = {mention.id: mention for mention in material_mentions}
     item_by_component = {
         item.component_id: item for item in priced_items if item.component_id is not None
     }
@@ -762,6 +857,16 @@ def _build_review_pack(
             catalog_source_ids.add(entity.source_file_id)
             if entity.sheet_id:
                 catalog_sheet_ids.add(entity.sheet_id)
+    for edge in material_mention_edges:
+        mention = mention_by_id.get(edge.source_id)
+        material = material_by_id.get(edge.target_id)
+        if mention is not None:
+            catalog_source_ids.add(mention.source_file_id)
+            catalog_entity_ids.update(mention.entity_ids)
+            if mention.sheet_id:
+                catalog_sheet_ids.add(mention.sheet_id)
+        if material is not None and material.source_file_id:
+            catalog_source_ids.add(material.source_file_id)
 
     return {
         "schema_version": "1.0",
@@ -799,8 +904,46 @@ def _build_review_pack(
             "confirmed_component_count": sum(
                 bool(value) for value in confirmations.selections.values()
             ),
+            "docx_material_count": sum(
+                value.source_type == "docx_material_book" for value in materials
+            ),
+            "material_mention_count": len(material_mentions),
+            "material_mention_match_candidate_count": len(material_mention_edges),
+            "material_mention_unique_match_count": sum(
+                edge.status == ReviewStatus.REVIEW for edge in material_mention_edges
+            ),
+            "material_mention_blocked_candidate_count": sum(
+                edge.status == ReviewStatus.BLOCK for edge in material_mention_edges
+            ),
         },
         "components": groups,
+        "material_evidence": {
+            "docx_materials": [
+                material.model_dump(mode="json")
+                for material in sorted(materials, key=lambda value: value.id)
+                if material.source_type == "docx_material_book"
+            ],
+            "unnumbered_mentions": [
+                mention.model_dump(mode="json")
+                for mention in sorted(material_mentions, key=lambda value: value.id)
+            ],
+            "mention_to_material_candidates": [
+                {
+                    **edge.model_dump(mode="json"),
+                    "source_ref": (
+                        mention_by_id[edge.source_id].model_dump(mode="json")
+                        if edge.source_id in mention_by_id
+                        else None
+                    ),
+                    "target_ref": (
+                        material_by_id[edge.target_id].model_dump(mode="json")
+                        if edge.target_id in material_by_id
+                        else None
+                    ),
+                }
+                for edge in sorted(material_mention_edges, key=lambda value: value.id)
+            ],
+        },
         "evidence_catalog": {
             "source_files": {
                 source_id: _source_ref(source_by_id[source_id])
@@ -1509,6 +1652,8 @@ def run_pipeline(
     tax_included: bool | None = None,
     ingest_limits: IngestLimits | None = None,
     render_evidence: bool = True,
+    stainless_code_families: Sequence[str] | None = None,
+    review_code_families: Sequence[str] | None = None,
 ) -> PipelineResult:
     """Run every deterministic stage and always leave a structured diagnostic trail."""
 
@@ -1522,6 +1667,14 @@ def run_pipeline(
         directory.mkdir(parents=True, exist_ok=True)
     issues: list[RunIssue] = []
     result = PipelineResult(status=ReviewStatus.BLOCK, run_dir=str(root), issues=issues)
+    stainless_families = tuple(
+        DEFAULT_STAINLESS_CODE_FAMILIES
+        if stainless_code_families is None
+        else stainless_code_families
+    )
+    review_families = tuple(
+        DEFAULT_REVIEW_CODE_FAMILIES if review_code_families is None else review_code_families
+    )
 
     ingest = ingest_input(input_path, root, limits=ingest_limits)
     write_json_atomic(root / "ingest.json", ingest.model_dump(mode="json"))
@@ -1586,10 +1739,16 @@ def run_pipeline(
     write_json_atomic(analysis_dir / "panels.json", panel_expansion.to_dict())
     sheets, entities = choose_analysis_view(bundle.sheets, bundle.entities, panel_expansion)
 
-    workbook_materials, material_issues = _load_materials(ingest.files)
+    workbook_materials, material_issues = _load_materials(
+        ingest.files,
+        stainless_code_families=stainless_families,
+        review_code_families=review_families,
+    )
     issues.extend(material_issues)
     cad_materials = parse_cad_material_specs(entities)
     materials = annotate_material_conflicts([*workbook_materials, *cad_materials])
+    materials, material_conflict_issues = _block_docx_cross_source_conflicts(materials)
+    issues.extend(material_conflict_issues)
     if cad_materials:
         issues.append(
             _issue(
@@ -1604,11 +1763,74 @@ def run_pipeline(
         analysis_dir / "materials.json",
         [material.model_dump(mode="json") for material in materials],
     )
-    occurrences = detect_mt_occurrences(entities, materials=materials)
+    explicit_occurrences = detect_mt_occurrences(
+        entities,
+        materials=(),
+        stainless_code_families=stainless_families,
+        review_code_families=review_families,
+    )
+    material_mentions = detect_material_mentions(
+        entities,
+        occurrences=explicit_occurrences,
+    )
+    material_mention_edges, docx_occurrences = link_docx_material_mentions(
+        material_mentions,
+        materials,
+        stainless_code_families=stainless_families,
+    )
+    occurrences = deduplicate_occurrences([*explicit_occurrences, *docx_occurrences])
     write_json_atomic(
         analysis_dir / "mt_occurrences.json",
         [occurrence.model_dump(mode="json") for occurrence in occurrences],
     )
+    write_json_atomic(
+        analysis_dir / "material_mentions.json",
+        [mention.model_dump(mode="json") for mention in material_mentions],
+    )
+    write_json_atomic(
+        analysis_dir / "material_mention_matches.json",
+        [edge.model_dump(mode="json") for edge in material_mention_edges],
+    )
+    if material_mentions:
+        issues.append(
+            _issue(
+                "materials",
+                Severity.INFO,
+                "UNNUMBERED_STAINLESS_MATERIAL_MENTIONS",
+                f"发现{len(material_mentions)}条无可识别材料代号的不锈钢描述；"
+                "仅保留为低置信审核候选，未伪造MT编号。",
+                evidence=[mention.id for mention in material_mentions[:24]],
+            )
+        )
+    unique_docx_mentions = {
+        edge.source_id for edge in material_mention_edges if edge.status == ReviewStatus.REVIEW
+    }
+    blocked_docx_mentions = {
+        edge.source_id for edge in material_mention_edges if edge.status == ReviewStatus.BLOCK
+    }
+    if unique_docx_mentions:
+        issues.append(
+            _issue(
+                "materials",
+                Severity.INFO,
+                "DOCX_MATERIAL_MENTION_CANDIDATES",
+                f"{len(unique_docx_mentions)}条无编号CAD描述唯一匹配DOCX材料代号；"
+                "仅建立低置信REVIEW候选，未直接确认构件或数量。",
+                evidence=sorted(unique_docx_mentions)[:24],
+            )
+        )
+    if blocked_docx_mentions:
+        issues.append(
+            _issue(
+                "materials",
+                Severity.BLOCK,
+                "DOCX_MATERIAL_MENTION_AMBIGUOUS",
+                f"{len(blocked_docx_mentions)}条CAD材料描述对应多个代号或冲突定义；"
+                "未生成带代号构件候选。",
+                evidence=sorted(blocked_docx_mentions)[:24],
+                action="在review-pack.json中核对文档材料候选并人工确认唯一代号",
+            )
+        )
     relation_edges = rank_evidence_edges(
         sheets,
         occurrences,
@@ -1643,6 +1865,7 @@ def run_pipeline(
         materials=materials,
         confirmations=confirmation_bundle.selections,
     )
+    takeoff.evidence_edges.extend(material_mention_edges)
     issues.extend(takeoff.issues)
     write_json_atomic(analysis_dir / "takeoff_draft.json", takeoff.to_dict())
     priced_items, price_issues, price_metadata = _price_items(
@@ -1668,6 +1891,9 @@ def run_pipeline(
             relation_edges,
             confirmation_bundle,
             source_files=ingest.files,
+            materials=materials,
+            material_mentions=material_mentions,
+            material_mention_edges=material_mention_edges,
             issues=issues,
             metadata={
                 "run_mode": "full",
@@ -1697,6 +1923,13 @@ def run_pipeline(
             "cad_sources": len(bundle.results),
             "virtual_panels": len(panel_expansion.sheets),
             "mt_occurrences": len(occurrences),
+            "material_mentions": len(material_mentions),
+            "docx_materials": sum(
+                material.source_type == "docx_material_book" for material in materials
+            ),
+            "material_mention_match_candidates": len(material_mention_edges),
+            "material_mention_unique_matches": len(unique_docx_mentions),
+            "material_mention_blocked_matches": len(blocked_docx_mentions),
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmed_components": sum(
                 bool(value) for value in confirmation_bundle.selections.values()
@@ -1732,6 +1965,10 @@ def run_pipeline(
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmation_source": confirmation_bundle.source_path,
             "price": price_metadata,
+            "material_code_families": {
+                "stainless": sorted(stainless_families),
+                "review": sorted(review_families),
+            },
             "counts": {
                 "source_files": len(ingest.files),
                 "cad_sources": len(bundle.results),
@@ -1739,6 +1976,13 @@ def run_pipeline(
                 "entities": len(entities),
                 "materials": len(materials),
                 "mt_occurrences": len(occurrences),
+                "material_mentions": len(material_mentions),
+                "docx_materials": sum(
+                    material.source_type == "docx_material_book" for material in materials
+                ),
+                "material_mention_match_candidates": len(material_mention_edges),
+                "material_mention_unique_matches": len(unique_docx_mentions),
+                "material_mention_blocked_matches": len(blocked_docx_mentions),
                 "components": len(takeoff.components),
                 "takeoff_items": len(priced_items),
             },
@@ -1760,6 +2004,8 @@ def run_pipeline(
         "materials": str(analysis_dir / "materials.json"),
         "panels": str(analysis_dir / "panels.json"),
         "mt_occurrences": str(analysis_dir / "mt_occurrences.json"),
+        "material_mentions": str(analysis_dir / "material_mentions.json"),
+        "material_mention_matches": str(analysis_dir / "material_mention_matches.json"),
         "relation_edges": str(analysis_dir / "relation_edges.json"),
         "takeoff": str(output_dir / "takeoff.json"),
         "evidence_graph": str(output_dir / "evidence_graph.json"),
@@ -1804,6 +2050,8 @@ def resume_pipeline(
     panels_path = analysis_dir / "panels.json"
     materials_path = analysis_dir / "materials.json"
     occurrences_path = analysis_dir / "mt_occurrences.json"
+    mentions_path = analysis_dir / "material_mentions.json"
+    mention_matches_path = analysis_dir / "material_mention_matches.json"
     edges_path = analysis_dir / "relation_edges.json"
     ingest_path = root / "ingest.json"
     required = [index_path, panels_path, materials_path, occurrences_path, edges_path, ingest_path]
@@ -1863,6 +2111,22 @@ def resume_pipeline(
         MtOccurrence.model_validate(value)
         for value in json.loads(occurrences_path.read_text(encoding="utf-8"))
     ]
+    material_mentions = (
+        [
+            MaterialMention.model_validate(value)
+            for value in json.loads(mentions_path.read_text(encoding="utf-8"))
+        ]
+        if mentions_path.is_file()
+        else []
+    )
+    material_mention_edges = (
+        [
+            EvidenceEdge.model_validate(value)
+            for value in json.loads(mention_matches_path.read_text(encoding="utf-8"))
+        ]
+        if mention_matches_path.is_file()
+        else []
+    )
     relation_edges = [
         EvidenceEdge.model_validate(value)
         for value in json.loads(edges_path.read_text(encoding="utf-8"))
@@ -1908,6 +2172,7 @@ def resume_pipeline(
         materials=materials,
         confirmations=confirmation_bundle.selections,
     )
+    takeoff.evidence_edges.extend(material_mention_edges)
     issues.extend(takeoff.issues)
     write_json_atomic(analysis_dir / "takeoff_draft.json", takeoff.to_dict())
     priced_items, price_issues, price_metadata = _price_items(
@@ -1943,8 +2208,7 @@ def resume_pipeline(
         "timestamp": resumed_at,
         "explicit_fields": sorted(explicit_price_fields),
         "inherited_fields": sorted(
-            {"price_book", "quote_date", "currency", "tax_included"}
-            - set(explicit_price_fields)
+            {"price_book", "quote_date", "currency", "tax_included"} - set(explicit_price_fields)
         ),
         "changes": pricing_changes,
         "price_book_integrity": price_integrity_audit,
@@ -1979,6 +2243,9 @@ def resume_pipeline(
             relation_edges,
             confirmation_bundle,
             source_files=ingest.files,
+            materials=materials,
+            material_mentions=material_mentions,
+            material_mention_edges=material_mention_edges,
             issues=issues,
             metadata={
                 "run_mode": "resume",
@@ -2019,6 +2286,11 @@ def resume_pipeline(
             "cad_sources": len(index_sources),
             "virtual_panels": len(panel_expansion.sheets),
             "mt_occurrences": len(occurrences),
+            "material_mentions": len(material_mentions),
+            "docx_materials": sum(
+                material.source_type == "docx_material_book" for material in materials
+            ),
+            "material_mention_match_candidates": len(material_mention_edges),
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmed_components": sum(
                 bool(value) for value in confirmation_bundle.selections.values()
@@ -2046,6 +2318,21 @@ def resume_pipeline(
         "entities": len(entities),
         "materials": len(materials),
         "mt_occurrences": len(occurrences),
+        "material_mentions": len(material_mentions),
+        "docx_materials": sum(
+            material.source_type == "docx_material_book" for material in materials
+        ),
+        "material_mention_match_candidates": len(material_mention_edges),
+        "material_mention_unique_matches": len(
+            {
+                edge.source_id
+                for edge in material_mention_edges
+                if edge.status == ReviewStatus.REVIEW
+            }
+        ),
+        "material_mention_blocked_matches": len(
+            {edge.source_id for edge in material_mention_edges if edge.status == ReviewStatus.BLOCK}
+        ),
         "components": len(takeoff.components),
         "takeoff_items": len(priced_items),
     }
@@ -2108,6 +2395,7 @@ def resume_pipeline(
             "panels": str(panels_path),
             "materials": str(materials_path),
             "mt_occurrences": str(occurrences_path),
+            "material_mention_matches": str(mention_matches_path),
             "relation_edges": str(edges_path),
             "takeoff": str(output_dir / "takeoff.json"),
             "evidence_graph": str(output_dir / "evidence_graph.json"),
@@ -2115,5 +2403,7 @@ def resume_pipeline(
             "issues": str(issues_path),
         },
     )
+    if mentions_path.is_file():
+        result.paths["material_mentions"] = str(mentions_path)
     write_json_atomic(root / "run.json", result.to_dict())
     return result

@@ -1,0 +1,74 @@
+{
+  "schema_version": "1.0",
+  "policy_version": "draft-length-quantity-pending",
+  "target_accuracy": 0.95,
+  "mt_code": {
+    "enabled": true,
+    "required_in_gold": true,
+    "normalization": "canonical"
+  },
+  "name": {
+    "enabled": true,
+    "required_in_gold": true,
+    "normalization": "canonical"
+  },
+  "material": {
+    "enabled": false,
+    "required_in_gold": false,
+    "normalization": "canonical"
+  },
+  "plan_location": {
+    "enabled": true,
+    "required_in_gold": true,
+    "normalization": "canonical"
+  },
+  "elevation": {
+    "enabled": true,
+    "required_in_gold": true,
+    "normalization": "canonical"
+  },
+  "detail": {
+    "enabled": true,
+    "required_in_gold": true,
+    "normalization": "canonical"
+  },
+  "unfolded_spec": {
+    "enabled": true,
+    "required_in_gold": true,
+    "mode": "strict",
+    "normalization": "canonical"
+  },
+  "width_mm": {
+    "enabled": false,
+    "required_in_gold": false,
+    "relative_tolerance": null,
+    "zero_handling": "exact",
+    "zero_absolute_tolerance": null
+  },
+  "length_mm": {
+    "enabled": true,
+    "required_in_gold": true,
+    "relative_tolerance": null,
+    "zero_handling": "exact",
+    "zero_absolute_tolerance": null
+  },
+  "quantity": {
+    "enabled": true,
+    "required_in_gold": true,
+    "relative_tolerance": null,
+    "zero_handling": "exact",
+    "zero_absolute_tolerance": null
+  },
+  "engineering_quantity": {
+    "enabled": true,
+    "required_in_gold": true,
+    "relative_tolerance": 0.05,
+    "zero_handling": "exact",
+    "zero_absolute_tolerance": null
+  },
+  "amount": {
+    "enabled": false,
+    "required_in_gold": false,
+    "exact": true
+  }
+}

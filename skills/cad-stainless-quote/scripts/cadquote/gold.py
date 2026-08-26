@@ -29,6 +29,7 @@ CANONICAL_FIELDS = (
     "sequence",
     "name",
     "mt_code",
+    "material_code",
     "material",
     "plan_location",
     "elevation",
@@ -70,31 +71,62 @@ _HEADER_ALIASES = {
     "编号": "sequence",
     "项次": "sequence",
     "项目名称": "name",
+    "项目": "name",
+    "材料名称": "name",
     "部位": "name",
+    "部位名称": "name",
+    "部位/名称": "name",
     "mt号": "mt_code",
     "mt编码": "mt_code",
+    "材料代号": "material_code",
+    "材料编号": "material_code",
     "材质": "material",
+    "材质表面处理": "material",
+    "材料特征描述": "material",
+    "材料表面": "material",
     "位置": "plan_location",
+    "位置图号": "plan_location",
+    "使用位置": "plan_location",
     "立面": "elevation",
     "立面编号": "elevation",
+    "立面图": "elevation",
+    "立面示意图": "elevation",
+    "图号": "elevation",
     "节点": "detail",
     "节点编号": "detail",
     "大样": "detail",
     "大样编号": "detail",
+    "大样图": "detail",
+    "节点示意图": "detail",
     "计算式附图": "unfolded_spec",
     "计算式": "unfolded_spec",
     "规格尺寸": "unfolded_spec",
+    "规格": "unfolded_spec",
+    "造型规格mm": "unfolded_spec",
     "展开宽": "width_mm",
     "展开宽度": "width_mm",
+    "宽展开尺寸": "width_mm",
+    "宽度mm": "width_mm",
     "长": "length_mm",
+    "高长": "length_mm",
+    "长度mm": "length_mm",
     "件数": "quantity",
+    "计量": "quantity",
+    "计算方式": "pricing_method",
     "计量单位": "unit",
+    "材料单价": "unit_price",
     "含税单价": "unit_price",
     "含税总价": "amount",
+    "合计": "amount",
+    "小计": "amount",
     "总价": "amount",
+    "明细备注": "note",
 }
 
-_MT_RE = re.compile(r"\bMT\s*[-_]?\s*(\d{1,3})(?:\s*[-_]\s*(\d{1,3}))?\b", re.I)
+_MT_RE = re.compile(
+    r"(?<![A-Z0-9])MT\s*[-_]?\s*(\d{1,3})(?:\s*[-_]\s*(\d{1,3}))?(?![A-Z0-9])",
+    re.I,
+)
 _NUMBER_FORMAT_DECIMALS = re.compile(r"\.([0#?]+)")
 _XLRD_CELL_TYPES = {
     xlrd.XL_CELL_EMPTY: "empty",
@@ -122,8 +154,29 @@ class GoldCellEvidence(_StrictModel):
     raw_value: Any = None
     value_repr: str
     formula: str | None = None
+    formula_kind: Literal["normal", "array"] | None = None
+    formula_range: str | None = None
     data_type: str
     number_format: str | None = None
+
+
+class GoldImageEvidence(_StrictModel):
+    """A workbook image or image-cell formula anchored to an auditable cell."""
+
+    id: str
+    sheet_name: str
+    sheet_index: int = Field(ge=0)
+    source_type: Literal["embedded", "cell_formula"]
+    category: Literal["elevation", "detail", "drawing", "rendering", "image"]
+    anchor_coordinate: str
+    anchor_row: int = Field(ge=1)
+    anchor_column: int = Field(ge=1)
+    end_coordinate: str | None = None
+    end_row: int | None = Field(default=None, ge=1)
+    end_column: int | None = Field(default=None, ge=1)
+    media_format: str | None = None
+    formula: str | None = None
+    reference_id: str | None = None
 
 
 class GoldSheetEvidence(_StrictModel):
@@ -134,6 +187,7 @@ class GoldSheetEvidence(_StrictModel):
     header_rows: list[int] = Field(default_factory=list)
     header_cells: list[GoldCellEvidence] = Field(default_factory=list)
     field_columns: dict[str, int] = Field(default_factory=dict)
+    images: list[GoldImageEvidence] = Field(default_factory=list)
     imported_row_count: int = Field(default=0, ge=0)
 
 
@@ -144,7 +198,10 @@ class GoldAuditIssue(_StrictModel):
         "QUANTITY_ROUNDING_DEVIATION",
         "QUANTITY_NOT_CALCULABLE",
         "AMOUNT_FORMULA_MISMATCH",
+        "AMOUNT_NOT_CALCULABLE",
         "MISSING_REQUIRED_FIELD",
+        "INVALID_NUMERIC_VALUE",
+        "UNRECOGNIZED_UNIT",
     ]
     severity: Literal["REVIEW", "BLOCK"]
     message: str
@@ -166,6 +223,9 @@ class GoldRow(_StrictModel):
     item: TakeoffItem
     raw_cells: list[GoldCellEvidence]
     field_cells: dict[str, list[str]] = Field(default_factory=dict)
+    source_material_code: str | None = None
+    mt_code_source: Literal["mt_code", "material_code", "material"] | None = None
+    image_evidence: list[GoldImageEvidence] = Field(default_factory=list)
     recalculated_engineering_quantity: float | None = None
     reported_engineering_quantity: float | None = None
     quantity_difference: float | None = None
@@ -185,6 +245,7 @@ class GoldImportSummary(_StrictModel):
     quantity_rounding_deviation_count: int = Field(ge=0)
     quantity_not_calculable_count: int = Field(ge=0)
     amount_mismatch_count: int = Field(ge=0)
+    amount_not_calculable_count: int = Field(ge=0)
     pass_count: int = Field(ge=0)
     review_count: int = Field(ge=0)
     block_count: int = Field(ge=0)
@@ -193,7 +254,7 @@ class GoldImportSummary(_StrictModel):
 class GoldImportResult(_StrictModel):
     """Serializable import result, including row-level source evidence."""
 
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     source_path: str
     source_sha256: str
     workbook_format: Literal["xls", "xlsx", "xlsm"]
@@ -222,6 +283,8 @@ class _Cell:
         column: int,
         value: Any,
         formula: str | None,
+        formula_kind: Literal["normal", "array"] | None,
+        formula_range: str | None,
         data_type: str,
         number_format: str | None,
     ) -> None:
@@ -231,6 +294,8 @@ class _Cell:
         self.column = column
         self.value = _json_scalar(value)
         self.formula = formula
+        self.formula_kind = formula_kind
+        self.formula_range = formula_range
         self.data_type = data_type
         self.number_format = number_format
 
@@ -248,16 +313,48 @@ class _Cell:
             raw_value=self.value,
             value_repr=_value_repr(self.value),
             formula=self.formula,
+            formula_kind=self.formula_kind,
+            formula_range=self.formula_range,
             data_type=self.data_type,
             number_format=self.number_format,
         )
 
 
+class _ImageAnchor:
+    def __init__(
+        self,
+        *,
+        source_type: Literal["embedded", "cell_formula"],
+        row: int,
+        column: int,
+        end_row: int | None = None,
+        end_column: int | None = None,
+        media_format: str | None = None,
+        formula: str | None = None,
+        reference_id: str | None = None,
+    ) -> None:
+        self.source_type = source_type
+        self.row = row
+        self.column = column
+        self.end_row = end_row
+        self.end_column = end_column
+        self.media_format = media_format
+        self.formula = formula
+        self.reference_id = reference_id
+
+
 class _Sheet:
-    def __init__(self, name: str, index: int, rows: list[list[_Cell]]) -> None:
+    def __init__(
+        self,
+        name: str,
+        index: int,
+        rows: list[list[_Cell]],
+        images: list[_ImageAnchor] | None = None,
+    ) -> None:
         self.name = name
         self.index = index
         self.rows = rows
+        self.images = images or []
 
     @property
     def max_row(self) -> int:
@@ -300,26 +397,108 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _formula_details(
+    value: Any, data_type: Any
+) -> tuple[str | None, Literal["normal", "array"] | None, str | None]:
+    if str(data_type or "") != "f" or value is None:
+        return None, None, None
+    if isinstance(value, str):
+        return value, "normal", None
+    text = getattr(value, "text", None)
+    reference = getattr(value, "ref", None)
+    return (
+        str(text) if text is not None else str(value),
+        "array",
+        str(reference) if reference is not None else None,
+    )
+
+
+def _image_anchor(image: Any) -> tuple[int, int, int | None, int | None] | None:
+    anchor = getattr(image, "anchor", None)
+    if isinstance(anchor, str):
+        match = re.fullmatch(r"([A-Za-z]+)(\d+)", anchor)
+        if not match:
+            return None
+        column = 0
+        for char in match.group(1).upper():
+            column = column * 26 + ord(char) - 64
+        return int(match.group(2)), column, None, None
+    start = getattr(anchor, "_from", None)
+    if start is None:
+        return None
+    end = getattr(anchor, "to", None)
+    return (
+        int(start.row) + 1,
+        int(start.col) + 1,
+        int(end.row) + 1 if end is not None else None,
+        int(end.col) + 1 if end is not None else None,
+    )
+
+
+_DISPIMG_RE = re.compile(r"(?i)DISPIMG\s*\(\s*[\"']([^\"']+)[\"']")
+
+
 def _read_xlsx(path: Path) -> list[_Sheet]:
     values_book = load_workbook(path, data_only=True, read_only=False)
     formulas_book = load_workbook(path, data_only=False, read_only=False)
     sheets: list[_Sheet] = []
     for index, value_ws in enumerate(values_book.worksheets):
         formula_ws = formulas_book[value_ws.title]
+        images: list[_ImageAnchor] = []
+        for image in formula_ws._images:
+            anchor = _image_anchor(image)
+            if anchor is None:
+                continue
+            row, column, end_row, end_column = anchor
+            images.append(
+                _ImageAnchor(
+                    source_type="embedded",
+                    row=row,
+                    column=column,
+                    end_row=end_row,
+                    end_column=end_column,
+                    media_format=(str(image.format) if getattr(image, "format", None) else None),
+                )
+            )
+
+        value_coordinates = {
+            coordinate for coordinate, cell in value_ws._cells.items() if cell.value is not None
+        }
+        formula_coordinates = {
+            coordinate for coordinate, cell in formula_ws._cells.items() if cell.value is not None
+        }
+        populated = value_coordinates | formula_coordinates
+        max_row = max((row for row, _ in populated), default=0)
+        max_column = max((column for _, column in populated), default=0)
+        for merged in formula_ws.merged_cells.ranges:
+            max_row = max(max_row, int(merged.max_row))
+            max_column = max(max_column, int(merged.max_col))
+        for image in images:
+            max_row = max(max_row, image.end_row or image.row)
+            max_column = max(max_column, image.end_column or image.column)
+
         rows: list[list[_Cell]] = []
-        for row_index in range(1, value_ws.max_row + 1):
+        for row_index in range(1, max_row + 1):
             row: list[_Cell] = []
-            for column in range(1, value_ws.max_column + 1):
+            for column in range(1, max_column + 1):
                 value_cell = value_ws.cell(row_index, column)
                 formula_cell = formula_ws.cell(row_index, column)
-                formula = (
-                    str(formula_cell.value)
-                    if formula_cell.data_type == "f" and formula_cell.value is not None
-                    else None
+                formula, formula_kind, formula_range = _formula_details(
+                    formula_cell.value, formula_cell.data_type
                 )
                 value = value_cell.value
-                if value is None and formula is not None:
-                    value = formula
+                if formula is not None:
+                    match = _DISPIMG_RE.search(formula)
+                    if match:
+                        images.append(
+                            _ImageAnchor(
+                                source_type="cell_formula",
+                                row=row_index,
+                                column=column,
+                                formula=formula,
+                                reference_id=match.group(1),
+                            )
+                        )
                 row.append(
                     _Cell(
                         sheet_name=value_ws.title,
@@ -328,12 +507,14 @@ def _read_xlsx(path: Path) -> list[_Sheet]:
                         column=column,
                         value=value,
                         formula=formula,
+                        formula_kind=formula_kind,
+                        formula_range=formula_range,
                         data_type=str(formula_cell.data_type or value_cell.data_type or "unknown"),
                         number_format=str(formula_cell.number_format or "General"),
                     )
                 )
             rows.append(row)
-        sheets.append(_Sheet(value_ws.title, index, rows))
+        sheets.append(_Sheet(value_ws.title, index, rows, images))
     values_book.close()
     formulas_book.close()
     return sheets
@@ -362,6 +543,8 @@ def _read_xls(path: Path) -> list[_Sheet]:
                         column=column + 1,
                         value=source.value if source.ctype != xlrd.XL_CELL_EMPTY else None,
                         formula=None,
+                        formula_kind=None,
+                        formula_range=None,
                         data_type=_XLRD_CELL_TYPES.get(source.ctype, "unknown"),
                         number_format=number_format,
                     )
@@ -380,7 +563,7 @@ def _normalise_mt(value: Any) -> str | None:
     text = _value_repr(value).strip().upper().replace("_", "-")
     match = _MT_RE.search(text)
     if not match:
-        return text or None
+        return None
     suffix = f"-{int(match.group(2)):02d}" if match.group(2) else ""
     return f"MT-{int(match.group(1)):02d}{suffix}"
 
@@ -483,54 +666,102 @@ def _formula_quantity(
     return None, ["单位"]
 
 
+def _header_field(header: str) -> str | None:
+    field = _HEADER_ALIASES.get(header)
+    if field:
+        return field
+    if header.startswith(("单价", "材料单价", "含税单价")):
+        return "unit_price"
+    if header.startswith(("金额", "合计", "小计", "总价", "含税总价")):
+        return "amount"
+    if header.startswith("宽度") and header.endswith(("mm", "毫米")):
+        return "width_mm"
+    if header.startswith("长度") and header.endswith(("mm", "毫米")):
+        return "length_mm"
+    if header.startswith("造型规格"):
+        return "unfolded_spec"
+    return None
+
+
+def _mapping_for_header_rows(sheet: _Sheet, start: int, depth: int) -> dict[str, int]:
+    observations: list[tuple[int, str, str]] = []
+    for column in range(1, sheet.max_column + 1):
+        for row_number in range(start, start + depth):
+            cell = sheet.cell(row_number, column)
+            header = _normalise_header(cell.value if cell else None)
+            if not header:
+                continue
+            field = "mt_code" if header == "颜色" else _header_field(header)
+            if field:
+                observations.append((column, header, field))
+
+    mapping: dict[str, int] = {}
+    count_specific = [
+        observation for observation in observations if observation[1] in {"件数", "计量"}
+    ]
+    quantity_named = [observation for observation in observations if observation[1] == "数量"]
+    engineering_named = [
+        observation for observation in observations if observation[2] == "engineering_quantity"
+    ]
+
+    for column, _header, field in observations:
+        if field in {"quantity", "engineering_quantity"}:
+            continue
+        mapping.setdefault(field, column)
+
+    if engineering_named:
+        mapping["engineering_quantity"] = engineering_named[0][0]
+        candidates = count_specific or quantity_named
+        if candidates:
+            mapping["quantity"] = candidates[0][0]
+    elif count_specific and quantity_named:
+        # Several established takeoff templates label the physical count as
+        # "计量" below a dimensions group, while the calculated billable value
+        # is headed "数量".  Keep both semantics rather than overwriting one.
+        mapping["quantity"] = count_specific[0][0]
+        mapping["engineering_quantity"] = quantity_named[0][0]
+    elif count_specific:
+        mapping["quantity"] = count_specific[0][0]
+    elif quantity_named:
+        mapping["quantity"] = quantity_named[0][0]
+
+    return mapping
+
+
 def _header_mapping(sheet: _Sheet) -> tuple[list[int], dict[str, int]] | None:
     best: tuple[int, int, int, dict[str, int]] | None = None
     for row_number in range(1, min(sheet.max_row, 30) + 1):
-        row = sheet.rows[row_number - 1]
-        normalised = [_normalise_header(cell.value) for cell in row]
-        color_quantity_layout = "颜色" in normalised and (
-            "规格" in normalised
-            or any(
-                _normalise_header(cell.value) in {"展开宽", "展开宽度", "件数"}
-                for cell in (sheet.rows[row_number] if row_number < sheet.max_row else [])
-            )
-        )
-        mapping: dict[str, int] = {}
-        recognised = 0
-        for column, header in enumerate(normalised, start=1):
-            if not header:
+        for depth in (1, 2):
+            if row_number + depth - 1 > sheet.max_row:
                 continue
-            if color_quantity_layout and header == "颜色":
-                field = "mt_code"
-            elif color_quantity_layout and header == "数量":
-                field = "engineering_quantity"
-            else:
-                field = _HEADER_ALIASES.get(header)
-            if field and field not in mapping:
-                mapping[field] = column
-                recognised += 1
-
-        depth = 1
-        if row_number < sheet.max_row:
-            sub_mapping: dict[str, int] = {}
-            for column, cell in enumerate(sheet.rows[row_number], start=1):
-                header = _normalise_header(cell.value)
-                field = _HEADER_ALIASES.get(header)
-                if field and header in {"展开宽", "展开宽度", "长", "长度", "件数"}:
-                    sub_mapping[field] = column
-            if len(sub_mapping) >= 2:
-                mapping.update(sub_mapping)
-                recognised += len(sub_mapping)
-                depth = 2
-
-        required_score = sum(field in mapping for field in ("name", "mt_code", "sequence"))
-        score = recognised + required_score * 3
-        candidate = (score, row_number, depth, mapping)
-        if best is None or candidate[0] > best[0]:
-            best = candidate
-    if best is None or best[0] < 8:
+            mapping = _mapping_for_header_rows(sheet, row_number, depth)
+            identity_score = sum(
+                field in mapping
+                for field in ("sequence", "name", "mt_code", "material_code", "material")
+            )
+            measurement_score = sum(
+                field in mapping
+                for field in (
+                    "unfolded_spec",
+                    "width_mm",
+                    "length_mm",
+                    "quantity",
+                    "engineering_quantity",
+                    "unit",
+                )
+            )
+            score = len(mapping) * 2 + identity_score * 3 + measurement_score
+            # Prefer the shallower header when both interpretations recognise
+            # exactly the same fields.  A real second header row must add value.
+            candidate = (score, -depth, -row_number, mapping)
+            if best is None or candidate[:3] > best[:3]:
+                best = candidate
+    if best is None or best[0] < 12:
         return None
-    _, row_number, depth, mapping = best
+    score, negative_depth, negative_row, mapping = best
+    del score
+    row_number = -negative_row
+    depth = -negative_depth
     return list(range(row_number, row_number + depth)), mapping
 
 
@@ -538,7 +769,28 @@ def _looks_like_data(values: dict[str, Any]) -> bool:
     sequence = _to_decimal(values.get("sequence"))
     mt_code = _normalise_mt(values.get("mt_code"))
     name = _value_repr(values.get("name")).strip()
-    if sequence is not None and sequence >= 1 and (mt_code or name):
+    summary_text = " ".join(
+        _value_repr(values.get(field)).strip()
+        for field in ("sequence", "name")
+        if not _is_empty(values.get(field))
+    )
+    if re.search(r"(?:^|\s)(?:合计|小计|总计|总合计|本页合计|税金)(?:$|\s)", summary_text):
+        return False
+    business_signal = any(
+        not _is_empty(values.get(field))
+        for field in (
+            "name",
+            "mt_code",
+            "material_code",
+            "material",
+            "unfolded_spec",
+            "width_mm",
+            "length_mm",
+            "quantity",
+            "engineering_quantity",
+        )
+    )
+    if sequence is not None and sequence >= 1 and business_signal:
         return True
     if mt_code and _MT_RE.search(mt_code) and name:
         return True
@@ -559,6 +811,87 @@ def _field_value(sheet: _Sheet, row: int, mapping: dict[str, int], field: str) -
     column = mapping.get(field)
     cell = sheet.cell(row, column) if column is not None else None
     return cell.value if cell else None
+
+
+_CELL_REFERENCE_RE = re.compile(r"(?<![A-Z0-9_])\$?([A-Z]{1,3})\$?(\d+)", re.I)
+
+
+def _canonical_amount_formula(sheet: _Sheet, row: int, mapping: dict[str, int]) -> bool:
+    amount_column = mapping.get("amount")
+    engineering_column = mapping.get("engineering_quantity")
+    unit_price_column = mapping.get("unit_price")
+    if not amount_column or not engineering_column or not unit_price_column:
+        return False
+    amount_cell = sheet.cell(row, amount_column)
+    if amount_cell is None or amount_cell.formula is None:
+        return True
+    references = {
+        f"{column.upper()}{reference_row}"
+        for column, reference_row in _CELL_REFERENCE_RE.findall(amount_cell.formula)
+    }
+    expected = {
+        f"{get_column_letter(engineering_column)}{row}",
+        f"{get_column_letter(unit_price_column)}{row}",
+    }
+    return references == expected
+
+
+def _image_category(
+    sheet: _Sheet, header_rows: list[int], column: int
+) -> Literal["elevation", "detail", "drawing", "rendering", "image"]:
+    text = "".join(
+        _normalise_header(
+            sheet.cell(row_number, column).value
+            if sheet.cell(row_number, column) is not None
+            else None
+        )
+        for row_number in header_rows
+    )
+    if any(token in text for token in ("节点", "大样")):
+        return "detail"
+    if "立面" in text:
+        return "elevation"
+    if any(token in text for token in ("效果", "图样效果")):
+        return "rendering"
+    if any(token in text for token in ("图纸", "图样", "附图")):
+        return "drawing"
+    return "image"
+
+
+def _sheet_image_evidence(
+    source_sha256: str, sheet: _Sheet, header_rows: list[int]
+) -> list[GoldImageEvidence]:
+    evidence: list[GoldImageEvidence] = []
+    for image_index, image in enumerate(sheet.images, start=1):
+        anchor_coordinate = f"{get_column_letter(image.column)}{image.row}"
+        end_coordinate = (
+            f"{get_column_letter(image.end_column)}{image.end_row}"
+            if image.end_row is not None and image.end_column is not None
+            else None
+        )
+        payload = (
+            f"{source_sha256}|{sheet.name}|{image.source_type}|{image_index}|"
+            f"{anchor_coordinate}|{end_coordinate or ''}|{image.reference_id or ''}"
+        ).encode()
+        evidence.append(
+            GoldImageEvidence(
+                id=f"gold-image:{hashlib.sha256(payload).hexdigest()[:20]}",
+                sheet_name=sheet.name,
+                sheet_index=sheet.index,
+                source_type=image.source_type,
+                category=_image_category(sheet, header_rows, image.column),
+                anchor_coordinate=anchor_coordinate,
+                anchor_row=image.row,
+                anchor_column=image.column,
+                end_coordinate=end_coordinate,
+                end_row=image.end_row,
+                end_column=image.end_column,
+                media_format=image.media_format,
+                formula=image.formula,
+                reference_id=image.reference_id,
+            )
+        )
+    return evidence
 
 
 def import_gold_workbook(path: str | Path) -> GoldImportResult:
@@ -591,20 +924,19 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                     sheet_index=sheet.index,
                     max_row=sheet.max_row,
                     max_column=sheet.max_column,
+                    images=_sheet_image_evidence(source_hash, sheet, []),
                 )
             )
             continue
         header_rows, mapping = detected
+        sheet_images = _sheet_image_evidence(source_hash, sheet, header_rows)
         header_cells = [
-            cell.evidence()
-            for row_number in header_rows
-            for cell in sheet.rows[row_number - 1]
+            cell.evidence() for row_number in header_rows for cell in sheet.rows[row_number - 1]
         ]
         imported_before = len(rows)
         for row_number in range(header_rows[-1] + 1, sheet.max_row + 1):
             values = {
-                field: _field_value(sheet, row_number, mapping, field)
-                for field in CANONICAL_FIELDS
+                field: _field_value(sheet, row_number, mapping, field) for field in CANONICAL_FIELDS
             }
             if not _looks_like_data(values):
                 continue
@@ -615,24 +947,56 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                 for field, column in mapping.items()
                 if sheet.cell(row_number, column) is not None
             }
-            mt_code = _normalise_mt(values["mt_code"]) or ""
+            source_material_code = _value_repr(values["material_code"]).strip() or None
+            material = _value_repr(values["material"]).strip() or None
+            mt_code = _normalise_mt(values["mt_code"])
+            mt_code_source: Literal["mt_code", "material_code", "material"] | None = None
+            if mt_code:
+                mt_code_source = "mt_code"
+            elif (derived_mt := _normalise_mt(source_material_code)) is not None:
+                mt_code = derived_mt
+                mt_code_source = "material_code"
+            elif (derived_mt := _normalise_mt(material)) is not None:
+                mt_code = derived_mt
+                mt_code_source = "material"
+            if mt_code_source and mt_code_source != "mt_code":
+                field_cells["mt_code"] = list(field_cells.get(mt_code_source, []))
+            mt_code = mt_code or ""
             name = _value_repr(values["name"]).strip()
             sequence = _to_sequence(values["sequence"], fallback_sequence)
             fallback_sequence = max(fallback_sequence + 1, sequence + 1)
             unit = _normalise_unit(values["unit"], values["pricing_method"])
-            pricing_method = (
-                _value_repr(values["pricing_method"]).strip()
-                or _default_pricing_method(unit)
-            )
+            pricing_method = _value_repr(
+                values["pricing_method"]
+            ).strip() or _default_pricing_method(unit)
             width = _to_decimal(values["width_mm"])
             length = _to_decimal(values["length_mm"])
             quantity = _to_decimal(values["quantity"])
             reported = _to_decimal(values["engineering_quantity"])
+            unit_price = _to_decimal(values["unit_price"])
+            amount = _to_decimal(values["amount"])
+            numeric_values = {
+                "width_mm": width,
+                "length_mm": length,
+                "quantity": quantity,
+                "engineering_quantity": reported,
+                "unit_price": unit_price,
+                "amount": amount,
+            }
+            invalid_numeric_fields = [
+                field for field, value in numeric_values.items() if value is not None and value < 0
+            ]
+            width_for_calculation = width if width is None or width >= 0 else None
+            length_for_calculation = length if length is None or length >= 0 else None
+            quantity_for_calculation = quantity if quantity is None or quantity >= 0 else None
+            reported_for_item = reported if reported is None or reported >= 0 else None
+            unit_price_for_item = unit_price if unit_price is None or unit_price >= 0 else None
+            amount_for_item = amount if amount is None or amount >= 0 else None
             recalculated, missing = _formula_quantity(
                 unit=unit,
-                width=width,
-                length=length,
-                quantity=quantity,
+                width=width_for_calculation,
+                length=length_for_calculation,
+                quantity=quantity_for_calculation,
                 unfolded_spec=values["unfolded_spec"],
             )
             issue_ids: list[str] = []
@@ -641,10 +1005,43 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
             difference: Decimal | None = None
             tolerance: Decimal | None = None
 
+            if invalid_numeric_fields:
+                code = "INVALID_NUMERIC_VALUE"
+                issue = GoldAuditIssue(
+                    id=_issue_id(source_hash, sheet.name, row_number, code),
+                    code=code,
+                    severity="BLOCK",
+                    message="数值字段不能为负数：" + "、".join(invalid_numeric_fields),
+                    sheet_name=sheet.name,
+                    row=row_number,
+                    field="/".join(invalid_numeric_fields),
+                    evidence_cells=sum(
+                        (field_cells.get(field, []) for field in invalid_numeric_fields), []
+                    ),
+                )
+                issues.append(issue)
+                issue_ids.append(issue.id)
+                row_status = ReviewStatus.BLOCK
+
+            if not _is_empty(values["unit"]) and unit is None:
+                code = "UNRECOGNIZED_UNIT"
+                issue = GoldAuditIssue(
+                    id=_issue_id(source_hash, sheet.name, row_number, code),
+                    code=code,
+                    severity="BLOCK",
+                    message=f"无法识别计价单位：{_value_repr(values['unit']).strip()}",
+                    sheet_name=sheet.name,
+                    row=row_number,
+                    field="unit",
+                    actual=_value_repr(values["unit"]).strip(),
+                    evidence_cells=field_cells.get("unit", []),
+                )
+                issues.append(issue)
+                issue_ids.append(issue.id)
+                row_status = ReviewStatus.BLOCK
+
             missing_required = [
-                label
-                for label, value in (("名称", name), ("MT编号", mt_code))
-                if not value
+                label for label, value in (("名称", name), ("MT编号", mt_code)) if not value
             ]
             if missing_required:
                 code = "MISSING_REQUIRED_FIELD"
@@ -657,7 +1054,11 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                     row=row_number,
                     field="/".join(missing_required),
                     evidence_cells=sum(
-                        (field_cells.get(field, []) for field in ("name", "mt_code")), []
+                        (
+                            field_cells.get(field, [])
+                            for field in ("name", "mt_code", "material_code", "material")
+                        ),
+                        [],
                     ),
                 )
                 issues.append(issue)
@@ -705,9 +1106,7 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                 issue_ids.append(issue.id)
                 row_status = ReviewStatus.BLOCK
             else:
-                engineering_cell = sheet.cell(
-                    row_number, mapping.get("engineering_quantity", 0)
-                )
+                engineering_cell = sheet.cell(row_number, mapping.get("engineering_quantity", 0))
                 tolerance = _format_quantum(
                     engineering_cell.number_format if engineering_cell else None
                 )
@@ -717,19 +1116,19 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                     material_threshold = max(
                         tolerance * Decimal(2), abs(recalculated) * Decimal("0.01")
                     )
-                    material = abs(difference) > material_threshold
+                    is_material_mismatch = abs(difference) > material_threshold
                     code = (
                         "QUANTITY_FORMULA_MISMATCH"
-                        if material
+                        if is_material_mismatch
                         else "QUANTITY_ROUNDING_DEVIATION"
                     )
                     issue = GoldAuditIssue(
                         id=_issue_id(source_hash, sheet.name, row_number, code),
                         code=code,
-                        severity="BLOCK" if material else "REVIEW",
+                        severity="BLOCK" if is_material_mismatch else "REVIEW",
                         message=(
                             "原表工程量与计价公式复算值存在实质偏差"
-                            if material
+                            if is_material_mismatch
                             else "原表工程量超出单元格显示精度允许的半单位舍入差"
                         ),
                         sheet_name=sheet.name,
@@ -755,67 +1154,122 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                     )
                     issues.append(issue)
                     issue_ids.append(issue.id)
-                    if material:
+                    if is_material_mismatch:
                         row_status = ReviewStatus.BLOCK
 
-            unit_price = _to_decimal(values["unit_price"])
-            amount = _to_decimal(values["amount"])
-            if unit_price is not None and reported is not None and amount is not None:
-                expected_amount = unit_price * reported
-                amount_difference = amount - expected_amount
-                if abs(amount_difference) > Decimal("0.005"):
-                    code = "AMOUNT_FORMULA_MISMATCH"
+            if unit_price is not None and reported is not None:
+                amount_column = mapping.get("amount")
+                amount_cell = sheet.cell(row_number, amount_column or 0)
+                canonical_amount_formula = _canonical_amount_formula(sheet, row_number, mapping)
+                if (
+                    amount_cell is not None
+                    and amount_cell.formula
+                    and (amount is None or not canonical_amount_formula)
+                ):
+                    code = "AMOUNT_NOT_CALCULABLE"
                     issue = GoldAuditIssue(
                         id=_issue_id(source_hash, sheet.name, row_number, code),
                         code=code,
-                        severity="BLOCK",
-                        message="原表金额与工程量×单价不一致",
+                        severity="REVIEW",
+                        message=(
+                            "金额公式缺少缓存显示值，无法核对"
+                            if amount is None
+                            else "金额公式包含安装费、税费或其他价格分量，不能按工程量×材料单价核对"
+                        ),
                         sheet_name=sheet.name,
                         row=row_number,
                         field="amount",
-                        actual=str(amount),
-                        expected=str(expected_amount),
-                        difference=str(amount_difference),
-                        tolerance="0.005",
+                        actual=str(amount) if amount is not None else None,
                         evidence_cells=sum(
-                            (field_cells.get(field, []) for field in (
-                                "engineering_quantity", "unit_price", "amount"
-                            )),
+                            (
+                                field_cells.get(field, [])
+                                for field in (
+                                    "engineering_quantity",
+                                    "unit_price",
+                                    "amount",
+                                )
+                            ),
                             [],
                         ),
                     )
                     issues.append(issue)
                     issue_ids.append(issue.id)
-                    row_status = ReviewStatus.BLOCK
+                elif amount is not None:
+                    expected_amount = unit_price * reported
+                    amount_difference = amount - expected_amount
+                    if abs(amount_difference) > Decimal("0.005"):
+                        code = "AMOUNT_FORMULA_MISMATCH"
+                        issue = GoldAuditIssue(
+                            id=_issue_id(source_hash, sheet.name, row_number, code),
+                            code=code,
+                            severity="BLOCK",
+                            message="原表金额与工程量×单价不一致",
+                            sheet_name=sheet.name,
+                            row=row_number,
+                            field="amount",
+                            actual=str(amount),
+                            expected=str(expected_amount),
+                            difference=str(amount_difference),
+                            tolerance="0.005",
+                            evidence_cells=sum(
+                                (
+                                    field_cells.get(field, [])
+                                    for field in (
+                                        "engineering_quantity",
+                                        "unit_price",
+                                        "amount",
+                                    )
+                                ),
+                                [],
+                            ),
+                        )
+                        issues.append(issue)
+                        issue_ids.append(issue.id)
+                        row_status = ReviewStatus.BLOCK
 
             item = TakeoffItem(
                 sequence=sequence,
-                name=name or "待确认名称",
-                mt_code=mt_code or "待确认MT",
-                material=_value_repr(values["material"]).strip() or None,
+                name=name,
+                mt_code=mt_code,
+                material=material,
                 plan_location=_value_repr(values["plan_location"]).strip() or None,
                 elevation=_value_repr(values["elevation"]).strip() or None,
                 detail=_value_repr(values["detail"]).strip() or None,
                 unfolded_spec=_value_repr(values["unfolded_spec"]).strip() or None,
-                width_mm=float(width) if width is not None else None,
-                length_mm=float(length) if length is not None else None,
-                quantity=float(quantity) if quantity is not None else None,
-                engineering_quantity=float(reported) if reported is not None else None,
+                width_mm=(
+                    float(width_for_calculation) if width_for_calculation is not None else None
+                ),
+                length_mm=(
+                    float(length_for_calculation) if length_for_calculation is not None else None
+                ),
+                quantity=(
+                    float(quantity_for_calculation)
+                    if quantity_for_calculation is not None
+                    else None
+                ),
+                engineering_quantity=(
+                    float(reported_for_item) if reported_for_item is not None else None
+                ),
                 unit=unit,  # type: ignore[arg-type]
                 pricing_method=pricing_method or None,
-                unit_price=float(unit_price) if unit_price is not None else None,
-                amount=float(amount) if amount is not None else None,
+                unit_price=(
+                    float(unit_price_for_item) if unit_price_for_item is not None else None
+                ),
+                amount=float(amount_for_item) if amount_for_item is not None else None,
                 note=_value_repr(values["note"]).strip() or None,
                 evidence_ids=[
                     f"{sheet.name}!{cell.coordinate}"
                     for cell in raw_cells
                     if not _is_empty(cell.raw_value)
+                ]
+                + [
+                    image.id
+                    for image in sheet_images
+                    if image.anchor_row <= row_number <= (image.end_row or image.anchor_row)
                 ],
                 status=row_status,
                 block_reason=(
-                    "人工金标准导入审计发现阻断项"
-                    if row_status == ReviewStatus.BLOCK
-                    else None
+                    "人工金标准导入审计发现阻断项" if row_status == ReviewStatus.BLOCK else None
                 ),
             )
             rows.append(
@@ -827,6 +1281,13 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                     item=item,
                     raw_cells=raw_cells,
                     field_cells=field_cells,
+                    source_material_code=source_material_code,
+                    mt_code_source=mt_code_source,
+                    image_evidence=[
+                        image
+                        for image in sheet_images
+                        if image.anchor_row <= row_number <= (image.end_row or image.anchor_row)
+                    ],
                     recalculated_engineering_quantity=(
                         float(recalculated) if recalculated is not None else None
                     ),
@@ -849,6 +1310,7 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                 header_rows=header_rows,
                 header_cells=header_cells,
                 field_columns=mapping,
+                images=sheet_images,
                 imported_row_count=len(rows) - imported_before,
             )
         )
@@ -858,19 +1320,17 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
     summary = GoldImportSummary(
         sheet_count=sum(sheet.imported_row_count > 0 for sheet in sheets),
         row_count=len(rows),
-        mt_distribution=dict(sorted(Counter(row.item.mt_code for row in rows).items())),
-        unit_distribution=dict(
-            sorted(Counter(row.item.unit or "未识别" for row in rows).items())
-        ),
+        mt_distribution=dict(sorted(Counter(row.item.mt_code or "未识别" for row in rows).items())),
+        unit_distribution=dict(sorted(Counter(row.item.unit or "未识别" for row in rows).items())),
         audit_issue_count=len(issues),
         quantity_mismatch_count=(
-            issue_counts["QUANTITY_FORMULA_MISMATCH"]
-            + issue_counts["QUANTITY_ROUNDING_DEVIATION"]
+            issue_counts["QUANTITY_FORMULA_MISMATCH"] + issue_counts["QUANTITY_ROUNDING_DEVIATION"]
         ),
         quantity_material_mismatch_count=issue_counts["QUANTITY_FORMULA_MISMATCH"],
         quantity_rounding_deviation_count=issue_counts["QUANTITY_ROUNDING_DEVIATION"],
         quantity_not_calculable_count=issue_counts["QUANTITY_NOT_CALCULABLE"],
         amount_mismatch_count=issue_counts["AMOUNT_FORMULA_MISMATCH"],
+        amount_not_calculable_count=issue_counts["AMOUNT_NOT_CALCULABLE"],
         pass_count=status_counts[ReviewStatus.PASS.value],
         review_count=status_counts[ReviewStatus.REVIEW.value],
         block_count=status_counts[ReviewStatus.BLOCK.value],

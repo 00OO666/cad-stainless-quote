@@ -14,16 +14,20 @@ are enforced before a member can fill the staging disk.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import mimetypes
 import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
+import time
 import unicodedata
 import zipfile
+import zlib
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path, PurePosixPath
@@ -68,6 +72,10 @@ class _RawMember:
     original_name: str
     size: int
     compressed_size: int | None
+    output_name: str | None = None
+    path_aliases: tuple[str, ...] = ()
+    name_repaired: bool = False
+    repaired_encoding: str | None = None
     is_dir: bool = False
     is_link: bool = False
     is_special: bool = False
@@ -82,6 +90,8 @@ class _Member:
     relative_path: str
     size: int
     compressed_size: int | None
+    name_repaired: bool = False
+    repaired_encoding: str | None = None
     source_path: Path | None = None
     source_signature: tuple[int, int, int, int] | None = None
 
@@ -91,6 +101,7 @@ class _Preflight:
     members: list[_Member] = dataclass_field(default_factory=list)
     issues: list[RunIssue] = dataclass_field(default_factory=list)
     input_sha256: str | None = None
+    metadata: dict[str, object] = dataclass_field(default_factory=dict)
 
 
 class _IngestFailure(Exception):
@@ -118,6 +129,7 @@ _MEDIA_TYPES = {
     ".dxf": "image/vnd.dxf",
     ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
 _SINGLE_FILE_SUFFIXES = {
@@ -127,12 +139,24 @@ _SINGLE_FILE_SUFFIXES = {
     ".xls",
     ".xlsx",
     ".xlsm",
+    ".docx",
     ".png",
     ".jpg",
     ".jpeg",
     ".tif",
     ".tiff",
 }
+
+_ARCHIVE_SUFFIXES: dict[str, Literal["zip", "rar", "7z"]] = {
+    ".zip": "zip",
+    ".rar": "rar",
+    ".7z": "7z",
+}
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_RAR_SIGNATURES = (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")
+_SEVEN_Z_SIGNATURE = b"7z\xbc\xaf\x27\x1c"
+_PUBLISH_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 6.0)
+_TRANSIENT_PUBLISH_WINERRORS = {5, 32, 33}
 
 
 def _issue(
@@ -155,6 +179,249 @@ def _issue(
 
 def _has_blocking_issue(issues: list[RunIssue]) -> bool:
     return any(issue.severity in {Severity.ERROR, Severity.BLOCK} for issue in issues)
+
+
+def _archive_kind_from_prefix(prefix: bytes) -> Literal["zip", "rar", "7z"] | None:
+    if prefix.startswith(_ZIP_SIGNATURES):
+        return "zip"
+    if prefix.startswith(_RAR_SIGNATURES):
+        return "rar"
+    if prefix.startswith(_SEVEN_Z_SIGNATURE):
+        return "7z"
+    return None
+
+
+def _is_macos_metadata(relative_path: str) -> bool:
+    """Return true for Finder/AppleDouble metadata, never for a project drawing."""
+
+    parts = PurePosixPath(relative_path).parts
+    folded = tuple(part.casefold() for part in parts)
+    return any(part == "__macosx" or part.startswith("._") for part in folded) or (
+        bool(folded) and folded[-1] == ".ds_store"
+    )
+
+
+def _zip_extra_fields(extra: bytes) -> list[tuple[int, bytes]]:
+    fields: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + 4 <= len(extra):
+        header_id, size = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        end = offset + size
+        if end > len(extra):
+            break
+        fields.append((header_id, extra[offset:end]))
+        offset = end
+    return fields
+
+
+def _zip_unicode_path(extra: bytes, raw_name: bytes) -> str | None:
+    """Read a valid Info-ZIP Unicode Path alias (0x7075), if present."""
+
+    for header_id, payload in _zip_extra_fields(extra):
+        if header_id != 0x7075 or len(payload) < 5 or payload[0] != 1:
+            continue
+        expected_crc = struct.unpack_from("<I", payload, 1)[0]
+        if expected_crc != zlib.crc32(raw_name) & 0xFFFFFFFF:
+            continue
+        try:
+            return payload[5:].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _is_cjk(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x3134F
+    )
+
+
+def _cp437_mojibake_group(character: str) -> str | None:
+    codepoint = ord(character)
+    if 0x2500 <= codepoint <= 0x257F:
+        return "box"
+    if 0x2580 <= codepoint <= 0x259F:
+        return "block"
+    if 0x0370 <= codepoint <= 0x03FF:
+        return "greek"
+    if 0x2200 <= codepoint <= 0x22FF:
+        return "math"
+    if 0x2300 <= codepoint <= 0x23FF:
+        return "technical"
+    if character in "¬µªº±÷×·¤¢£¥ƒ":
+        return "legacy-symbol"
+    return None
+
+
+def _name_quality(value: str) -> tuple[float, int, int, set[str]]:
+    visible = [character for character in value if character not in "/\\"]
+    if not visible:
+        return float("-inf"), 0, 0, set()
+    printable = sum(character.isprintable() for character in visible)
+    cjk_count = sum(_is_cjk(character) for character in visible)
+    mojibake_groups = {
+        group for character in visible if (group := _cp437_mojibake_group(character))
+    }
+    mojibake_count = sum(_cp437_mojibake_group(character) is not None for character in visible)
+    score = (
+        2.0 * printable / len(visible)
+        + 4.0 * cjk_count / len(visible)
+        - 5.0 * mojibake_count / len(visible)
+    )
+    return score, cjk_count, mojibake_count, mojibake_groups
+
+
+def _clear_legacy_filename_repair(lookup_name: str, candidate: str) -> bool:
+    """Require strong mojibake-to-CJK improvement before changing CP437 output.
+
+    A no-flag ZIP byte sequence is intrinsically ambiguous.  This deliberately
+    declines weak repairs (including ordinary accented CP437 names) and accepts
+    only candidates with multiple CJK characters plus multiple characteristic
+    CP437 mojibake classes.  The untouched lookup name remains available for reads.
+    """
+
+    if candidate == lookup_name:
+        return False
+    lookup_score, _, mojibake_count, mojibake_groups = _name_quality(lookup_name)
+    candidate_score, cjk_count, candidate_mojibake_count, _ = _name_quality(candidate)
+    if cjk_count < 2 or candidate_mojibake_count:
+        return False
+    if mojibake_count < 3 or len(mojibake_groups) < 2:
+        return False
+    return candidate_score - lookup_score >= 2.0
+
+
+def _reasonable_utf8_filename_repair(lookup_name: str, candidate: str) -> bool:
+    """Prefer strict UTF-8 when it clearly turns CP437 mojibake into CJK text."""
+
+    if candidate == lookup_name:
+        return False
+    lookup_score, _, lookup_mojibake_count, _ = _name_quality(lookup_name)
+    candidate_score, cjk_count, candidate_mojibake_count, _ = _name_quality(candidate)
+    return (
+        cjk_count >= 1
+        and candidate_mojibake_count == 0
+        and lookup_mojibake_count >= 2
+        and candidate_score - lookup_score >= 1.0
+    )
+
+
+def _zip_member_names(
+    info: zipfile.ZipInfo,
+) -> tuple[str, str, tuple[str, ...], str | None, tuple[tuple[bytes, str], ...]]:
+    """Return validated-later lookup, output, aliases, and repaired encoding.
+
+    ZIP archives produced by some older tools store UTF-8 or GBK/GB18030 filename
+    bytes without setting bit 11.  Python must initially decode those bytes as
+    CP437.  The byte round-trip and conservative quality score repair clear Chinese
+    mojibake while keeping the exact lookup key for ``ZipFile.open``.  Every returned
+    alias is safety-checked before extraction.
+    """
+
+    lookup_name = info.filename
+    legacy_name = getattr(info, "orig_filename", lookup_name)
+    aliases: list[str] = []
+    if legacy_name != lookup_name:
+        aliases.append(legacy_name)
+
+    utf8_flagged = bool(info.flag_bits & 0x800)
+    try:
+        raw_name = legacy_name.encode("utf-8" if utf8_flagged else "cp437")
+    except UnicodeEncodeError:
+        raw_name = b""
+
+    output_name = lookup_name
+    repaired_encoding: str | None = None
+    unicode_alias = _zip_unicode_path(info.extra, raw_name) if raw_name else None
+    if unicode_alias is not None:
+        output_name = unicode_alias
+        repaired_encoding = "infozip_unicode_path" if unicode_alias != lookup_name else None
+        if unicode_alias != lookup_name:
+            aliases.append(unicode_alias)
+    elif not utf8_flagged and raw_name:
+        utf8_candidate: str | None = None
+        try:
+            utf8_candidate = raw_name.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            pass
+        if utf8_candidate is not None and _reasonable_utf8_filename_repair(
+            lookup_name, utf8_candidate
+        ):
+            repaired_encoding, output_name = "utf-8", utf8_candidate
+            aliases.append(output_name)
+        else:
+            try:
+                gb18030_candidate = raw_name.decode("gb18030", errors="strict")
+            except UnicodeDecodeError:
+                gb18030_candidate = None
+            if gb18030_candidate is not None and _clear_legacy_filename_repair(
+                lookup_name, gb18030_candidate
+            ):
+                utf8_is_clearly_worse = utf8_candidate is None or (
+                    _name_quality(gb18030_candidate)[0] - _name_quality(utf8_candidate)[0] >= 2.0
+                )
+                if utf8_is_clearly_worse:
+                    repaired_encoding, output_name = "gb18030", gb18030_candidate
+                    aliases.append(output_name)
+
+    unique_aliases = tuple(dict.fromkeys(aliases))
+    raw_segments = [part for part in re.split(rb"[/\\]", raw_name) if part] if raw_name else []
+    output_segments = [part for part in re.split(r"[/\\]", output_name) if part]
+    segment_aliases = (
+        tuple(zip(raw_segments, output_segments, strict=True))
+        if len(raw_segments) == len(output_segments)
+        else ()
+    )
+    return lookup_name, output_name, unique_aliases, repaired_encoding, segment_aliases
+
+
+def _reuse_zip_segment_aliases(
+    output_name: str,
+    segment_aliases: tuple[tuple[bytes, str], ...],
+    segment_map: dict[bytes, tuple[str, str | None]],
+    repaired_encoding: str | None,
+) -> tuple[str, str | None, int, list[tuple[str, str]]]:
+    """Make each repeated raw ZIP path segment resolve to one Unicode alias."""
+
+    parts = re.split(r"([/\\])", output_name)
+    segment_positions = [
+        index for index, part in enumerate(parts) if part and part not in {"/", "\\"}
+    ]
+    if len(segment_positions) != len(segment_aliases):
+        return output_name, repaired_encoding, 0, []
+
+    overrides = 0
+    authoritative_conflicts: list[tuple[str, str]] = []
+    inherited_encodings: set[str] = set()
+    for position, (raw_segment, proposed_segment) in zip(
+        segment_positions, segment_aliases, strict=True
+    ):
+        prior = segment_map.get(raw_segment)
+        if prior is None:
+            segment_map[raw_segment] = (proposed_segment, repaired_encoding)
+            continue
+        prior_segment, prior_encoding = prior
+        if prior_segment == proposed_segment:
+            if prior_encoding:
+                inherited_encodings.add(prior_encoding)
+            continue
+        if "infozip_unicode_path" in {prior_encoding, repaired_encoding}:
+            authoritative_conflicts.append((prior_segment, proposed_segment))
+            continue
+        parts[position] = prior_segment
+        overrides += 1
+        if prior_encoding:
+            inherited_encodings.add(prior_encoding)
+
+    effective_encoding = repaired_encoding
+    if effective_encoding is None and len(inherited_encodings) == 1:
+        effective_encoding = next(iter(inherited_encodings))
+    return "".join(parts), effective_encoding, overrides, authoritative_conflicts
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -266,13 +533,39 @@ def _validate_members(
     file_keys: set[str] = set()
     directory_keys: set[str] = set()
     total_size = 0
+    skipped_macos_count = 0
+    skipped_macos_bytes = 0
+    repaired_name_count = 0
+    repaired_name_encodings: dict[str, int] = {}
 
     for raw in raw_members:
-        try:
-            relative_path = _normalize_relative_path(raw.original_name, limits)
-        except _IngestFailure as failure:
-            result.issues.append(_issue(failure.code, failure.message, evidence=failure.evidence))
+        output_name = raw.output_name or raw.original_name
+        names_to_validate = tuple(
+            dict.fromkeys((raw.original_name, *raw.path_aliases, output_name))
+        )
+        normalized_aliases: dict[str, str] = {}
+        alias_invalid = False
+        for alias in names_to_validate:
+            try:
+                normalized_aliases[alias] = _normalize_relative_path(alias, limits)
+            except _IngestFailure as failure:
+                result.issues.append(
+                    _issue(failure.code, failure.message, evidence=failure.evidence)
+                )
+                alias_invalid = True
+        if alias_invalid:
             continue
+        relative_path = normalized_aliases[output_name]
+
+        if _is_macos_metadata(relative_path):
+            skipped_macos_count += 1
+            skipped_macos_bytes += max(raw.size, 0)
+            continue
+
+        if raw.name_repaired:
+            repaired_name_count += 1
+            encoding = raw.repaired_encoding or "unknown"
+            repaired_name_encodings[encoding] = repaired_name_encodings.get(encoding, 0) + 1
 
         collision_key = relative_path.casefold()
         prior = seen_paths.get(collision_key)
@@ -357,8 +650,38 @@ def _validate_members(
                 relative_path=relative_path,
                 size=raw.size,
                 compressed_size=raw.compressed_size,
+                name_repaired=raw.name_repaired,
+                repaired_encoding=raw.repaired_encoding,
                 source_path=raw.source_path,
                 source_signature=raw.source_signature,
+            )
+        )
+
+    result.metadata["skipped_macos_metadata_count"] = skipped_macos_count
+    result.metadata["skipped_macos_metadata_bytes"] = skipped_macos_bytes
+    result.metadata["repaired_member_name_count"] = repaired_name_count
+    result.metadata["repaired_member_name_encodings"] = dict(
+        sorted(repaired_name_encodings.items())
+    )
+    if skipped_macos_count:
+        result.issues.append(
+            _issue(
+                "MACOS_METADATA_SKIPPED",
+                f"已忽略 {skipped_macos_count} 个 macOS 元数据成员。",
+                severity=Severity.WARNING,
+                evidence=[str(skipped_macos_count), str(skipped_macos_bytes)],
+            )
+        )
+    if repaired_name_count:
+        result.issues.append(
+            _issue(
+                "ZIP_MEMBER_NAME_REPAIRED",
+                f"已恢复 {repaired_name_count} 个 ZIP 成员的文件名编码。",
+                severity=Severity.WARNING,
+                evidence=[
+                    str(repaired_name_count),
+                    repr(dict(sorted(repaired_name_encodings.items()))),
+                ],
             )
         )
 
@@ -511,23 +834,42 @@ def _scan_directory(input_root: Path, run_root: Path, limits: IngestLimits) -> _
 
 def _preflight_zip(path: Path, limits: IngestLimits) -> _Preflight:
     raw_members: list[_RawMember] = []
-    alias_issues: list[RunIssue] = []
+    segment_map: dict[bytes, tuple[str, str | None]] = {}
+    segment_override_count = 0
+    segment_issues: list[RunIssue] = []
     try:
         with zipfile.ZipFile(path) as archive:
             for info in archive.infolist():
-                # Python applies the Info-ZIP Unicode Path extra field to ``filename``
-                # while retaining the legacy CP437-decoded name in ``orig_filename``.
-                # The former is the archive lookup key.  Validate both so a malicious
-                # alias cannot hide traversal, but extract by the canonical lookup key.
-                original_name = info.filename
-                legacy_name = getattr(info, "orig_filename", original_name)
-                if legacy_name != original_name:
-                    try:
-                        _normalize_relative_path(legacy_name, limits)
-                    except _IngestFailure as failure:
-                        alias_issues.append(
-                            _issue(failure.code, failure.message, evidence=failure.evidence)
+                (
+                    lookup_name,
+                    output_name,
+                    path_aliases,
+                    repaired_encoding,
+                    segment_aliases,
+                ) = _zip_member_names(info)
+                proposed_output_name = output_name
+                (
+                    output_name,
+                    repaired_encoding,
+                    overrides,
+                    authoritative_conflicts,
+                ) = _reuse_zip_segment_aliases(
+                    output_name,
+                    segment_aliases,
+                    segment_map,
+                    repaired_encoding,
+                )
+                segment_override_count += overrides
+                if output_name != proposed_output_name:
+                    path_aliases = tuple(dict.fromkeys((*path_aliases, proposed_output_name)))
+                for prior_segment, proposed_segment in authoritative_conflicts:
+                    segment_issues.append(
+                        _issue(
+                            "ZIP_SEGMENT_ALIAS_CONFLICT",
+                            "同一 ZIP 原始路径段对应多个 Unicode 别名。",
+                            evidence=[prior_segment, proposed_segment],
                         )
+                    )
                 unix_mode = (info.external_attr >> 16) & 0xFFFF
                 file_type = stat.S_IFMT(unix_mode)
                 is_link = stat.S_ISLNK(unix_mode)
@@ -535,7 +877,11 @@ def _preflight_zip(path: Path, limits: IngestLimits) -> _Preflight:
                 allowed_type = file_type in {0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK}
                 raw_members.append(
                     _RawMember(
-                        original_name=original_name,
+                        original_name=lookup_name,
+                        output_name=output_name,
+                        path_aliases=path_aliases,
+                        name_repaired=repaired_encoding is not None,
+                        repaired_encoding=repaired_encoding,
                         size=info.file_size,
                         compressed_size=info.compress_size,
                         is_dir=is_dir,
@@ -555,7 +901,18 @@ def _preflight_zip(path: Path, limits: IngestLimits) -> _Preflight:
             ]
         )
     preflight = _validate_members(raw_members, limits, archive_bytes=path.stat().st_size)
-    preflight.issues = [*alias_issues, *preflight.issues]
+    preflight.metadata["zip_segment_alias_count"] = len(segment_map)
+    preflight.metadata["zip_segment_consistency_override_count"] = segment_override_count
+    preflight.issues = [*segment_issues, *preflight.issues]
+    if segment_override_count:
+        preflight.issues.append(
+            _issue(
+                "ZIP_SEGMENT_ALIAS_REUSED",
+                f"已复用 {segment_override_count} 个重复 ZIP 路径段的既定编码别名。",
+                severity=Severity.WARNING,
+                evidence=[str(segment_override_count)],
+            )
+        )
     return preflight
 
 
@@ -725,6 +1082,14 @@ def _open_regular_file(path: Path, expected: tuple[int, int, int, int] | None) -
     return handle
 
 
+def _detect_archive_kind(
+    path: Path,
+    expected: tuple[int, int, int, int],
+) -> Literal["zip", "rar", "7z"] | None:
+    with _open_regular_file(path, expected) as source:
+        return _archive_kind_from_prefix(source.read(8))
+
+
 def _copy_stream(
     source: BinaryIO,
     destination: Path,
@@ -837,9 +1202,7 @@ def _seven_zip_executable() -> Path | None:
     candidates = [
         shutil.which("7z"),
         Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "7-Zip" / "7z.exe",
-        Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
-        / "7-Zip"
-        / "7z.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "7-Zip" / "7z.exe",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
@@ -933,6 +1296,9 @@ def _source_record(
     else:
         archive_member = member.original_name
         metadata["container_sha256"] = container_sha256
+        metadata["archive_member_normalized"] = member.relative_path
+        metadata["archive_member_name_repaired"] = member.name_repaired
+        metadata["archive_member_repaired_encoding"] = member.repaired_encoding
     path_digest = hashlib.sha256(member.relative_path.encode("utf-8")).hexdigest()[:16]
     return SourceFile(
         # Content hashes remain separately queryable, while the path suffix
@@ -973,6 +1339,55 @@ def _base_result(
         ingest_dir=str(ingest_root.resolve(strict=False)),
         extracted_dir=str((ingest_root / "files").resolve(strict=False)),
     )
+
+
+def _publish_ingest_directory(stage: Path, destination: Path) -> int:
+    """Atomically publish a staged tree, tolerating short Windows scanner locks.
+
+    Antivirus/indexing products can briefly open a newly extracted DWG without
+    ``FILE_SHARE_DELETE``.  Windows then rejects the parent-directory rename with
+    WinError 5/32/33.  Retrying the same atomic rename is safe: the destination is
+    checked before every attempt, and no partial final directory is ever exposed.
+    """
+
+    last_error: OSError | None = None
+    for attempt in range(len(_PUBLISH_RETRY_DELAYS_SECONDS) + 1):
+        if destination.exists() or destination.is_symlink():
+            raise _IngestFailure(
+                "INGEST_DESTINATION_EXISTS",
+                "发布结果时发现 ingest 已存在；拒绝覆盖并发或既有结果。",
+                [str(destination)],
+            )
+        try:
+            os.replace(stage, destination)
+            return attempt
+        except OSError as error:
+            last_error = error
+            winerror = getattr(error, "winerror", None)
+            transient = (
+                isinstance(error, PermissionError)
+                or winerror in _TRANSIENT_PUBLISH_WINERRORS
+                or error.errno in {errno.EACCES, errno.EPERM, errno.EBUSY}
+            )
+            if not transient or attempt >= len(_PUBLISH_RETRY_DELAYS_SECONDS):
+                break
+            time.sleep(_PUBLISH_RETRY_DELAYS_SECONDS[attempt])
+
+    assert last_error is not None
+    raise _IngestFailure(
+        "INGEST_PUBLISH_FAILED",
+        (
+            "暂存目录已完整生成，但原子发布持续被系统拒绝；"
+            "可能有杀毒、索引或同步程序短暂占用新文件。"
+        ),
+        [
+            str(stage),
+            str(destination),
+            f"winerror={getattr(last_error, 'winerror', None)}",
+            f"errno={last_error.errno}",
+            str(last_error),
+        ],
+    ) from last_error
 
 
 def ingest_input(
@@ -1018,19 +1433,61 @@ def ingest_input(
         return result
 
     if source.is_dir():
-        input_kind: Literal[
-            "directory", "file", "zip", "rar", "7z", "unsupported"
-        ] = "directory"
+        input_kind: Literal["directory", "file", "zip", "rar", "7z", "unsupported"] = "directory"
+        format_metadata: dict[str, object] = {
+            "input_extension": source.suffix.lower(),
+            "detected_format": "directory",
+            "format_detection": "filesystem",
+            "extension_mismatch": False,
+        }
     elif source.is_file():
         suffix = source.suffix.lower()
-        input_kind = {".zip": "zip", ".rar": "rar", ".7z": "7z"}.get(
-            suffix,
-            "file" if suffix in _SINGLE_FILE_SUFFIXES else "unsupported",
+        declared_archive_kind = _ARCHIVE_SUFFIXES.get(suffix)
+        if suffix in _SINGLE_FILE_SUFFIXES:
+            input_kind = "file"
+            detected_archive_kind = None
+            detection_method = "single_file_suffix"
+        else:
+            try:
+                detected_archive_kind = _detect_archive_kind(source, _signature(source_stat))
+            except _IngestFailure as failure:
+                result = _base_result(source, run_root, "unsupported")
+                result.issues.append(
+                    _issue(failure.code, failure.message, evidence=failure.evidence)
+                )
+                return result
+            input_kind = detected_archive_kind or declared_archive_kind or "unsupported"
+            detection_method = "signature" if detected_archive_kind else "extension_fallback"
+        extension_mismatch = detected_archive_kind is not None and (
+            declared_archive_kind != detected_archive_kind
         )
+        format_metadata = {
+            "input_extension": suffix,
+            "declared_archive_format": declared_archive_kind,
+            "detected_format": detected_archive_kind or input_kind,
+            "format_detection": detection_method,
+            "extension_mismatch": extension_mismatch,
+        }
     else:
         input_kind = "unsupported"
+        format_metadata = {
+            "input_extension": source.suffix.lower(),
+            "detected_format": "unsupported",
+            "format_detection": "filesystem",
+            "extension_mismatch": False,
+        }
 
     result = _base_result(source, run_root, input_kind)
+    result.metadata.update(format_metadata)
+    if bool(format_metadata.get("extension_mismatch")):
+        result.issues.append(
+            _issue(
+                "ARCHIVE_EXTENSION_MISMATCH",
+                (f"文件扩展名与归档签名不一致；已按实际 {input_kind.upper()} 格式安全处理。"),
+                severity=Severity.WARNING,
+                evidence=[source.name, source.suffix.lower() or "(none)", input_kind],
+            )
+        )
     if input_kind == "unsupported":
         result.issues.append(
             _issue(
@@ -1104,6 +1561,7 @@ def ingest_input(
 
     result.issues.extend(preflight.issues)
     result.input_sha256 = preflight.input_sha256
+    result.metadata.update(preflight.metadata)
     if _has_blocking_issue(result.issues):
         return result
 
@@ -1198,7 +1656,7 @@ def ingest_input(
         if input_kind == "directory":
             result.input_sha256 = _tree_digest(records)
 
-        os.replace(stage, final_ingest_root)
+        publish_retry_count = _publish_ingest_directory(stage, final_ingest_root)
         result.files = records
         result.succeeded = True
         if input_kind != "directory":
@@ -1206,11 +1664,23 @@ def ingest_input(
                 (final_ingest_root / "original" / f"input{source.suffix.lower()}").resolve()
             )
         result.metadata = {
+            **result.metadata,
             "file_count": len(records),
             "total_uncompressed_bytes": actual_total,
             "normalized_paths": True,
             "originals_modified": False,
+            "publish_method": "atomic_directory_rename",
+            "publish_retry_count": publish_retry_count,
         }
+        if publish_retry_count:
+            result.issues.append(
+                _issue(
+                    "INGEST_PUBLISH_RETRIED",
+                    f"原子发布曾被占用，重试 {publish_retry_count} 次后成功。",
+                    severity=Severity.WARNING,
+                    evidence=[str(publish_retry_count)],
+                )
+            )
         if not records:
             result.issues.append(
                 _issue(

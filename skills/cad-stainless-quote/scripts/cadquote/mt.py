@@ -17,13 +17,28 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any
 
-from .materials import find_mt_codes, normalize_mt_code, normalize_text
-from .models import CadEntity, MaterialSpec, MtOccurrence, ReviewStatus
+from .materials import (
+    DEFAULT_REVIEW_CODE_FAMILIES,
+    DEFAULT_STAINLESS_CODE_FAMILIES,
+    find_material_codes,
+    material_code_disposition,
+    normalize_material_code_family,
+    normalize_mt_code,
+    normalize_text,
+)
+from .models import (
+    CadEntity,
+    EvidenceEdge,
+    MaterialMention,
+    MaterialSpec,
+    MtOccurrence,
+    ReviewStatus,
+)
 
 _TEXT_TYPES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF", "MULTILEADER", "MLEADER"}
 _LEADER_TYPES = {"LEADER", "MLEADER", "MULTILEADER"}
-_DETACHED_MT_RE = re.compile(r"^\s*M\s*T\s*[-—–－_:/／\\]?\s*$", re.I)
 _NUMBER_RE = re.compile(r"^\s*0*(\d{1,3})\s*$")
+_STAINLESS_RE = re.compile(r"不锈钢", re.I)
 _MATERIAL_KEYWORD_RE = re.compile(
     r"不锈钢|钢板|金属|铝板|铝合金|铜板|铁板|钛金|玫瑰金|镜面|拉丝|喷砂|"
     r"苹果砂|古铜|烤漆|镀色|雕花|蚀刻"
@@ -53,6 +68,9 @@ class TextCluster:
 @dataclass(frozen=True)
 class _Seed:
     code: str
+    raw_code: str
+    family: str
+    disposition: str
     entities: tuple[CadEntity, ...]
     confidence: float
     method: str
@@ -142,9 +160,7 @@ def cluster_nearby_text(
     """
 
     text_entities = [
-        entity
-        for entity in entities
-        if entity.text and entity.entity_type.upper() in _TEXT_TYPES
+        entity for entity in entities if entity.text and entity.entity_type.upper() in _TEXT_TYPES
     ]
     by_scope: dict[tuple[str, str | None, str], list[CadEntity]] = defaultdict(list)
     for entity in text_entities:
@@ -206,26 +222,37 @@ def cluster_nearby_text(
     return sorted(clusters, key=lambda cluster: cluster.entity_ids)
 
 
-def _detached_seeds(group: Sequence[CadEntity], radius: float) -> list[_Seed]:
-    mt_entities = [
-        entity
-        for entity in group
-        if _DETACHED_MT_RE.fullmatch(clean_cad_text(entity.text))
-    ]
+def _detached_seeds(
+    group: Sequence[CadEntity],
+    radius: float,
+    *,
+    stainless_families: Iterable[str],
+    review_families: Iterable[str],
+) -> list[_Seed]:
+    family_entities: list[tuple[CadEntity, str, str]] = []
+    for entity in group:
+        family = normalize_material_code_family(clean_cad_text(entity.text))
+        disposition = material_code_disposition(
+            family,
+            stainless_families=stainless_families,
+            review_families=review_families,
+        )
+        if family and disposition:
+            family_entities.append((entity, family, disposition))
     number_entities = [
         entity for entity in group if _NUMBER_RE.fullmatch(clean_cad_text(entity.text))
     ]
-    candidates: list[tuple[float, str, str, CadEntity, CadEntity]] = []
-    for mt_entity in mt_entities:
-        mt_point = entity_center(mt_entity)
+    candidates: list[tuple[float, str, str, CadEntity, str, str, CadEntity]] = []
+    for family_entity, family, disposition in family_entities:
+        family_point = entity_center(family_entity)
         for number_entity in number_entities:
             number_point = entity_center(number_entity)
-            distance = _distance(mt_point, number_point)
+            distance = _distance(family_point, number_point)
             if distance > radius:
                 continue
-            if mt_point is not None and number_point is not None:
-                dx = number_point[0] - mt_point[0]
-                dy = abs(number_point[1] - mt_point[1])
+            if family_point is not None and number_point is not None:
+                dx = number_point[0] - family_point[0]
+                dy = abs(number_point[1] - family_point[1])
                 # Callout codes are normally on the same baseline, with the
                 # number to the right.  Below/right is tolerated for blocks.
                 if dy > radius * 0.65 or dx < -radius * 0.35:
@@ -236,25 +263,39 @@ def _detached_seeds(group: Sequence[CadEntity], radius: float) -> list[_Seed]:
             candidates.append(
                 (
                     distance + orientation_penalty,
-                    mt_entity.id,
+                    family_entity.id,
                     number_entity.id,
-                    mt_entity,
+                    family_entity,
+                    family,
+                    disposition,
                     number_entity,
                 )
             )
 
-    used_mt: set[str] = set()
+    used_families: set[str] = set()
     used_numbers: set[str] = set()
     seeds: list[_Seed] = []
-    for _, _, _, mt_entity, number_entity in sorted(candidates):
-        if mt_entity.id in used_mt or number_entity.id in used_numbers:
+    for _, _, _, family_entity, family, disposition, number_entity in sorted(candidates):
+        if family_entity.id in used_families or number_entity.id in used_numbers:
             continue
         match = _NUMBER_RE.fullmatch(clean_cad_text(number_entity.text))
         assert match is not None
         width = max(2, len(match.group(1)))
-        code = f"MT-{int(match.group(1)):0{width}d}"
-        seeds.append(_Seed(code, (mt_entity, number_entity), 0.80, "detached_text"))
-        used_mt.add(mt_entity.id)
+        code = f"{family}-{int(match.group(1)):0{width}d}"
+        confidence = 0.80 if disposition == "stainless" else 0.56
+        seeds.append(
+            _Seed(
+                code=code,
+                raw_code=f"{clean_cad_text(family_entity.text)} "
+                f"{clean_cad_text(number_entity.text)}",
+                family=family,
+                disposition=disposition,
+                entities=(family_entity, number_entity),
+                confidence=confidence,
+                method="detached_text",
+            )
+        )
+        used_families.add(family_entity.id)
         used_numbers.add(number_entity.id)
     return seeds
 
@@ -343,6 +384,8 @@ def _extract_leader_points(
 
 def _bind_leader(
     seed_entities: Sequence[CadEntity],
+    seed_code: str,
+    seed_family: str,
     anchor: tuple[float, float] | None,
     leaders: Sequence[CadEntity],
     radius: float,
@@ -352,8 +395,15 @@ def _bind_leader(
     for leader in leaders:
         label, target = _extract_leader_points(leader)
         own_annotation = leader.id in seed_ids or bool(
-            set(find_mt_codes(leader.text or ""))
-            & {code for entity in seed_entities for code in find_mt_codes(entity.text or "")}
+            seed_code
+            in {
+                match.normalized_code
+                for match in find_material_codes(
+                    leader.text or "",
+                    stainless_families={seed_family},
+                    review_families=(),
+                )
+            }
         )
         distance = 0.0 if own_annotation else _distance(anchor, label)
         if distance <= radius:
@@ -392,7 +442,14 @@ def _occurrence_from_seed(
     if descriptor is not None and descriptor.id not in {entity.id for entity in entities}:
         entities.append(descriptor)
     leaders = [entity for entity in group if entity.entity_type.upper() in _LEADER_TYPES]
-    leader, target = _bind_leader(entities, anchor, leaders, leader_radius)
+    leader, target = _bind_leader(
+        entities,
+        seed.code,
+        seed.family,
+        anchor,
+        leaders,
+        leader_radius,
+    )
     if leader is not None and leader.id not in {entity.id for entity in entities}:
         entities.append(leader)
 
@@ -420,9 +477,7 @@ def _occurrence_from_seed(
                 or distance > radius * 6.0
             ):
                 continue
-            component_candidates.append(
-                (distance + priority * radius * 0.15, entity.id, text)
-            )
+            component_candidates.append((distance + priority * radius * 0.15, entity.id, text))
     component_hint = min(component_candidates)[2] if component_candidates else None
     if (
         component_hint is None
@@ -454,6 +509,8 @@ def _occurrence_from_seed(
     return MtOccurrence(
         id=_stable_id("mt", payload),
         mt_code=seed.code,
+        raw_material_code=seed.raw_code,
+        material_code_family=seed.family,
         source_file_id=source.source_file_id,
         sheet_id=source.sheet_id,
         entity_ids=entity_ids,
@@ -523,6 +580,206 @@ def deduplicate_occurrences(
     return sorted(output, key=lambda item: (item.source_file_id, item.sheet_id or "", item.id))
 
 
+def detect_material_mentions(
+    entities: Iterable[CadEntity],
+    *,
+    occurrences: Iterable[MtOccurrence] = (),
+) -> list[MaterialMention]:
+    """Retain unnumbered stainless descriptions as diagnostics, never MT rows."""
+
+    used_entity_ids = {
+        entity_id for occurrence in occurrences for entity_id in occurrence.entity_ids
+    }
+    mentions: list[MaterialMention] = []
+    seen_source_entities: set[tuple[str, str]] = set()
+    for entity in sorted(entities, key=lambda value: value.id):
+        if (
+            entity.id in used_entity_ids
+            or not entity.text
+            or entity.entity_type.upper() not in _TEXT_TYPES
+        ):
+            continue
+        text = clean_cad_text(entity.text)
+        if not _STAINLESS_RE.search(text) or find_material_codes(text):
+            continue
+        original_id = str(entity.geometry.get("original_entity_id") or entity.id)
+        identity = (entity.source_file_id, original_id)
+        if identity in seen_source_entities:
+            continue
+        seen_source_entities.add(identity)
+        anchor = entity_center(entity)
+        rounded_anchor = tuple(round(value, 6) for value in anchor) if anchor is not None else None
+        payload = {
+            "raw_text": text,
+            "source_file_id": entity.source_file_id,
+            "sheet_id": entity.sheet_id,
+            "entity_ids": [entity.id],
+            "anchor": rounded_anchor,
+        }
+        mentions.append(
+            MaterialMention(
+                id=_stable_id("material-mention", payload),
+                raw_text=text,
+                source_file_id=entity.source_file_id,
+                sheet_id=entity.sheet_id,
+                entity_ids=[entity.id],
+                anchor=rounded_anchor,
+                confidence=0.38 if _COMPONENT_RE.search(text) else 0.32,
+                status=ReviewStatus.REVIEW,
+            )
+        )
+    return mentions
+
+
+def link_docx_material_mentions(
+    mentions: Iterable[MaterialMention],
+    materials: Iterable[MaterialSpec],
+    *,
+    stainless_code_families: Iterable[str] | None = None,
+) -> tuple[list[EvidenceEdge], list[MtOccurrence]]:
+    """Create auditable REVIEW candidates from DOCX descriptions to CAD mentions.
+
+    Only records explicitly parsed from a DOCX material book participate. A
+    normalized description must resolve to exactly one configured stainless code.
+    Ambiguous descriptions produce BLOCK candidate edges and never occurrences.
+    """
+
+    stainless_families = tuple(
+        DEFAULT_STAINLESS_CODE_FAMILIES
+        if stainless_code_families is None
+        else stainless_code_families
+    )
+    phrase_specs: dict[str, list[MaterialSpec]] = defaultdict(list)
+    for material in materials:
+        family = material.material_code_family or material.mt_code.rsplit("-", 1)[0]
+        if (
+            material.source_type != "docx_material_book"
+            or material_code_disposition(
+                family,
+                stainless_families=stainless_families,
+                review_families=(),
+            )
+            != "stainless"
+        ):
+            continue
+        phrase = re.sub(
+            r"[\s,，。()（）/|｜:：;；._\-—–]+",
+            "",
+            clean_cad_text(material.name),
+        ).casefold()
+        if len(phrase) >= 3:
+            phrase_specs[phrase].append(material)
+
+    edges: list[EvidenceEdge] = []
+    occurrences: list[MtOccurrence] = []
+    for mention in sorted(mentions, key=lambda value: value.id):
+        compact = re.sub(
+            r"[\s,，。()（）/|｜:：;；._\-—–]+",
+            "",
+            clean_cad_text(mention.raw_text),
+        ).casefold()
+        matched_specs = {
+            material.id: material
+            for phrase, values in phrase_specs.items()
+            if phrase in compact or compact in phrase
+            for material in values
+        }
+        by_code: dict[str, list[MaterialSpec]] = defaultdict(list)
+        for material in matched_specs.values():
+            by_code[material.mt_code].append(material)
+        if not by_code:
+            continue
+
+        candidate_codes = sorted(by_code)
+        unique_code = candidate_codes[0] if len(candidate_codes) == 1 else None
+        blocked_definition = bool(
+            unique_code
+            and any(
+                material.status == ReviewStatus.BLOCK or material.conflicts
+                for material in by_code[unique_code]
+            )
+        )
+        relation_status = (
+            ReviewStatus.REVIEW
+            if unique_code is not None and not blocked_definition
+            else ReviewStatus.BLOCK
+        )
+        codes_for_edges = [unique_code] if unique_code is not None else candidate_codes
+        for code in codes_for_edges:
+            assert code is not None
+            candidates = sorted(by_code[code], key=lambda value: value.id)
+            target = candidates[0]
+            payload = {
+                "relation": "material_mention_to_material",
+                "mention_id": mention.id,
+                "material_code": code,
+                "material_spec_ids": [value.id for value in candidates],
+                "candidate_codes": candidate_codes,
+            }
+            basis = [
+                "source_type:docx_material_book",
+                f"material_code:{code}",
+                (
+                    "description_normalized_unique"
+                    if unique_code is not None
+                    else "description_normalized_ambiguous"
+                ),
+                f"candidate_codes:{','.join(candidate_codes)}",
+                *(
+                    f"document_sha256:{value.source_sha256}"
+                    for value in candidates
+                    if value.source_sha256
+                ),
+                *(
+                    f"source_location:{value.source_location}"
+                    for value in candidates
+                    if value.source_location
+                ),
+            ]
+            edges.append(
+                EvidenceEdge(
+                    id=_stable_id("edge", payload),
+                    relation="material_mention_to_material",
+                    source_id=mention.id,
+                    target_id=target.id,
+                    basis=list(dict.fromkeys(basis)),
+                    confidence=0.46 if relation_status == ReviewStatus.REVIEW else 0.28,
+                    status=relation_status,
+                )
+            )
+
+        if unique_code is None or blocked_definition:
+            continue
+        representative = sorted(by_code[unique_code], key=lambda value: value.id)[0]
+        family = representative.material_code_family or unique_code.rsplit("-", 1)[0]
+        occurrence_payload = {
+            "material_mention_id": mention.id,
+            "mt_code": unique_code,
+            "material_spec_ids": sorted(value.id for value in by_code[unique_code]),
+        }
+        occurrences.append(
+            MtOccurrence(
+                id=_stable_id("mt-docx-candidate", occurrence_payload),
+                mt_code=unique_code,
+                raw_material_code=representative.raw_material_code or unique_code,
+                material_code_family=family,
+                source_file_id=mention.source_file_id,
+                sheet_id=mention.sheet_id,
+                entity_ids=list(mention.entity_ids),
+                anchor=mention.anchor,
+                component_hint=(
+                    mention.raw_text if _COMPONENT_RE.search(mention.raw_text) else None
+                ),
+                confidence=0.44,
+                status=ReviewStatus.REVIEW,
+            )
+        )
+    return (
+        sorted(edges, key=lambda value: value.id),
+        deduplicate_occurrences(occurrences),
+    )
+
+
 def detect_mt_occurrences(
     entities: Iterable[CadEntity],
     *,
@@ -530,11 +787,26 @@ def detect_mt_occurrences(
     cluster_distance: float | None = None,
     leader_bind_distance: float | None = None,
     room_search_distance: float | None = None,
+    stainless_code_families: Iterable[str] | None = None,
+    review_code_families: Iterable[str] | None = None,
 ) -> list[MtOccurrence]:
-    """Detect explicit, detached, and uniquely material-resolved MT labels."""
+    """Detect configured stainless/review material-code annotations.
+
+    ``MT`` and ``GC-SS`` are stainless families by default. ``GC-MT`` remains
+    a lower-confidence review candidate unless callers explicitly move it into
+    ``stainless_code_families``. Other families are ignored unless configured.
+    """
 
     all_entities = list(entities)
     material_list = list(materials)
+    stainless_families = tuple(
+        DEFAULT_STAINLESS_CODE_FAMILIES
+        if stainless_code_families is None
+        else stainless_code_families
+    )
+    review_families = tuple(
+        DEFAULT_REVIEW_CODE_FAMILIES if review_code_families is None else review_code_families
+    )
     by_scope: dict[tuple[str, str | None, str], list[CadEntity]] = defaultdict(list)
     for entity in all_entities:
         by_scope[(entity.source_file_id, entity.sheet_id, entity.space)].append(entity)
@@ -552,13 +824,30 @@ def detect_mt_occurrences(
             if not entity.text or entity.entity_type.upper() not in _TEXT_TYPES:
                 continue
             text = clean_cad_text(entity.text)
-            for code in find_mt_codes(text):
-                seeds.append(_Seed(code, (entity,), 0.88, "explicit_text"))
-        detached = _detached_seeds(group, radius)
+            for code_match in find_material_codes(
+                text,
+                stainless_families=stainless_families,
+                review_families=review_families,
+            ):
+                seeds.append(
+                    _Seed(
+                        code=code_match.normalized_code,
+                        raw_code=code_match.raw_code,
+                        family=code_match.family,
+                        disposition=code_match.disposition,
+                        entities=(entity,),
+                        confidence=(0.88 if code_match.disposition == "stainless" else 0.58),
+                        method="explicit_text",
+                    )
+                )
+        detached = _detached_seeds(
+            group,
+            radius,
+            stainless_families=stainless_families,
+            review_families=review_families,
+        )
         seeds.extend(detached)
-        detached_entity_ids = {
-            entity.id for seed in detached for entity in seed.entities
-        }
+        detached_entity_ids = {entity.id for seed in detached for entity in seed.entities}
         # Some callout blocks store only a numeric value in an ATTRIB whose tag
         # carries the MT meaning.  This is explicit structured evidence even if
         # the static "MT" glyph was omitted from the exported DXF.
@@ -567,10 +856,43 @@ def detect_mt_occurrences(
                 continue
             tag = clean_cad_text(entity.geometry.get("tag")).upper()
             match = _NUMBER_RE.fullmatch(clean_cad_text(entity.text))
-            if match and re.search(r"(?:^|[_-])MT(?:$|[_-])|材料.*编号|物料.*编号", tag):
+            family: str | None = None
+            disposition: str | None = None
+            tag_compact = re.sub(r"[^A-Z0-9\u4e00-\u9fff]", "", tag)
+            for configured_family in sorted(
+                {*stainless_families, *review_families},
+                key=lambda value: (-len(value), value),
+            ):
+                normalized_family = normalize_material_code_family(configured_family)
+                if normalized_family and normalized_family.replace("-", "") in tag_compact:
+                    family = normalized_family
+                    disposition = material_code_disposition(
+                        family,
+                        stainless_families=stainless_families,
+                        review_families=review_families,
+                    )
+                    break
+            if family is None and re.search(r"材料.*编号|物料.*编号", tag):
+                family = "MT"
+                disposition = material_code_disposition(
+                    family,
+                    stainless_families=stainless_families,
+                    review_families=review_families,
+                )
+            if match and family and disposition:
                 width = max(2, len(match.group(1)))
-                code = f"MT-{int(match.group(1)):0{width}d}"
-                seeds.append(_Seed(code, (entity,), 0.84, "attribute_tag"))
+                code = f"{family}-{int(match.group(1)):0{width}d}"
+                seeds.append(
+                    _Seed(
+                        code=code,
+                        raw_code=f"{family} {clean_cad_text(entity.text)}",
+                        family=family,
+                        disposition=disposition,
+                        entities=(entity,),
+                        confidence=0.84 if disposition == "stainless" else 0.54,
+                        method="attribute_tag",
+                    )
+                )
 
         for seed in seeds:
             occurrence = _occurrence_from_seed(
@@ -599,9 +921,33 @@ def detect_mt_occurrences(
             code = _match_material_code(entity.text, phrases)
             if code is None:
                 continue
+            material = next(
+                (value for value in material_list if value.mt_code == code),
+                None,
+            )
+            family = (
+                material.material_code_family
+                if material and material.material_code_family
+                else code.rsplit("-", 1)[0]
+            )
+            disposition = material_code_disposition(
+                family,
+                stainless_families=stainless_families,
+                review_families=review_families,
+            )
+            if disposition is None:
+                continue
             detections.append(
                 _occurrence_from_seed(
-                    _Seed(code, (entity,), 0.65, "material_name"),
+                    _Seed(
+                        code=code,
+                        raw_code=(material.raw_material_code if material else None) or code,
+                        family=family,
+                        disposition=disposition,
+                        entities=(entity,),
+                        confidence=0.65 if disposition == "stainless" else 0.48,
+                        method="material_name",
+                    ),
                     group=group,
                     radius=radius,
                     room_radius=room_radius,
@@ -618,7 +964,9 @@ __all__ = [
     "cluster_nearby_text",
     "contains_material_keyword",
     "deduplicate_occurrences",
+    "detect_material_mentions",
     "detect_mt_occurrences",
     "entity_center",
+    "link_docx_material_mentions",
     "normalize_mt_code",
 ]

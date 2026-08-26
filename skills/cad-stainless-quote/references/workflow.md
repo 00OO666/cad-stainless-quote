@@ -16,6 +16,12 @@ Never promote a lower-priority source over a conflicting higher-priority source 
 
 Rank a plan→elevation or elevation→detail edge using explicit reference code, room/component identity, MT code, leader target, geometric neighborhood, title/sheet compatibility, and direction. File-name similarity alone is not sufficient for PASS.
 
+When CAD contains only an unnumbered stainless description, an ingested DOCX material book may
+provide a material-code candidate. Accept only an explicit configured code family plus a
+description, and retain the document hash and row/cell or paragraph locator. A unique normalized
+description is still REVIEW; an ambiguous or conflicting mapping is BLOCK. Neither case proves a
+physical quantity.
+
 ## REVIEW versus BLOCK
 
 - REVIEW: plausible candidates exist but require a choice, deduction, or business convention.

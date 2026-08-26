@@ -20,7 +20,12 @@ from cadquote.gold import import_gold_workbook
 from cadquote.ingest import ingest_input
 from cadquote.io import write_json_atomic
 from cadquote.linking import rank_evidence_edges
-from cadquote.materials import load_material_specs
+from cadquote.materials import (
+    DEFAULT_REVIEW_CODE_FAMILIES,
+    DEFAULT_STAINLESS_CODE_FAMILIES,
+    load_docx_material_specs,
+    load_material_specs,
+)
 from cadquote.models import (
     CadEntity,
     EvidenceEdge,
@@ -32,7 +37,7 @@ from cadquote.models import (
     Sheet,
     TakeoffItem,
 )
-from cadquote.mt import detect_mt_occurrences
+from cadquote.mt import detect_material_mentions, detect_mt_occurrences
 from cadquote.panels import PanelExpansion, choose_analysis_view
 from cadquote.pipeline import load_confirmation_bundle, resume_pipeline, run_pipeline
 from cadquote.render import load_regions_json, render_regions, viewport_model_regions
@@ -40,7 +45,16 @@ from cadquote.takeoff import build_takeoff
 
 
 def _print(payload: Any) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    output_encoding = sys.stdout.encoding or "utf-8"
+    try:
+        text.encode(output_encoding, errors="strict")
+    except (LookupError, UnicodeEncodeError):
+        # Raw ZIP lookup keys can contain valid CP437 glyphs that a GBK Windows
+        # console cannot represent.  Escape only the terminal copy; JSON artifacts
+        # on disk retain their original Unicode audit data.
+        text = json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+    sys.stdout.write(f"{text}\n")
 
 
 def _load_json(path: Path | str) -> Any:
@@ -96,13 +110,52 @@ def _takeoff_rows(payload: Any) -> list[dict[str, Any]]:
     raise ValueError("takeoff JSON has no items or gold rows")
 
 
+def _evaluation_rows(payload: Any) -> tuple[list[dict[str, Any]], list[str | None]]:
+    """Load takeoff rows while retaining stable wrapper IDs from gold-import JSON."""
+
+    if isinstance(payload, list):
+        raw_rows = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        raw_rows = payload["items"]
+    elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        raw_rows = payload["rows"]
+    else:
+        raise ValueError("takeoff JSON has no items or gold rows")
+    rows: list[dict[str, Any]] = []
+    row_ids: list[str | None] = []
+    for value in raw_rows:
+        if not isinstance(value, dict):
+            raise ValueError("every evaluation row must be an object")
+        if isinstance(value.get("item"), dict):
+            item = dict(value["item"])
+            row_id = value.get("gold_id") or value.get("row_id") or value.get("id")
+        else:
+            item = dict(value)
+            row_id = item.pop("gold_id", None) or item.pop("row_id", None) or item.pop("id", None)
+            item.pop("project_id", None)
+        rows.append(item)
+        row_ids.append(str(row_id) if row_id is not None else None)
+    return rows, row_ids
+
+
+def _evaluation_project_id(payload: Any, fallback: str) -> str:
+    if not isinstance(payload, dict):
+        return fallback
+    metadata = payload.get("metadata")
+    values = (
+        payload.get("project_id"),
+        payload.get("project_name"),
+        metadata.get("project_id") if isinstance(metadata, dict) else None,
+        metadata.get("project_name") if isinstance(metadata, dict) else None,
+    )
+    return next((str(value).strip() for value in values if value and str(value).strip()), fallback)
+
+
 def _load_index(path: Path | str) -> tuple[list[Sheet], list[CadEntity]]:
     payload = _load_json(path)
     sources = payload.get("sources", []) if isinstance(payload, dict) else []
     sheets = [
-        Sheet.model_validate(value)
-        for source in sources
-        for value in source.get("sheets", [])
+        Sheet.model_validate(value) for source in sources for value in source.get("sheets", [])
     ]
     entities = [
         CadEntity.model_validate(value)
@@ -122,9 +175,7 @@ def _apply_panels(
     panel_payload = _load_json(panels_path)
     expansion = PanelExpansion(
         sheets=[Sheet.model_validate(value) for value in panel_payload.get("sheets", [])],
-        entities=[
-            CadEntity.model_validate(value) for value in panel_payload.get("entities", [])
-        ],
+        entities=[CadEntity.model_validate(value) for value in panel_payload.get("entities", [])],
         source_panel_counts={
             str(key): int(value)
             for key, value in panel_payload.get("source_panel_counts", {}).items()
@@ -141,6 +192,14 @@ def command_doctor(_: argparse.Namespace) -> int:
 
 
 def command_run(args: argparse.Namespace) -> int:
+    stainless_families = {
+        *DEFAULT_STAINLESS_CODE_FAMILIES,
+        *(args.stainless_code_family or []),
+    }
+    review_families = {
+        *DEFAULT_REVIEW_CODE_FAMILIES,
+        *(args.review_code_family or []),
+    } - stainless_families
     result = run_pipeline(
         args.input,
         args.out,
@@ -150,6 +209,8 @@ def command_run(args: argparse.Namespace) -> int:
         currency=args.currency,
         tax_included=args.tax_included,
         render_evidence=not args.no_render,
+        stainless_code_families=sorted(stainless_families),
+        review_code_families=sorted(review_families),
     )
     _print(_pipeline_cli_summary(result))
     return 0 if result.status.value in {"PASS", "REVIEW"} else 2
@@ -206,10 +267,34 @@ def command_index(args: argparse.Namespace) -> int:
 
 
 def command_materials(args: argparse.Namespace) -> int:
-    values = load_material_specs(args.workbook)
+    stainless_families = {
+        *DEFAULT_STAINLESS_CODE_FAMILIES,
+        *(args.stainless_code_family or []),
+    }
+    review_families = {
+        *DEFAULT_REVIEW_CODE_FAMILIES,
+        *(args.review_code_family or []),
+    } - stainless_families
+    values = (
+        load_docx_material_specs(
+            args.workbook,
+            stainless_families=stainless_families,
+            review_families=review_families,
+        )
+        if args.workbook.suffix.lower() == ".docx"
+        else load_material_specs(args.workbook)
+    )
     payload = [value.model_dump(mode="json") for value in values]
     write_json_atomic(Path(args.out), payload)
-    _print({"material_count": len(values), "output": str(Path(args.out).resolve())})
+    _print(
+        {
+            "material_count": len(values),
+            "docx_material_count": sum(
+                value.source_type == "docx_material_book" for value in values
+            ),
+            "output": str(Path(args.out).resolve()),
+        }
+    )
     return 0
 
 
@@ -221,10 +306,43 @@ def command_detect_mt(args: argparse.Namespace) -> int:
         if args.materials
         else []
     )
-    values = detect_mt_occurrences(entities, materials=materials)
+    stainless_families = {
+        *DEFAULT_STAINLESS_CODE_FAMILIES,
+        *(args.stainless_code_family or []),
+    }
+    review_families = {
+        *DEFAULT_REVIEW_CODE_FAMILIES,
+        *(args.review_code_family or []),
+    } - stainless_families
+    values = detect_mt_occurrences(
+        entities,
+        materials=materials,
+        stainless_code_families=stainless_families,
+        review_code_families=review_families,
+    )
     payload = [value.model_dump(mode="json") for value in values]
     write_json_atomic(Path(args.out), payload)
-    _print({"occurrence_count": len(values), "output": str(Path(args.out).resolve())})
+    mentions = detect_material_mentions(entities, occurrences=values)
+    if args.mentions_out:
+        write_json_atomic(
+            Path(args.mentions_out),
+            [value.model_dump(mode="json") for value in mentions],
+        )
+    _print(
+        {
+            "occurrence_count": len(values),
+            "material_mention_count": len(mentions),
+            "code_family_distribution": dict(
+                sorted(Counter(value.material_code_family or "unknown" for value in values).items())
+            ),
+            "stainless_code_families": sorted(stainless_families),
+            "review_code_families": sorted(review_families),
+            "output": str(Path(args.out).resolve()),
+            "mentions_output": (
+                str(Path(args.mentions_out).resolve()) if args.mentions_out else None
+            ),
+        }
+    )
     return 0
 
 
@@ -290,17 +408,12 @@ def command_quote(args: argparse.Namespace) -> int:
             for value in payload.get("evidence_edges", payload.get("edges", []))
         ]
         measurements = [
-            MeasurementCandidate.model_validate(value)
-            for value in payload.get("measurements", [])
+            MeasurementCandidate.model_validate(value) for value in payload.get("measurements", [])
         ]
         issues = [RunIssue.model_validate(value) for value in payload.get("issues", [])]
         raw_metadata = payload.get("metadata", {})
         metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-        missing_sections = [
-            name
-            for name in ("measurements", "issues")
-            if name not in payload
-        ]
+        missing_sections = [name for name in ("measurements", "issues") if name not in payload]
         if "evidence_edges" not in payload and "edges" not in payload:
             missing_sections.insert(0, "evidence_edges")
         if missing_sections:
@@ -354,21 +467,52 @@ def command_render(args: argparse.Namespace) -> int:
 def command_evaluate(args: argparse.Namespace) -> int:
     predicted_payload = _load_json(args.predicted)
     gold_payload = _load_json(args.gold)
-    predicted_rows = _takeoff_rows(predicted_payload)
-    gold_rows = _takeoff_rows(gold_payload)
+    predicted_rows, predicted_row_ids = _evaluation_rows(predicted_payload)
+    gold_rows, gold_row_ids = _evaluation_rows(gold_payload)
+    policy = _load_json(args.policy) if args.policy else None
+    project_id = args.project_id or _evaluation_project_id(gold_payload, Path(args.gold).stem)
     report = evaluate_takeoff(
         [TakeoffItem.model_validate(value) for value in predicted_rows],
         [TakeoffItem.model_validate(value) for value in gold_rows],
+        tolerance=args.tolerance,
+        policy=policy,
+        predicted_row_ids=predicted_row_ids,
+        gold_row_ids=gold_row_ids,
+        project_id=project_id,
     )
     if args.out:
         write_json_atomic(Path(args.out), report)
     # The detailed row-key lists can be very large on real projects. Keep the
     # terminal result readable while preserving the complete report on disk.
-    summary = {
+    summary: dict[str, Any] = {
         key: value
         for key, value in report.items()
-        if key not in {"missing_keys", "unexpected_keys", "row_results"}
+        if key
+        not in {
+            "missing_keys",
+            "unexpected_keys",
+            "row_results",
+            "projects",
+            "policy",
+            "duplicate_groups",
+            "invalid_gold_rows",
+        }
     }
+    summary["project_summaries"] = [
+        {
+            key: value
+            for key, value in project.items()
+            if key
+            not in {
+                "row_results",
+                "duplicate_groups",
+                "invalid_gold_rows",
+                "missing_rows",
+                "unexpected_rows",
+            }
+        }
+        for project in report["projects"]
+    ]
     if args.out:
         summary["output"] = str(Path(args.out).resolve())
     _print(summary)
@@ -405,6 +549,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quote-date", help="报价基准日期（YYYY-MM-DD；默认当天）")
     run.add_argument("--currency", default="CNY", help="价格币种（默认CNY）")
     run.add_argument("--tax-included", type=_parse_bool, help="要求价格含税口径true/false")
+    run.add_argument(
+        "--stainless-code-family",
+        action="append",
+        help="追加明确作为不锈钢处理的材料代号家族（可重复）",
+    )
+    run.add_argument(
+        "--review-code-family",
+        action="append",
+        help="追加只进入低置信审核的材料代号家族（可重复）",
+    )
     run.add_argument("--no-render", action="store_true", help="跳过MT局部证据图渲染")
     run.set_defaults(handler=command_run)
 
@@ -437,8 +591,18 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--out", type=Path, required=True)
     index.set_defaults(handler=command_index)
 
-    materials = subparsers.add_parser("materials", help="解析XLS/XLSX材料表")
+    materials = subparsers.add_parser("materials", help="解析XLS/XLSX或DOCX材料表")
     materials.add_argument("workbook", type=Path)
+    materials.add_argument(
+        "--stainless-code-family",
+        action="append",
+        help="追加明确作为不锈钢处理的材料代号家族（可重复）",
+    )
+    materials.add_argument(
+        "--review-code-family",
+        action="append",
+        help="追加只进入低置信审核的材料代号家族（可重复）",
+    )
     materials.add_argument("--out", type=Path, required=True)
     materials.set_defaults(handler=command_materials)
 
@@ -446,6 +610,17 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("index", type=Path)
     detect.add_argument("--materials", type=Path)
     detect.add_argument("--panels", type=Path, help="使用视口面板并保留未覆盖Model实体")
+    detect.add_argument(
+        "--stainless-code-family",
+        action="append",
+        help="追加明确作为不锈钢处理的代号家族；例如GC-MT（可重复）",
+    )
+    detect.add_argument(
+        "--review-code-family",
+        action="append",
+        help="追加只进入低置信审核的代号家族（可重复）",
+    )
+    detect.add_argument("--mentions-out", type=Path, help="输出无编号不锈钢描述诊断JSON")
     detect.add_argument("--out", type=Path, required=True)
     detect.set_defaults(handler=command_detect_mt)
 
@@ -485,6 +660,21 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("predicted", type=Path)
     evaluate.add_argument("gold", type=Path)
     evaluate.add_argument("--out", type=Path)
+    evaluate.add_argument(
+        "--policy",
+        type=Path,
+        help="版本化验收策略JSON；省略时长度/数量容差保持待确认，结果不能PASS",
+    )
+    evaluate.add_argument(
+        "--project-id",
+        help="本次项目标识；默认取gold元数据或文件名",
+    )
+    evaluate.add_argument(
+        "--tolerance",
+        type=float,
+        default=1e-3,
+        help="旧版工程量绝对精确指标容差（不影响新版95%% gate）",
+    )
     evaluate.set_defaults(handler=command_evaluate)
 
     gold = subparsers.add_parser("gold-import", help="导入并审计人工算量清单金标准")

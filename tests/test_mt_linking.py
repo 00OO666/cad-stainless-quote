@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,9 @@ from cadquote.linking import (
     rank_evidence_edges,
 )
 from cadquote.materials import (
+    find_material_codes,
     load_material_specs,
+    normalize_material_code,
     normalize_mt_code,
     parse_cad_material_specs,
     parse_material_rows,
@@ -21,7 +25,12 @@ from cadquote.models import (
     ReviewStatus,
     Sheet,
 )
-from cadquote.mt import cluster_nearby_text, detect_mt_occurrences
+from cadquote.mt import (
+    cluster_nearby_text,
+    detect_material_mentions,
+    detect_mt_occurrences,
+)
+from cadquote.takeoff import build_component_instances
 from openpyxl import Workbook
 
 
@@ -72,30 +81,142 @@ def test_normalizes_full_width_and_detached_material_cards() -> None:
     assert normalize_mt_code("01") is None
 
     rows = [
-        ["材料编号 NUMBER:", "MT-01", "材料品牌 BRAND:", "示例品牌"],
-        ["材料名称 NAME:", "示例拉丝不锈钢", "材料型号 MODEL:", "SYN-1001"],
-        ["材料规格 SIZE:", "0.8mm厚", "", ""],
+        ["材料编号 NUMBER:", "MT-01", "材料品牌 BRAND:", "某品牌"],
+        ["材料名称 NAME:", "古铜色不锈钢", "材料型号 MODEL:", "ZE-3002"],
+        ["材料规格 SIZE:", "1.2mm厚", "", ""],
         ["", "", "", ""],
         ["材料编号 NUMBER:", "MT", "02"],
-        ["材料名称 NAME:", "示例金属饰件（颜色与MT-01一致）"],
-        ["材料规格 SIZE:", "0.8 mm 厚"],
+        ["材料名称 NAME:", "金属雕花（颜色与MT-01一致）"],
+        ["材料规格 SIZE:", "1.2 mm 厚"],
     ]
-    specs = parse_material_rows(rows, source_file_id="file:synthetic", sheet_name="合成材料")
+    specs = parse_material_rows(rows, source_file_id="file:kaili", sheet_name="金属")
 
     assert [spec.mt_code for spec in specs] == ["MT-01", "MT-02"]
-    assert specs[0].name == "示例拉丝不锈钢"
-    assert specs[0].brand == "示例品牌"
-    assert specs[0].model == "SYN-1001"
-    assert specs[0].thickness_mm == pytest.approx(0.8)
-    assert specs[1].name == "示例金属饰件(颜色与MT-01一致)"
-    assert specs[1].thickness_mm == pytest.approx(0.8)
+    assert specs[0].name == "古铜色不锈钢"
+    assert specs[0].brand == "某品牌"
+    assert specs[0].model == "ZE-3002"
+    assert specs[0].thickness_mm == pytest.approx(1.2)
+    assert specs[1].name == "金属雕花(颜色与MT-01一致)"
+    assert specs[1].thickness_mm == pytest.approx(1.2)
     assert all(spec.status == ReviewStatus.REVIEW for spec in specs)
     assert [spec.id for spec in specs] == [
         spec.id
-        for spec in parse_material_rows(
-            rows, source_file_id="file:synthetic", sheet_name="合成材料"
-        )
+        for spec in parse_material_rows(rows, source_file_id="file:kaili", sheet_name="金属")
     ]
+
+
+def test_general_material_code_families_preserve_identity_and_scope() -> None:
+    matches = find_material_codes("MT-01 / ＧＣ－ＳＳ－１０１ / GC-MT-105 / GC-GL-201 / GC-MR-301")
+
+    assert [value.normalized_code for value in matches] == [
+        "MT-01",
+        "GC-SS-101",
+        "GC-MT-105",
+    ]
+    assert [value.family for value in matches] == ["MT", "GC-SS", "GC-MT"]
+    assert [value.disposition for value in matches] == [
+        "stainless",
+        "stainless",
+        "review",
+    ]
+    assert normalize_material_code("材料号 GC-SS-101") == "GC-SS-101"
+    assert normalize_mt_code("GC-SS-101") is None
+
+
+def test_material_rows_keep_gc_ss_raw_code_and_ignore_unconfigured_families() -> None:
+    rows = [
+        ["材料编号", "名称"],
+        ["ＧＣ－ＳＳ－１０１", "黑色哑光不锈钢"],
+        ["GC-MT-105", "待复核金属"],
+        ["GC-GL-201", "玻璃"],
+        ["GC-MR-301", "镜子"],
+    ]
+
+    specs = parse_material_rows(rows, source_file_id="file:fixture", sheet_name="材料表")
+
+    assert [value.mt_code for value in specs] == ["GC-SS-101", "GC-MT-105"]
+    assert [value.material_code_family for value in specs] == ["GC-SS", "GC-MT"]
+    assert specs[0].raw_material_code == "ＧＣ－ＳＳ－１０１"
+
+
+def test_detects_gc_ss_and_reviews_gc_mt_without_absorbing_gl_or_mr() -> None:
+    entities = [
+        entity("entity:mt", "MT-01", 0, 0),
+        entity("entity:ss", "GC-SS-101", 20, 0),
+        entity("entity:gc-mt", "GC-MT-105", 40, 0),
+        entity("entity:gl", "GC-GL-201", 60, 0),
+        entity("entity:mr", "GC-MR-301", 80, 0),
+    ]
+
+    detected = detect_mt_occurrences(entities, cluster_distance=5)
+
+    assert {value.mt_code for value in detected} == {
+        "MT-01",
+        "GC-SS-101",
+        "GC-MT-105",
+    }
+    by_code = {value.mt_code: value for value in detected}
+    assert by_code["GC-SS-101"].raw_material_code == "GC-SS-101"
+    assert by_code["GC-SS-101"].material_code_family == "GC-SS"
+    assert by_code["GC-MT-105"].material_code_family == "GC-MT"
+    assert by_code["GC-MT-105"].confidence < by_code["GC-SS-101"].confidence
+
+    configured = detect_mt_occurrences(
+        entities,
+        cluster_distance=5,
+        stainless_code_families={"MT", "GC-SS", "GC-MT"},
+        review_code_families=(),
+    )
+    configured_by_code = {value.mt_code: value for value in configured}
+    assert configured_by_code["GC-MT-105"].confidence == pytest.approx(0.88)
+
+
+def test_detects_detached_gc_ss_family_and_number() -> None:
+    detected = detect_mt_occurrences(
+        [
+            entity("entity:family", "GC-SS", 0, 0),
+            entity("entity:number", "102", 8, 0),
+        ],
+        cluster_distance=12,
+    )
+
+    assert len(detected) == 1
+    assert detected[0].mt_code == "GC-SS-102"
+    assert detected[0].raw_material_code == "GC-SS 102"
+    assert detected[0].material_code_family == "GC-SS"
+
+
+def test_unnumbered_stainless_text_is_diagnostic_not_fabricated_mt() -> None:
+    entities = [entity("entity:mention", "黑色哑光不锈钢门套", 10, 10)]
+
+    detected = detect_mt_occurrences(entities)
+    mentions = detect_material_mentions(entities, occurrences=detected)
+
+    assert detected == []
+    assert len(mentions) == 1
+    assert mentions[0].raw_text == "黑色哑光不锈钢门套"
+    assert mentions[0].confidence < 0.5
+    assert "mt_code" not in mentions[0].model_dump()
+
+
+def test_component_candidate_preserves_material_code_family() -> None:
+    occurrence_value = MtOccurrence(
+        id="occurrence:ss",
+        mt_code="GC-SS-101",
+        raw_material_code="ＧＣ－ＳＳ－１０１",
+        material_code_family="GC-SS",
+        source_file_id="file:fixture",
+        sheet_id="sheet:plan",
+        entity_ids=["entity:ss"],
+    )
+    sheets = [Sheet(id="sheet:plan", source_file_id="file:fixture", kind="plan")]
+
+    components = build_component_instances(sheets, [occurrence_value], [])
+
+    assert len(components) == 1
+    assert components[0].mt_code == "GC-SS-101"
+    assert components[0].raw_material_code == "ＧＣ－ＳＳ－１０１"
+    assert components[0].material_code_family == "GC-SS"
 
 
 def test_parses_tabular_xlsx_and_surfaces_conflicts(tmp_path: Path) -> None:
@@ -104,46 +225,46 @@ def test_parses_tabular_xlsx_and_surfaces_conflicts(tmp_path: Path) -> None:
     worksheet = workbook.active
     worksheet.title = "材料表"
     worksheet.append(["MT编号", "名称", "材质", "厚度", "表面处理", "工艺"])
-    worksheet.append(["MT01", "示例镜面不锈钢", "304", 0.8, "镜面", "折弯"])
-    worksheet.append(["MT-01", "示例镜面不锈钢", "304", 1.0, "镜面", "折弯"])
+    worksheet.append(["MT01", "黑色镜面不锈钢", "304", 0.91, "镜面黑色", "折弯"])
+    worksheet.append(["MT-01", "黑色镜面不锈钢", "304", 1.2, "镜面黑色", "折弯"])
     workbook.save(workbook_path)
 
     specs = load_material_specs(workbook_path, source_file_id="file:xlsx")
 
     assert len(specs) == 2
     assert {spec.grade for spec in specs} == {"304"}
-    assert {spec.thickness_mm for spec in specs} == {0.8, 1.0}
+    assert {spec.thickness_mm for spec in specs} == {0.91, 1.2}
     assert all(any("thickness_mm" in conflict for conflict in spec.conflicts) for spec in specs)
 
 
-def test_parses_horizontal_cad_material_rows_without_crossing_rows() -> None:
+def test_parses_same_baseline_cad_material_table_without_crossing_rows() -> None:
     entities = [
         entity("entity:mt1", "MT-01", 0, 20, sheet_id="sheet:materials"),
-        entity("entity:name1", "示例拉丝不锈钢 316 0.8mm厚", 40, 20, sheet_id="sheet:materials"),
+        entity("entity:name1", "苹果砂不锈钢 304 1.2mm厚", 40, 20, sheet_id="sheet:materials"),
         entity("entity:mt2", "MT-02", 0, 10, sheet_id="sheet:materials"),
-        entity("entity:name2", "示例镜面不锈钢", 40, 10, sheet_id="sheet:materials"),
+        entity("entity:name2", "黑色镜面不锈钢", 40, 10, sheet_id="sheet:materials"),
     ]
 
     specs = parse_cad_material_specs(entities)
 
     assert {spec.mt_code: spec.name for spec in specs} == {
-        "MT-01": "示例拉丝不锈钢 316 0.8mm厚",
-        "MT-02": "示例镜面不锈钢",
+        "MT-01": "苹果砂不锈钢 304 1.2mm厚",
+        "MT-02": "黑色镜面不锈钢",
     }
     mt1 = next(spec for spec in specs if spec.mt_code == "MT-01")
-    assert mt1.grade == "316"
-    assert mt1.thickness_mm == pytest.approx(0.8)
+    assert mt1.grade == "304"
+    assert mt1.thickness_mm == pytest.approx(1.2)
 
 
 def test_detects_detached_mt_keywords_room_and_leader_without_counting_labels() -> None:
     entities = [
         entity("entity:mt1", "MT", 0, 0),
         entity("entity:n1", "01", 8, 0),
-        entity("entity:material1", "示例拉丝不锈钢", 0, -5),
+        entity("entity:material1", "青古铜不锈钢", 0, -5),
         entity("entity:mt2", "ＭＴ", 30, 0),
         entity("entity:n2", "０１", 38, 0),
-        entity("entity:material2", "示例不锈钢踢脚线", 30, -5),
-        entity("entity:room", "测试接待区", 0, 60),
+        entity("entity:material2", "青古铜不锈钢踢脚线", 30, -5),
+        entity("entity:room", "接待前厅", 0, 60),
         entity(
             "entity:leader1",
             None,
@@ -177,7 +298,7 @@ def test_detects_detached_mt_keywords_room_and_leader_without_counting_labels() 
         "entity:leader2",
     }
     assert {item.leader_target for item in detected} == {(50.0, 50.0), (80.0, 25.0)}
-    assert all(item.room == "测试接待区" for item in detected)
+    assert all(item.room == "接待前厅" for item in detected)
     assert all(item.status == ReviewStatus.REVIEW for item in detected)
     assert [item.model_dump() for item in detected] == [
         item.model_dump()
@@ -335,8 +456,7 @@ def test_reference_normalization_range_and_ranked_evidence_edges() -> None:
     detail_edges = [
         edge
         for edge in default_edges
-        if edge.relation == "elevation_to_detail"
-        and edge.source_id == "sheet:elevation:good"
+        if edge.relation == "elevation_to_detail" and edge.source_id == "sheet:elevation:good"
     ]
 
     assert plan_edges[0].target_id == "sheet:elevation:good"
@@ -387,3 +507,42 @@ def test_multiple_explicit_sheet_targets_are_not_all_promoted() -> None:
 
     assert len(edges) == 2
     assert all(edge.status == ReviewStatus.REVIEW for edge in edges)
+
+
+def test_available_a2_dxf_derived_text_recovers_mt01_occurrences() -> None:
+    source = Path(os.environ.get("CADQUOTE_REAL_DXF_TEXT_JSON", ""))
+    if not source.is_file():
+        pytest.skip("set CADQUOTE_REAL_DXF_TEXT_JSON to run the private DXF-text check")
+
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    entities = [
+        entity(
+            f"entity:{item.get('h') or index}",
+            item["t"],
+            item.get("x"),
+            item.get("y"),
+            sheet_id="sheet:a2-elevation",
+            entity_type="ATTRIB" if item.get("blk") else "TEXT",
+        )
+        for index, item in enumerate(payload["texts"])
+    ]
+
+    detected = detect_mt_occurrences(entities, cluster_distance=12)
+
+    assert len(detected) >= 5
+    assert {item.mt_code for item in detected} == {"MT-01"}
+    assert all(item.status == ReviewStatus.REVIEW for item in detected)
+
+
+def test_opt_in_material_workbook_yields_both_codes_and_thickness() -> None:
+    source = Path(os.environ.get("CADQUOTE_REAL_MATERIAL_XLS", ""))
+    if not source.is_file():
+        pytest.skip("set CADQUOTE_REAL_MATERIAL_XLS to run the private material check")
+
+    specs = load_material_specs(source, source_file_id="file:private-materials")
+    relevant = [spec for spec in specs if spec.mt_code in {"MT-01", "MT-02"}]
+
+    assert {spec.mt_code for spec in relevant} == {"MT-01", "MT-02"}
+    assert all(spec.thickness_mm == pytest.approx(1.2) for spec in relevant)
+    assert all("\ufffd" not in (spec.name or "") for spec in relevant)
+    assert all(spec.status == ReviewStatus.REVIEW for spec in relevant)

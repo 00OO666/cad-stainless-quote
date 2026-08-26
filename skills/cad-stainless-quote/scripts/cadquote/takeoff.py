@@ -371,11 +371,7 @@ class _MeasurementIndex:
                         )
                 seen_quantity_values: set[float] = set()
                 for match in _QUANTITY_RE.finditer(text):
-                    raw = (
-                        match.group("prefix")
-                        or match.group("suffix")
-                        or match.group("label")
-                    )
+                    raw = match.group("prefix") or match.group("suffix") or match.group("label")
                     if raw is None:
                         continue
                     value = float(raw)
@@ -651,6 +647,12 @@ def build_component_instances(
                 ComponentInstance(
                     id=component_id,
                     mt_code=occurrence.mt_code,
+                    raw_material_code=_consensus(
+                        [value.raw_material_code for value in occurrence_group]
+                    ),
+                    material_code_family=_consensus(
+                        [value.material_code_family for value in occurrence_group]
+                    ),
                     name=_consensus([value.component_hint for value in occurrence_group]),
                     room=_consensus([value.room for value in occurrence_group]),
                     plan_occurrence_ids=plan_ids,
@@ -693,6 +695,12 @@ def build_component_instances(
                     ComponentInstance(
                         id=component_id,
                         mt_code=occurrence.mt_code,
+                        raw_material_code=_consensus(
+                            [value.raw_material_code for value in occurrence_group]
+                        ),
+                        material_code_family=_consensus(
+                            [value.material_code_family for value in occurrence_group]
+                        ),
                         name=_consensus([value.component_hint for value in occurrence_group]),
                         room=_consensus([value.room for value in occurrence_group]),
                         plan_occurrence_ids=[],
@@ -862,8 +870,7 @@ def collect_measurement_candidates(
             basis = [*candidate.basis, f"candidate_rank:{rank}/{total}"]
             if total > _MAX_MEASUREMENT_CANDIDATES_PER_ROLE:
                 basis.append(
-                    "candidate_pool_truncated:"
-                    f"{total}->{_MAX_MEASUREMENT_CANDIDATES_PER_ROLE}"
+                    f"candidate_pool_truncated:{total}->{_MAX_MEASUREMENT_CANDIDATES_PER_ROLE}"
                 )
             bounded.append(candidate.model_copy(update={"basis": basis}))
     return sorted(bounded, key=lambda value: (value.role, -value.confidence, value.id))

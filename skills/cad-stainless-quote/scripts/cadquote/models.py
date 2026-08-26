@@ -29,6 +29,98 @@ class Severity(StrEnum):
     BLOCK = "BLOCK"
 
 
+class TextNormalizationMode(StrEnum):
+    """Supported deterministic normalization modes for evaluation text fields."""
+
+    STRICT = "strict"
+    CANONICAL = "canonical"
+
+
+class NumericZeroHandling(StrEnum):
+    """How a relative-tolerance rule behaves when the gold value is zero."""
+
+    EXACT = "exact"
+    ABSOLUTE = "absolute"
+    UNRESOLVED = "unresolved"
+
+
+class UnfoldedSpecComparisonMode(StrEnum):
+    """Ways to compare a folded/unfolded-width expression."""
+
+    STRICT = "strict"
+    EVALUATED_TOTAL = "evaluated-total"
+
+
+class EvaluationTextFieldPolicy(StrictModel):
+    enabled: bool = True
+    required_in_gold: bool = True
+    normalization: TextNormalizationMode = TextNormalizationMode.CANONICAL
+
+
+class EvaluationNumericFieldPolicy(StrictModel):
+    enabled: bool = True
+    required_in_gold: bool = True
+    # ``None`` deliberately means that the business tolerance is still pending.
+    relative_tolerance: float | None = Field(default=None, ge=0)
+    zero_handling: NumericZeroHandling = NumericZeroHandling.EXACT
+    zero_absolute_tolerance: float | None = Field(default=None, ge=0)
+
+
+class EvaluationUnfoldedSpecPolicy(StrictModel):
+    enabled: bool = True
+    required_in_gold: bool = True
+    mode: UnfoldedSpecComparisonMode = UnfoldedSpecComparisonMode.STRICT
+    normalization: TextNormalizationMode = TextNormalizationMode.CANONICAL
+
+
+class EvaluationAmountPolicy(StrictModel):
+    # Amount is outside the current quantity-takeoff acceptance scope unless a
+    # reviewer explicitly enables the exact (0%) comparison.
+    enabled: bool = False
+    required_in_gold: bool = False
+    exact: bool = True
+
+
+class EvaluationPolicy(StrictModel):
+    """Versioned business policy for project-level 95% replication testing.
+
+    The default is intentionally non-final: the engineering-quantity tolerance is
+    known to be 5%, while length and physical-count tolerances still require an
+    explicit business decision.  A report produced with this default can diagnose
+    rows but can never claim that the 95% gate passed.
+    """
+
+    schema_version: Literal["1.0"] = "1.0"
+    policy_version: str = "draft-length-quantity-pending"
+    target_accuracy: float = Field(default=0.95, gt=0, le=1)
+    mt_code: EvaluationTextFieldPolicy = Field(default_factory=EvaluationTextFieldPolicy)
+    name: EvaluationTextFieldPolicy = Field(default_factory=EvaluationTextFieldPolicy)
+    material: EvaluationTextFieldPolicy = Field(
+        default_factory=lambda: EvaluationTextFieldPolicy(
+            enabled=False,
+            required_in_gold=False,
+        )
+    )
+    plan_location: EvaluationTextFieldPolicy = Field(default_factory=EvaluationTextFieldPolicy)
+    elevation: EvaluationTextFieldPolicy = Field(default_factory=EvaluationTextFieldPolicy)
+    detail: EvaluationTextFieldPolicy = Field(default_factory=EvaluationTextFieldPolicy)
+    unfolded_spec: EvaluationUnfoldedSpecPolicy = Field(
+        default_factory=EvaluationUnfoldedSpecPolicy
+    )
+    width_mm: EvaluationNumericFieldPolicy = Field(
+        default_factory=lambda: EvaluationNumericFieldPolicy(
+            enabled=False,
+            required_in_gold=False,
+        )
+    )
+    length_mm: EvaluationNumericFieldPolicy = Field(default_factory=EvaluationNumericFieldPolicy)
+    quantity: EvaluationNumericFieldPolicy = Field(default_factory=EvaluationNumericFieldPolicy)
+    engineering_quantity: EvaluationNumericFieldPolicy = Field(
+        default_factory=lambda: EvaluationNumericFieldPolicy(relative_tolerance=0.05)
+    )
+    amount: EvaluationAmountPolicy = Field(default_factory=EvaluationAmountPolicy)
+
+
 class SourceFile(StrictModel):
     id: str
     relative_path: str
@@ -88,6 +180,8 @@ class CadEntity(StrictModel):
 class MaterialSpec(StrictModel):
     id: str
     mt_code: str
+    raw_material_code: str | None = None
+    material_code_family: str | None = None
     name: str | None = None
     grade: str | None = None
     thickness_mm: float | None = Field(default=None, gt=0)
@@ -96,7 +190,10 @@ class MaterialSpec(StrictModel):
     brand: str | None = None
     model: str | None = None
     source_file_id: str | None = None
+    source_type: str | None = None
+    source_sha256: str | None = None
     source_location: str | None = None
+    source_evidence: list[str] = Field(default_factory=list)
     status: ReviewStatus = ReviewStatus.REVIEW
     conflicts: list[str] = Field(default_factory=list)
 
@@ -104,6 +201,8 @@ class MaterialSpec(StrictModel):
 class MtOccurrence(StrictModel):
     id: str
     mt_code: str
+    raw_material_code: str | None = None
+    material_code_family: str | None = None
     source_file_id: str
     sheet_id: str | None = None
     entity_ids: list[str] = Field(default_factory=list)
@@ -116,9 +215,25 @@ class MtOccurrence(StrictModel):
     status: ReviewStatus = ReviewStatus.REVIEW
 
 
+class MaterialMention(StrictModel):
+    """Unnumbered stainless-steel text retained for review, never as a fake MT."""
+
+    id: str
+    raw_text: str
+    source_file_id: str
+    sheet_id: str | None = None
+    entity_ids: list[str] = Field(default_factory=list)
+    anchor: tuple[float, float] | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    status: ReviewStatus = ReviewStatus.REVIEW
+    reason: str = "stainless material description has no recognized material code"
+
+
 class ComponentInstance(StrictModel):
     id: str
     mt_code: str
+    raw_material_code: str | None = None
+    material_code_family: str | None = None
     name: str | None = None
     room: str | None = None
     plan_occurrence_ids: list[str] = Field(default_factory=list)
@@ -132,6 +247,7 @@ class EvidenceEdge(StrictModel):
     relation: Literal[
         "plan_to_elevation",
         "elevation_to_detail",
+        "material_mention_to_material",
         "occurrence_to_component",
         "component_to_dimension",
         "component_to_price",
