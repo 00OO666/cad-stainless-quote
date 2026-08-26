@@ -1,0 +1,11 @@
+ezdxf==1.4.4
+matplotlib==3.11.1
+openpyxl==3.1.5
+pydantic==2.13.4
+XlsxWriter==3.2.9
+py7zr==0.22.0
+PyYAML==6.0.3
+RapidFuzz==3.14.5
+rarfile==4.5
+shapely==2.1.2
+xlrd==2.0.2

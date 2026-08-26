@@ -1,0 +1,4 @@
+interface:
+  display_name: "CAD 不锈钢算量报价"
+  short_description: "从CAD图纸生成可追溯算量和报价草稿；门禁通过后形成确认报价"
+  default_prompt: "Use $cad-stainless-quote to analyze this CAD drawing package and produce a traceable stainless-steel quantity takeoff and quotation."

@@ -1,0 +1,27 @@
+{
+  "version": "REPLACE_WITH_APPROVED_VERSION",
+  "approved": false,
+  "source": "REPLACE_WITH_PRICE_SOURCE",
+  "entries": [
+    {
+      "id": "price:replace-me",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "approved": false,
+      "mt_code": "MT-01",
+      "material": "REPLACE_WITH_EXACT_MATERIAL",
+      "grade": "304",
+      "thickness_mm": 1.2,
+      "finish": "REPLACE_WITH_EXACT_FINISH",
+      "process": "REPLACE_WITH_EXACT_PROCESS",
+      "pricing_method": "按实际展开面积计算",
+      "unit": "㎡",
+      "unit_price": 0,
+      "currency": "CNY",
+      "tax_included": null,
+      "valid_from": null,
+      "valid_to": null,
+      "source": "REPLACE_WITH_PRICE_SOURCE",
+      "note": "模板默认未批准；填写真实单价、含税口径、有效期并审核后，再把两处 approved 改为 true"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "optional_selection_examples": {
+    "merge_component_ids": [
+      "component:REPLACE_WITH_SOURCE_COMPONENT_ID"
+    ],
+    "note": "Only copy merge_component_ids into selected when a reviewer explicitly confirms that the source rows are one physical component."
+  },
+  "components": {
+    "component:REPLACE_WITH_REVIEW_PACK_ID": {
+      "reviewer": "REPLACE_WITH_REVIEWER",
+      "reviewed_at": "REPLACE_WITH_ISO_8601_TIME",
+      "reason": "REPLACE_WITH_REASON_AND_DRAWING_EVIDENCE",
+      "selected": {
+        "plan_to_elevation_edge": "edge:REPLACE_WITH_CANDIDATE_ID",
+        "elevation_to_detail_edge": "edge:REPLACE_WITH_CANDIDATE_ID",
+        "unit": "㎡",
+        "pricing_method": "按实际展开面积计算",
+        "unfolded_spec": "measurement:REPLACE_WITH_CANDIDATE_ID",
+        "length": "measurement:REPLACE_WITH_CANDIDATE_ID",
+        "quantity": "measurement:REPLACE_WITH_CANDIDATE_ID"
+      }
+    }
+  }
+}
