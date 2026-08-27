@@ -39,6 +39,7 @@ _TEXT_TYPES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF", "MULTILEADER", "MLEADER"}
 _LEADER_TYPES = {"LEADER", "MLEADER", "MULTILEADER"}
 _NUMBER_RE = re.compile(r"^\s*0*(\d{1,3})\s*$")
 _STAINLESS_RE = re.compile(r"不锈钢", re.I)
+_UNNUMBERED_METAL_RE = re.compile(r"金属|铁艺|铝合金|铝板|铜板|铁板|钢板|钛金", re.I)
 _MATERIAL_KEYWORD_RE = re.compile(
     r"不锈钢|钢板|金属|铝板|铝合金|铜板|铁板|钛金|玫瑰金|镜面|拉丝|喷砂|"
     r"苹果砂|古铜|烤漆|镀色|雕花|蚀刻|铁艺|扁铁"
@@ -65,7 +66,7 @@ _ROOM_RE = re.compile(
 )
 _COMPONENT_RE = re.compile(
     r"踢脚|脚线|顶线|线条|门套|窗套|包板|收口|嵌条|墙面|顶面|天花|屏风|柜|台|"
-    r"造型|设备带|壁炉|层架|挂衣杆|栏杆|压条|雕花"
+    r"造型|设备带|壁炉|层架|挂衣杆|栏杆|栏板|压条|雕花"
 )
 _DRAWING_TITLE_RE = re.compile(
     r"(?:平面|立面|剖面|大样|节点|示意|索引|放样|天花)[^,，。；;]{0,12}图|图纸目录"
@@ -621,7 +622,7 @@ def detect_material_mentions(
     *,
     occurrences: Iterable[MtOccurrence] = (),
 ) -> list[MaterialMention]:
-    """Retain unnumbered stainless descriptions as diagnostics, never MT rows."""
+    """Retain unnumbered stainless/metal component text, never fabricate MT rows."""
 
     used_entity_ids = {
         entity_id for occurrence in occurrences for entity_id in occurrence.entity_ids
@@ -636,7 +637,11 @@ def detect_material_mentions(
         ):
             continue
         text = clean_cad_text(entity.text)
-        if not _STAINLESS_RE.search(text) or find_material_codes(text):
+        is_stainless = bool(_STAINLESS_RE.search(text))
+        is_uncoded_metal_component = bool(
+            _UNNUMBERED_METAL_RE.search(text) and _COMPONENT_RE.search(text)
+        )
+        if (not is_stainless and not is_uncoded_metal_component) or find_material_codes(text):
             continue
         original_id = str(entity.geometry.get("original_entity_id") or entity.id)
         identity = (entity.source_file_id, original_id)
@@ -660,8 +665,17 @@ def detect_material_mentions(
                 sheet_id=entity.sheet_id,
                 entity_ids=[entity.id],
                 anchor=rounded_anchor,
-                confidence=0.38 if _COMPONENT_RE.search(text) else 0.32,
+                confidence=(
+                    0.38
+                    if is_stainless and _COMPONENT_RE.search(text)
+                    else 0.36 if is_uncoded_metal_component else 0.32
+                ),
                 status=ReviewStatus.REVIEW,
+                reason=(
+                    "metal component description has no recognized material code"
+                    if is_uncoded_metal_component and not is_stainless
+                    else "stainless material description has no recognized material code"
+                ),
             )
         )
     return mentions

@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from .linking import extract_reference_codes
-from .models import CadEntity, ComponentInstance, MeasurementCandidate, MtOccurrence, Sheet
+from .models import (
+    CadEntity,
+    ComponentInstance,
+    MaterialMention,
+    MeasurementCandidate,
+    MtOccurrence,
+    Sheet,
+)
 
 
 def _first_material_code(row: Mapping[str, Any]) -> str:
@@ -39,7 +46,16 @@ def _dimension_value(entity: CadEntity) -> float | None:
     return float(raw)
 
 
-def _numeric_probe(expected: Any, values: Sequence[float]) -> dict[str, Any]:
+def _business_text(value: Any) -> str:
+    return re.sub(r"[\s,，。()（）/|｜:：;；._\-—–]+", "", str(value or "")).casefold()
+
+
+def _numeric_probe(
+    expected: Any,
+    values: Sequence[float],
+    *,
+    minimum_absolute_tolerance: float = 1.0,
+) -> dict[str, Any]:
     if not isinstance(expected, (int, float)):
         return {"expected": expected, "hit": None, "closest": None, "relative_error": None}
     expected_value = float(expected)
@@ -52,7 +68,10 @@ def _numeric_probe(expected: Any, values: Sequence[float]) -> dict[str, Any]:
         }
     closest = min(values, key=lambda value: (abs(value - expected_value), value))
     error = abs(closest - expected_value) / abs(expected_value) if expected_value else None
-    hit = abs(closest - expected_value) <= max(1.0, abs(expected_value) * 0.05)
+    hit = abs(closest - expected_value) <= max(
+        minimum_absolute_tolerance,
+        abs(expected_value) * 0.05,
+    )
     return {
         "expected": expected_value,
         "hit": hit,
@@ -92,6 +111,8 @@ def build_candidate_benchmark(
     takeoff_payload: Mapping[str, Any],
     gold_payload: Mapping[str, Any],
     *,
+    material_mentions: Sequence[MaterialMention] = (),
+    vector_probe_payload: Mapping[str, Any] | None = None,
     evidence_payload: Mapping[str, Any] | None = None,
     evidence_root: Path | None = None,
     gold_image_payload: Mapping[str, Any] | None = None,
@@ -120,6 +141,19 @@ def build_candidate_benchmark(
             occurrences_by_page_code[(_page_code(sheet.drawing_number), occurrence.mt_code)].append(
                 occurrence
             )
+    mentions_by_page: dict[str, list[MaterialMention]] = defaultdict(list)
+    for mention in material_mentions:
+        sheet = sheet_by_id.get(mention.sheet_id or "")
+        if sheet and sheet.drawing_number:
+            mentions_by_page[_page_code(sheet.drawing_number)].append(mention)
+    vector_probe_by_occurrence: dict[str, Mapping[str, Any]] = {}
+    for probe in (vector_probe_payload or {}).get("probes", []):
+        if not isinstance(probe, Mapping):
+            continue
+        occurrence_id = probe.get("occurrence_id")
+        quantity = probe.get("recommended_quantity")
+        if isinstance(occurrence_id, str) and isinstance(quantity, (int, float)):
+            vector_probe_by_occurrence[occurrence_id] = probe
     component_by_occurrence: dict[str, list[str]] = defaultdict(list)
     for component in components:
         for occurrence_id in [
@@ -158,8 +192,22 @@ def build_candidate_benchmark(
         raw_location = str(item.get("plan_location") or "").strip()
         page = _page_code(raw_location)
         code = _first_material_code(wrapper)
+        gold_name = _business_text(item.get("name"))
         candidate_occurrences = sorted(
             occurrences_by_page_code.get((page, code), []), key=lambda value: value.id
+        )
+        uncoded_material_mentions = sorted(
+            (
+                mention
+                for mention in mentions_by_page.get(page, ())
+                if not code
+                and gold_name
+                and (
+                    gold_name in _business_text(mention.raw_text)
+                    or _business_text(mention.raw_text) in gold_name
+                )
+            ),
+            key=lambda value: value.id,
         )
         component_ids = sorted(
             {
@@ -184,16 +232,36 @@ def build_candidate_benchmark(
         numeric_values = sorted(set([*page_values, *component_values]))
         width_probe = _numeric_probe(item.get("width_mm"), numeric_values)
         length_probe = _numeric_probe(item.get("length_mm"), numeric_values)
+        measurement_quantity_values = {
+            measurement.numeric_value
+            for measurement in component_measurements
+            if measurement.role == "quantity"
+        }
+        vector_quantity_probes = [
+            vector_probe_by_occurrence[occurrence.id]
+            for occurrence in candidate_occurrences
+            if occurrence.id in vector_probe_by_occurrence
+        ]
+        vector_quantity_values = {
+            float(probe["recommended_quantity"])
+            for probe in vector_quantity_probes
+            if isinstance(probe.get("recommended_quantity"), (int, float))
+        }
         quantity_values = sorted(
             {
-                measurement.numeric_value
-                for measurement in component_measurements
-                if measurement.role == "quantity"
+                *measurement_quantity_values,
+                *vector_quantity_values,
             }
         )
-        quantity_probe = _numeric_probe(item.get("quantity"), quantity_values)
+        quantity_probe = _numeric_probe(
+            item.get("quantity"),
+            quantity_values,
+            minimum_absolute_tolerance=0.0,
+        )
         leader_count = sum(value.leader_target is not None for value in candidate_occurrences)
-        if not candidate_occurrences:
+        if not candidate_occurrences and uncoded_material_mentions:
+            readiness = "UNCODED_MATERIAL_CANDIDATE"
+        elif not candidate_occurrences:
             readiness = "MISSING_PAGE_CODE_CANDIDATE"
         elif width_probe["hit"] and length_probe["hit"] and quantity_probe["hit"]:
             readiness = "FIELD_CANDIDATES_COMPLETE"
@@ -225,6 +293,15 @@ def build_candidate_benchmark(
                 "candidate_component_count": len(component_ids),
                 "candidate_occurrence_ids": [value.id for value in candidate_occurrences],
                 "candidate_component_ids": component_ids,
+                "uncoded_material_mention_count": len(uncoded_material_mentions),
+                "uncoded_material_mention_ids": [
+                    value.id for value in uncoded_material_mentions
+                ],
+                "vector_quantity_probe_count": len(vector_quantity_probes),
+                "vector_quantity_occurrence_ids": sorted(
+                    str(value["occurrence_id"]) for value in vector_quantity_probes
+                ),
+                "vector_quantity_values": sorted(vector_quantity_values),
                 "width_probe": width_probe,
                 "length_probe": length_probe,
                 "quantity_probe": quantity_probe,
@@ -304,6 +381,9 @@ def build_candidate_benchmark(
         "page_code_candidate_coverage_count": sum(
             row["candidate_occurrence_count"] > 0 for row in comparison_rows
         ),
+        "uncoded_material_candidate_coverage_count": sum(
+            row["uncoded_material_mention_count"] > 0 for row in comparison_rows
+        ),
         "width_candidate_hit_count": sum(
             row["width_probe"]["hit"] is True for row in comparison_rows
         ),
@@ -312,6 +392,9 @@ def build_candidate_benchmark(
         ),
         "quantity_candidate_hit_count": sum(
             row["quantity_probe"]["hit"] is True for row in comparison_rows
+        ),
+        "vector_quantity_candidate_coverage_count": sum(
+            row["vector_quantity_probe_count"] > 0 for row in comparison_rows
         ),
         "readiness_distribution": dict(sorted(readiness_counts.items())),
         "warning": (

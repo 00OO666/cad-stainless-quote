@@ -55,6 +55,16 @@ def _fixture():
             room="洽谈区",
             confidence=0.9,
         ),
+        MtOccurrence(
+            id="detail-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="detail",
+            anchor=(45, 50),
+            leader_entity_id="detail-leader",
+            leader_target=(50, 50),
+            confidence=0.9,
+        ),
     ]
     edges = [
         EvidenceEdge(
@@ -157,6 +167,87 @@ def test_mt_occurrence_count_is_not_used_as_quantity():
     assert draft.items[0].status == ReviewStatus.BLOCK
 
 
+def test_unfolded_spec_requires_one_local_detail_occurrence_anchor():
+    sheets, occurrences, edges, entities = _fixture()
+    unanchored = [value for value in occurrences if value.id != "detail-mt"]
+
+    result = build_takeoff(sheets, entities, unanchored, edges)
+
+    assert not [
+        candidate for candidate in result.measurements if candidate.role == "unfolded_spec"
+    ]
+
+
+def test_explicit_detail_link_with_local_anchor_keeps_local_unfolded_spec():
+    sheets, occurrences, edges, entities = _fixture()
+
+    result = build_takeoff(sheets, entities, occurrences, edges)
+    unfolded = next(
+        candidate for candidate in result.measurements if candidate.role == "unfolded_spec"
+    )
+
+    assert unfolded.raw_value == "10+180+10"
+    assert "component_local_detail_anchor" in unfolded.basis
+    assert "detail_occurrence:detail-mt" in unfolded.basis
+
+
+def test_similarity_only_ceiling_target_cannot_supply_unfolded_spec():
+    sheets, occurrences, edges, entities = _fixture()
+    sheets.append(
+        Sheet(
+            id="ceiling",
+            source_file_id="f",
+            kind="ceiling",
+            drawing_number="1F-PL-10",
+            title="一层天花布置图",
+            bbox=(0, 0, 100, 100),
+        )
+    )
+    edges.append(
+        EvidenceEdge(
+            id="similar-title-only",
+            relation="elevation_to_detail",
+            source_id="elevation",
+            target_id="ceiling",
+            basis=["title_similarity:0.400"],
+            confidence=0.06,
+            status=ReviewStatus.REVIEW,
+        )
+    )
+    # Even a same-code annotation on the weakly related page cannot make the
+    # relation component-specific without an explicit/confirmed detail link.
+    occurrences.append(
+        MtOccurrence(
+            id="ceiling-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="ceiling",
+            leader_entity_id="ceiling-leader",
+            leader_target=(50, 50),
+        )
+    )
+    entities.append(
+        CadEntity(
+            id="ceiling-expression",
+            source_file_id="f",
+            sheet_id="ceiling",
+            entity_type="TEXT",
+            space="model",
+            text="900+300",
+            insert=(50, 50),
+            bbox=(45, 45, 65, 55),
+        )
+    )
+
+    result = build_takeoff(sheets, entities, occurrences, edges)
+    unfolded = [
+        candidate for candidate in result.measurements if candidate.role == "unfolded_spec"
+    ]
+
+    assert [candidate.raw_value for candidate in unfolded] == ["10+180+10"]
+    assert all(candidate.sheet_id != "ceiling" for candidate in unfolded)
+
+
 def test_dimension_multiplication_is_not_misread_as_quantity():
     sheets, occurrences, edges, entities = _fixture()
     entities = [entity for entity in entities if entity.id != "quantity-text"]
@@ -171,6 +262,204 @@ def test_dimension_multiplication_is_not_misread_as_quantity():
             insert=(52, 50),
             bbox=(50, 49, 65, 52),
         )
+    )
+
+    draft = build_takeoff(sheets, entities, occurrences, edges)
+
+    assert not [candidate for candidate in draft.measurements if candidate.role == "quantity"]
+
+
+def test_split_explicit_quantity_tokens_same_parent_are_review_only():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [entity for entity in entities if entity.id != "quantity-text"]
+    entities.extend(
+        [
+            CadEntity(
+                id="split-qty-label",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="QTY",
+                insert=(51, 50),
+                geometry={"parent_insert_handle": "COUNT-ANN"},
+            ),
+            CadEntity(
+                id="split-qty-separator",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="=",
+                insert=(52, 50),
+                geometry={"parent_insert_handle": "COUNT-ANN"},
+            ),
+            CadEntity(
+                id="split-qty-value",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="2",
+                insert=(53, 50),
+                geometry={"parent_insert_handle": "COUNT-ANN"},
+            ),
+            CadEntity(
+                id="same-cluster-dimension-product",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="50*200",
+                insert=(54, 50),
+                geometry={"parent_insert_handle": "COUNT-ANN"},
+            ),
+        ]
+    )
+
+    draft = build_takeoff(sheets, entities, occurrences, edges)
+    quantities = [candidate for candidate in draft.measurements if candidate.role == "quantity"]
+
+    assert len(quantities) == 1
+    assert quantities[0].numeric_value == 2
+    assert quantities[0].raw_value == "QTY=2"
+    assert quantities[0].status == ReviewStatus.REVIEW
+    assert set(quantities[0].entity_ids) == {
+        "split-qty-label",
+        "split-qty-separator",
+        "split-qty-value",
+    }
+    assert "explicit_count_text_cluster" in quantities[0].basis
+    assert "annotation_cluster:parent_insert_handle:COUNT-ANN" in quantities[0].basis
+    assert draft.items[0].quantity is None
+
+
+def test_split_multiplier_tokens_can_share_explicit_leader_annotation_identity():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [entity for entity in entities if entity.id != "quantity-text"]
+    entities.extend(
+        [
+            CadEntity(
+                id="count-multileader",
+                source_file_id="f",
+                sheet_id="elevation",
+                handle="COUNT-LEADER",
+                entity_type="MULTILEADER",
+                space="model",
+                text="×",
+                insert=(51, 50),
+                geometry={"annotation_handle": "COUNT-VALUE"},
+            ),
+            CadEntity(
+                id="count-leader-value",
+                source_file_id="f",
+                sheet_id="elevation",
+                handle="COUNT-VALUE",
+                entity_type="TEXT",
+                space="model",
+                text="2",
+                insert=(52, 50),
+            ),
+        ]
+    )
+
+    draft = build_takeoff(sheets, entities, occurrences, edges)
+    quantities = [candidate for candidate in draft.measurements if candidate.role == "quantity"]
+
+    assert len(quantities) == 1
+    assert quantities[0].numeric_value == 2
+    assert quantities[0].raw_value == "×2"
+    assert quantities[0].status == ReviewStatus.REVIEW
+    assert set(quantities[0].entity_ids) == {"count-multileader", "count-leader-value"}
+    assert "annotation_cluster:leader_annotation_handle:COUNT-VALUE" in quantities[0].basis
+
+
+def test_split_quantity_tokens_never_cross_annotation_clusters_or_parse_dimensions():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [entity for entity in entities if entity.id != "quantity-text"]
+    entities.extend(
+        [
+            CadEntity(
+                id="orphan-qty-label",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="数量",
+                insert=(51, 50),
+                geometry={"parent_insert_handle": "ANN-A"},
+            ),
+            CadEntity(
+                id="other-cluster-number",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="2",
+                insert=(51.1, 50),
+                geometry={"parent_insert_handle": "ANN-B"},
+            ),
+            CadEntity(
+                id="dimension-x-marker",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="×",
+                insert=(52, 50),
+                geometry={"parent_insert_handle": "DIM-ANN"},
+            ),
+            CadEntity(
+                id="dimension-first-value",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="50",
+                insert=(53, 50),
+                geometry={"parent_insert_handle": "DIM-ANN"},
+            ),
+            CadEntity(
+                id="dimension-second-value",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="200",
+                insert=(54, 50),
+                geometry={"parent_insert_handle": "DIM-ANN"},
+            ),
+            CadEntity(
+                id="plain-dimension-product",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="TEXT",
+                space="model",
+                text="50*200",
+                insert=(55, 50),
+                geometry={"parent_insert_handle": "PRODUCT-ANN"},
+            ),
+            CadEntity(
+                id="cross-sheet-qty-label",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="QTY",
+                insert=(56, 50),
+                geometry={"parent_insert_handle": "SHARED-ANN"},
+            ),
+            CadEntity(
+                id="cross-sheet-qty-value",
+                source_file_id="f",
+                sheet_id="detail",
+                entity_type="ATTRIB",
+                space="model",
+                text="2",
+                insert=(56, 50),
+                geometry={"parent_insert_handle": "SHARED-ANN"},
+            ),
+        ]
     )
 
     draft = build_takeoff(sheets, entities, occurrences, edges)
@@ -539,6 +828,18 @@ def test_confirmed_measurement_must_belong_to_selected_relation_chain():
             bbox=(40, 45, 70, 55),
         )
     )
+    occurrences.append(
+        MtOccurrence(
+            id="detail-other-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="detail-other",
+            anchor=(45, 50),
+            leader_entity_id="detail-other-leader",
+            leader_target=(50, 50),
+            confidence=0.9,
+        )
+    )
     draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
     component = next(value for value in draft.components if value.plan_occurrence_ids)
     candidates = [value for value in draft.measurements if value.component_id == component.id]
@@ -565,7 +866,7 @@ def test_confirmed_measurement_must_belong_to_selected_relation_chain():
     )
     item = next(value for value in final.items if value.component_id == component.id)
     assert item.status == ReviewStatus.BLOCK
-    assert "outside selected chain" in (item.block_reason or "")
+    assert "confirmed unfolded_spec candidate does not exist" in (item.block_reason or "")
 
 
 @pytest.mark.parametrize("materials", [[], [_material(conflicts=["finish: A | B"])]])

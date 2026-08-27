@@ -22,6 +22,30 @@ description, and retain the document hash and row/cell or paragraph locator. A u
 description is still REVIEW; an ambiguous or conflicting mapping is BLOCK. Neither case proves a
 physical quantity.
 
+## Quantity evidence
+
+Prefer an explicit, component-bound quantity label. Split labels such as `QTY`, `=`, `2`
+may be joined only inside the same CAD parent block or a real leader annotation identity;
+never join nearby free text, cross-sheet tokens, or a size expression such as `50*200`.
+
+When the drawing has no quantity text, inspect `analysis/vector_quantity_probes.json`.
+The probe revisits straight `LWPOLYLINE`/`POLYLINE` entities near the leader target and
+groups translation-equivalent shapes on the same layer. Even a unique group is REVIEW:
+the reviewer must verify that the repeated shapes are physical billable instances rather
+than decorative lines, construction geometry, or multiple edges of one component. A
+truncated scan or more than one leader-anchored repeated group produces no recommendation.
+
+```powershell
+& .\scripts\run.ps1 vector-probe `
+  "C:\runs\project\index\cad_index.json" `
+  "C:\runs\project\analysis\mt_occurrences.json" `
+  --panels "C:\runs\project\analysis\panels.json" `
+  --out "C:\runs\project\analysis\vector_quantity_probes.json"
+```
+
+Never copy a vector probe directly into the commercial workbook. It must first be bound to
+one physical component and explicitly confirmed with reviewer, time, reason, and evidence.
+
 ## REVIEW versus BLOCK
 
 - REVIEW: plausible candidates exist but require a choice, deduction, or business convention.

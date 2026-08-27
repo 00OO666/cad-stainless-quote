@@ -206,6 +206,7 @@ def test_pipeline_single_dxf_produces_auditable_review_package(tmp_path: Path):
     assert Path(result.quote_path).is_file()
     assert Path(result.manifest_path).is_file()
     assert Path(result.paths["review_pack"]).is_file()
+    assert Path(result.paths["vector_quantity_probes"]).is_file()
     workbook = load_workbook(result.quote_path)
     assert workbook.sheetnames == ["报价表", "来源追踪", "待确认", "运行信息"]
     assert workbook["待确认"].max_row >= 2
@@ -213,6 +214,8 @@ def test_pipeline_single_dxf_produces_auditable_review_package(tmp_path: Path):
     index_path = Path(result.paths["index_json"])
     index_mtime = index_path.stat().st_mtime_ns
     first_review_pack = json.loads(Path(result.paths["review_pack"]).read_text(encoding="utf-8"))
+    assert first_review_pack["summary"]["vector_quantity_review_candidate_count"] == 0
+    assert first_review_pack["vector_quantity_evidence"]["policy"]["auto_quantity"] is False
     entity_id = first_review_pack["components"][0]["sources"]["entity_ids"][0]
     entity_record = first_review_pack["evidence_catalog"]["entities"][entity_id]
     source_record = first_review_pack["evidence_catalog"]["source_files"][
@@ -255,6 +258,7 @@ def test_pipeline_single_dxf_produces_auditable_review_package(tmp_path: Path):
     assert reused.audit[component_id]["reviewer"] == "测试审核员"
     assert reused.selections[component_id]["merge_component_ids"] == ["component:not-real"]
     assert "measurement_candidates" in review_pack["components"][0]
+    assert "vector_quantity_probes" in review_pack["components"][0]
     assert "relation_edge_candidates" in review_pack["components"][0]
     assert review_pack["confirmation_template"]["optional_selection_examples"][
         "merge_component_ids"

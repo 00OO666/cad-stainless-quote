@@ -21,6 +21,8 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Uses exact or unique distinctive material aliases; ambiguous shared aliases remain unresolved.
 - Builds reviewable plan → elevation → detail relationships without treating annotation count as quantity.
 - Extracts bounded length, height, quantity, and unfolded-width candidates with unit and paper-space safeguards.
+- Revisits raw DXF polylines near leader targets to surface conservative repeated-instance quantity candidates; they remain `REVIEW` and never auto-fill the bill.
+- Rejects sheet-wide detail dimensions unless an explicit detail relation and a unique component-local material anchor exist.
 - Exports embedded workbook image evidence and can register screenshots to rendered CAD panels with an optional vision dependency.
 - Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
 - Applies audited reviewer confirmations and resumes without re-running immutable upstream stages.
@@ -37,6 +39,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 4. Only `PASS` rows may contribute to the confirmed total.
 5. A price requires an approved source, version, date, currency, tax basis, material, thickness, finish, process, unit, and pricing method.
 6. Human benchmark spreadsheets are imported as candidate truth and audited before use.
+7. Repeated linework is only a review candidate; a reviewer must prove that it represents independent billable components.
 
 ## Requirements
 

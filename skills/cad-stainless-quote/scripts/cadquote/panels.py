@@ -252,7 +252,16 @@ def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPa
     for entity in paper_entities:
         if entity.entity_type != "ATTRIB" or not entity.text:
             continue
-        codes = sorted(extract_reference_codes(entity.text))
+        extracted_codes = extract_reference_codes(entity.text)
+        specificity = max(
+            ((code.count("-"), len(code)) for code in extracted_codes),
+            default=None,
+        )
+        codes = sorted(
+            code
+            for code in extracted_codes
+            if (code.count("-"), len(code)) == specificity
+        )
         if len(codes) != 1:
             continue
         parent_handle = entity.geometry.get("parent_insert_handle")
@@ -300,6 +309,28 @@ def _nearest_page_reference(
     if viewport.bbox is not None:
         width = viewport.bbox[2] - viewport.bbox[0]
         height = viewport.bbox[3] - viewport.bbox[1]
+        # Some authoring files place many complete paper sheets side-by-side
+        # under one very wide viewport.  Their title blocks form a horizontal
+        # sequence just below the viewport.  The panel begins with the
+        # left-most page, not the title block nearest the viewport centre or
+        # lower-right corner.
+        horizontal_band = [
+            value
+            for value in candidates
+            if viewport.bbox[0] <= value.point[0]
+            <= viewport.bbox[2] + max(5.0, width * 0.03)
+            and viewport.bbox[1] - max(300.0, height * 0.75)
+            <= value.point[1]
+            <= viewport.bbox[3] + max(30.0, height * 0.20)
+        ]
+        distinct_codes = {value.code for value in horizontal_band}
+        if len(distinct_codes) >= 2:
+            x_values = [value.point[0] for value in horizontal_band]
+            if max(x_values) - min(x_values) >= max(5.0, width * 0.10):
+                return min(
+                    horizontal_band,
+                    key=lambda value: (value.point[0], value.point[1], value.code, value.entity_id),
+                )
         # Conventional title blocks sit at the lower-right of the represented
         # drawing area. Prefer that directional relationship before raw nearest
         # distance; otherwise a viewport near a page boundary can be assigned
@@ -766,6 +797,7 @@ class _LocalViewAnchor:
     x: float
     title: str | None
     entity_ids: tuple[str, ...]
+    basis: str = "local_title"
 
 
 _LOCAL_ELEVATION_CODE_RE = re.compile(
@@ -892,6 +924,88 @@ def _local_view_anchors(
     return anchors
 
 
+def _prepend_parent_page_anchor(
+    panel: Sheet,
+    anchors: Sequence[_LocalViewAnchor],
+) -> list[_LocalViewAnchor]:
+    """Recover the explicit title-block page immediately before local anchors.
+
+    A long paper-space viewport may start on the page named by its neighboring
+    title block and then contain additional repeated page titles in the same
+    model strip.  In that layout the local detector can see ``B2-E-11`` and
+    later pages while the parent panel already carries the explicit
+    ``paper_page_reference:B2-E-10`` evidence.  Dropping the parent reference
+    silently folds page 04 into page 05.
+
+    Only the immediately preceding code is inferred, and only when the parent
+    code is backed by a native paper-page reference.  Its x position is one
+    median inter-page pitch before the first local anchor; implausible geometry
+    fails closed and leaves the original anchors unchanged.
+    """
+
+    ordered = sorted(anchors, key=lambda value: (value.x, value.code))
+    if len(ordered) < 2 or panel.bbox is None or not panel.drawing_number:
+        return ordered
+
+    parent_code = panel.drawing_number.strip().upper().replace("_", "-")
+    if any(anchor.code.upper().replace("_", "-") == parent_code for anchor in ordered):
+        return ordered
+
+    parent_match = _LOCAL_ELEVATION_CODE_RE.fullmatch(parent_code)
+    first_match = _LOCAL_ELEVATION_CODE_RE.fullmatch(
+        ordered[0].code.upper().replace("_", "-")
+    )
+    if parent_match is None or first_match is None:
+        return ordered
+    parent_prefix = parent_match.group("prefix").upper().replace("_", "-")
+    first_prefix = first_match.group("prefix").upper().replace("_", "-")
+    if parent_prefix != first_prefix:
+        return ordered
+    if int(first_match.group("number")) != int(parent_match.group("number")) + 1:
+        return ordered
+
+    reference_entity_ids: list[str] = []
+    marker = "paper_page_reference:"
+    for evidence in panel.evidence:
+        if not evidence.startswith(marker):
+            continue
+        payload = evidence[len(marker) :]
+        code, separator, entity_id = payload.partition("@")
+        if (
+            separator
+            and code.strip().upper().replace("_", "-") == parent_code
+            and entity_id
+        ):
+            reference_entity_ids.append(entity_id)
+    if not reference_entity_ids:
+        return ordered
+
+    gaps = [
+        right.x - left.x
+        for left, right in zip(ordered, ordered[1:], strict=False)
+        if right.x > left.x
+    ]
+    if not gaps:
+        return ordered
+    page_pitch = _median(gaps)
+    inferred_x = ordered[0].x - page_pitch
+    x0, _, x1, _ = panel.bbox
+    minimum_margin = max((x1 - x0) * 0.002, page_pitch * 0.08)
+    if not (x0 + minimum_margin < inferred_x < ordered[0].x - minimum_margin):
+        return ordered
+
+    return [
+        _LocalViewAnchor(
+            code=parent_code,
+            x=inferred_x,
+            title=panel.title,
+            entity_ids=tuple(sorted(set(reference_entity_ids))),
+            basis="paper_page_reference_predecessor",
+        ),
+        *ordered,
+    ]
+
+
 def _layout_family(layout: str | None) -> str:
     return (layout or "").split("#viewport:", 1)[0]
 
@@ -964,8 +1078,8 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
 
     Some CAD files place twenty or more complete drawing sheets side-by-side in
     model space and expose them through only one paper viewport. Treating that
-    viewport as a single sheet collapses distinct codes such as ``L1-EL-02`` and
-    ``L1-EL-05`` into the title-block code nearest the viewport. This pass uses
+    viewport as a single sheet collapses distinct codes such as ``B2-E-03`` and
+    ``B2-E-09`` into the title-block code nearest the viewport. This pass uses
     repeated local sheet-title geometry to recover the nested sheets.
     """
 
@@ -978,7 +1092,10 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
     output_entities: list[CadEntity] = []
     for panel in expansion.sheets:
         panel_entities = entities_by_sheet.get(panel.id, [])
-        anchors = _local_view_anchors(panel, panel_entities)
+        anchors = _prepend_parent_page_anchor(
+            panel,
+            _local_view_anchors(panel, panel_entities),
+        )
         if len(anchors) < 2 or panel.bbox is None:
             output_sheets.append(panel)
             output_entities.extend(panel_entities)
@@ -1104,6 +1221,7 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
                         f"local_subview_parent:{panel.id}",
                         f"local_page_code:{anchor.code}",
                         f"local_anchor_x:{anchor.x:.6f}",
+                        f"local_anchor_basis:{anchor.basis}",
                         f"local_subview_entities:{len(child_entities)}",
                     ],
                 }

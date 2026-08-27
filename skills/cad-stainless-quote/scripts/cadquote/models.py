@@ -216,7 +216,7 @@ class MtOccurrence(StrictModel):
 
 
 class MaterialMention(StrictModel):
-    """Unnumbered stainless-steel text retained for review, never as a fake MT."""
+    """Unnumbered stainless/metal component text retained for review, never as a fake MT."""
 
     id: str
     raw_text: str

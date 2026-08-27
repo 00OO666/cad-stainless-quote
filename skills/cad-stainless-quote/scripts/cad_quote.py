@@ -37,6 +37,7 @@ from cadquote.materials import (
 from cadquote.models import (
     CadEntity,
     EvidenceEdge,
+    MaterialMention,
     MaterialSpec,
     MeasurementCandidate,
     MtOccurrence,
@@ -61,6 +62,7 @@ from cadquote.render import (
     viewport_model_regions,
 )
 from cadquote.takeoff import build_takeoff
+from cadquote.vector_probe import probe_repeated_vectors
 
 
 def _print(payload: Any) -> None:
@@ -471,6 +473,32 @@ def command_panels(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_vector_probe(args: argparse.Namespace) -> int:
+    """Revisit raw DXF polylines near MT leader targets for REVIEW-only counts."""
+
+    payload = _load_json(args.index)
+    sheets, entities = _load_index(args.index)
+    sheets, _ = _apply_panels(sheets, entities, args.panels)
+    occurrences = [MtOccurrence.model_validate(value) for value in _load_json(args.occurrences)]
+    sources = payload.get("sources", []) if isinstance(payload, dict) else []
+    source_paths = {
+        str(source.get("source_file_id")): Path(str(source.get("source_path")))
+        for source in sources
+        if source.get("source_file_id") and source.get("source_path")
+    }
+    result = probe_repeated_vectors(
+        source_paths,
+        sheets,
+        occurrences,
+        radius=args.radius,
+        geometry_tolerance=args.geometry_tolerance,
+        max_primitives=args.max_primitives,
+    )
+    write_json_atomic(Path(args.out), result)
+    _print({**result["summary"], "output": str(Path(args.out).resolve())})
+    return 0 if not result["issues"] else 2
+
+
 def command_materials(args: argparse.Namespace) -> int:
     stainless_families = {
         *DEFAULT_STAINLESS_CODE_FAMILIES,
@@ -761,6 +789,12 @@ def command_candidate_benchmark(args: argparse.Namespace) -> int:
     occurrences = [MtOccurrence.model_validate(value) for value in _load_json(args.occurrences)]
     takeoff_payload = _load_json(args.takeoff)
     gold_payload = _load_json(args.gold)
+    material_mentions = (
+        [MaterialMention.model_validate(value) for value in _load_json(args.material_mentions)]
+        if args.material_mentions
+        else []
+    )
+    vector_probe_payload = _load_json(args.vector_probes) if args.vector_probes else None
     evidence_payload = _load_json(args.evidence_index) if args.evidence_index else None
     gold_image_payload = (
         _load_json(args.gold_image_manifest) if args.gold_image_manifest else None
@@ -770,6 +804,8 @@ def command_candidate_benchmark(args: argparse.Namespace) -> int:
         occurrences,
         takeoff_payload,
         gold_payload,
+        material_mentions=material_mentions,
+        vector_probe_payload=vector_probe_payload,
         evidence_payload=evidence_payload,
         evidence_root=args.evidence_index.parent if args.evidence_index else None,
         gold_image_payload=gold_image_payload,
@@ -1072,6 +1108,19 @@ def build_parser() -> argparse.ArgumentParser:
     panels.add_argument("--out", type=Path, required=True)
     panels.set_defaults(handler=command_panels)
 
+    vector_probe = subparsers.add_parser(
+        "vector-probe",
+        help="按MT箭头局部读取原始多段线，输出仅供审核的重复实例数量候选",
+    )
+    vector_probe.add_argument("index", type=Path)
+    vector_probe.add_argument("occurrences", type=Path)
+    vector_probe.add_argument("--panels", type=Path)
+    vector_probe.add_argument("--radius", type=float, default=1_500.0)
+    vector_probe.add_argument("--geometry-tolerance", type=float, default=0.5)
+    vector_probe.add_argument("--max-primitives", type=int, default=250_000)
+    vector_probe.add_argument("--out", type=Path, required=True)
+    vector_probe.set_defaults(handler=command_vector_probe)
+
     materials = subparsers.add_parser("materials", help="解析XLS/XLSX或DOCX材料表")
     materials.add_argument("workbook", type=Path)
     materials.add_argument(
@@ -1176,6 +1225,12 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_benchmark.add_argument("takeoff", type=Path)
     candidate_benchmark.add_argument("gold", type=Path)
     candidate_benchmark.add_argument("--evidence-index", type=Path)
+    candidate_benchmark.add_argument("--material-mentions", type=Path)
+    candidate_benchmark.add_argument(
+        "--vector-probes",
+        type=Path,
+        help="加入原始DXF局部重复图形的REVIEW数量候选诊断",
+    )
     candidate_benchmark.add_argument("--gold-image-manifest", type=Path)
     candidate_benchmark.add_argument("--out", type=Path, required=True)
     candidate_benchmark.set_defaults(handler=command_candidate_benchmark)

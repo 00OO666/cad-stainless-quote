@@ -873,3 +873,171 @@ def test_small_unnumbered_detail_viewport_inherits_explicit_local_page_band() ->
         value.startswith("inherited_local_page_code:L1-EL-05@")
         for value in inherited.evidence
     )
+
+
+def test_wide_viewport_uses_leftmost_specific_paper_page_reference() -> None:
+    source_id = "file:wide-synthetic"
+    model_sheet = Sheet(id="model-wide", source_file_id=source_id, layout="Model")
+    paper_sheet = Sheet(id="paper-wide", source_file_id=source_id, layout="Elevations")
+    entities = [
+        CadEntity(
+            id="model-line",
+            source_file_id=source_id,
+            sheet_id=model_sheet.id,
+            entity_type="LINE",
+            space="model",
+            bbox=(0.0, 0.0, 1000.0, 100.0),
+        ),
+        CadEntity(
+            id="wide-viewport",
+            source_file_id=source_id,
+            sheet_id=paper_sheet.id,
+            entity_type="VIEWPORT",
+            space="paper:Elevations",
+            bbox=(0.0, 20.0, 1000.0, 100.0),
+            geometry={"viewport_id": 2, "model_bbox": [0.0, 0.0, 1000.0, 100.0]},
+        ),
+    ]
+    for number, x_value in ((10, -20.0), (11, 50.0), (12, 450.0), (13, 850.0)):
+        parent = f"TB-{number}"
+        page_handle = f"PAGE-{number}"
+        title_handle = f"TITLE-{number}"
+        entities.extend(
+            [
+                CadEntity(
+                    id=f"insert:{number}",
+                    source_file_id=source_id,
+                    sheet_id=paper_sheet.id,
+                    handle=parent,
+                    entity_type="INSERT",
+                    space="paper:Elevations",
+                    insert=(x_value, 10.0),
+                    geometry={
+                        "name": "TITLE_BLOCK",
+                        "attribute_handles": [page_handle, title_handle],
+                    },
+                ),
+                CadEntity(
+                    id=f"page:{number}",
+                    source_file_id=source_id,
+                    sheet_id=paper_sheet.id,
+                    handle=page_handle,
+                    entity_type="ATTRIB",
+                    space="paper:Elevations",
+                    text=f"B2-E-{number:02d}",
+                    insert=(x_value, 10.0),
+                    geometry={"parent_insert_handle": parent, "tag": "SHEET_NO"},
+                ),
+                CadEntity(
+                    id=f"title:{number}",
+                    source_file_id=source_id,
+                    sheet_id=paper_sheet.id,
+                    handle=title_handle,
+                    entity_type="ATTRIB",
+                    space="paper:Elevations",
+                    text="LEVEL B ELEVATIONS",
+                    insert=(x_value, 14.0),
+                    geometry={"parent_insert_handle": parent, "tag": "SHEET_TITLE"},
+                ),
+            ]
+        )
+
+    expansion = expand_viewport_panels(
+        [model_sheet, paper_sheet],
+        entities,
+        source_names={source_id: "synthetic-elevations.dwg"},
+    )
+
+    assert expansion.sheets[0].drawing_number == "B2-E-11"
+    assert any(
+        value.startswith("paper_page_reference:B2-E-11@")
+        for value in expansion.sheets[0].evidence
+    )
+
+
+def test_local_split_preserves_explicit_parent_page_before_repeated_titles() -> None:
+    panel = Sheet(
+        id="panel:wide-predecessor",
+        source_file_id="file:synthetic",
+        drawing_number="B2-E-10",
+        title="LEVEL B ELEVATIONS",
+        kind="elevation",
+        layout="Elevations#viewport:ABC",
+        viewport_handle="ABC",
+        bbox=(0.0, 0.0, 400.0, 100.0),
+        evidence=["paper_page_reference:B2-E-10@entity:page-10"],
+    )
+    entities = [
+        CadEntity(
+            id="title:11",
+            source_file_id="file:synthetic",
+            sheet_id=panel.id,
+            entity_type="TEXT",
+            space="model@Elevations#ABC",
+            text="LEVEL B ELEVATIONS",
+            insert=(178.0, 8.0),
+        ),
+        CadEntity(
+            id="code:11",
+            source_file_id="file:synthetic",
+            sheet_id=panel.id,
+            entity_type="TEXT",
+            space="model@Elevations#ABC",
+            text="B2-E-11",
+            insert=(180.0, 4.0),
+        ),
+        CadEntity(
+            id="title:12",
+            source_file_id="file:synthetic",
+            sheet_id=panel.id,
+            entity_type="TEXT",
+            space="model@Elevations#ABC",
+            text="LEVEL B ELEVATIONS",
+            insert=(278.0, 8.0),
+        ),
+        CadEntity(
+            id="code:12",
+            source_file_id="file:synthetic",
+            sheet_id=panel.id,
+            entity_type="TEXT",
+            space="model@Elevations#ABC",
+            text="B2-E-12",
+            insert=(280.0, 4.0),
+        ),
+        *(
+            CadEntity(
+                id=f"mt:page-{number}",
+                source_file_id="file:synthetic",
+                sheet_id=panel.id,
+                entity_type="TEXT",
+                space="model@Elevations#ABC",
+                text=f"MT-{index:02d}",
+                insert=(x_value, 55.0),
+            )
+            for index, (number, x_value) in enumerate(
+                ((10, 50.0), (11, 180.0), (12, 300.0)),
+                start=1,
+            )
+        ),
+    ]
+    expansion = PanelExpansion(sheets=[panel], entities=entities)
+
+    split_local_drawing_panels(expansion)
+
+    assert [sheet.drawing_number for sheet in expansion.sheets] == [
+        "B2-E-10",
+        "B2-E-11",
+        "B2-E-12",
+    ]
+    sheet_by_id = {sheet.id: sheet for sheet in expansion.sheets}
+    mt_pages = {
+        entity.text: sheet_by_id[entity.sheet_id].drawing_number
+        for entity in expansion.entities
+        if entity.text and entity.text.startswith("MT-")
+    }
+    assert mt_pages == {
+        "MT-01": "B2-E-10",
+        "MT-02": "B2-E-11",
+        "MT-03": "B2-E-12",
+    }
+    assert "local_anchor_basis:paper_page_reference_predecessor" in expansion.sheets[0].evidence

@@ -15,6 +15,7 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 - Add `--price-book <xlsx-or-json>` only when the user supplied or approved that price source.
 - After reviewing `<run-dir>/review-pack.json`, run `scripts/run.ps1 resume <run-dir> --confirmations <json>` so conversion and indexing are reused. `resume` inherits the original pricing context unless it is explicitly changed.
 - For diagnosis or another partial rerun, use the stage commands shown by `scripts/run.ps1 --help`.
+- The full run writes `analysis/vector_quantity_probes.json`. For an existing index, run `scripts/run.ps1 vector-probe <index-json> <occurrences-json> --panels <panels-json> --out <json>` to revisit raw DXF polylines near MT leader targets. These are REVIEW-only candidates and never auto-fill quantity.
 - For an accuracy check, run `scripts/run.ps1 evaluate <predicted-json> <gold-json> --policy <versioned-policy-json> --out <report-json>`. The bundled policy template deliberately leaves disputed length/quantity tolerances pending, so it cannot produce a 95% PASS until those rules are explicitly approved.
 - For a held-out suite, run `scripts/run.ps1 evaluate-batch <manifest-json> --out <batch-dir>`. Inspect every project gate in addition to the JSON/Markdown aggregate; the batch may PASS only when every project PASSes.
 - A CLI exit code of 2 can mean a safe BLOCK result, not a crash; inspect the printed `status`/`safe_outcome` and `<run-dir>/issues.json`.
@@ -37,9 +38,10 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 8. Report both precision of PASS items and automation rate; do not hide unresolved items.
 9. Treat PDFs and images as inventoried attachments unless a later verified parser explicitly extracts evidence from them.
 10. Never use an unscaled paper-space geometric dimension as millimetres, and never let non-PASS rows enter the confirmed quotation total.
+11. A repeated-vector group is only a quantity REVIEW candidate. Require one leader-anchored congruent group, independent handles, an untruncated source scan, and later semantic corroboration before a reviewer may accept it.
 
 ## Outputs
 
-The pipeline produces a machine-readable manifest/index, material-code candidate list, read-only DOCX material-book mappings, unnumbered stainless-material mention diagnostics and candidate edges, evidence graph, review pack, takeoff JSON, quotation workbook, pending-confirmation list, and run diagnostics. A quotation with unresolved evidence or prices is a takeoff draft, not a completed commercial quote.
+The pipeline produces a machine-readable manifest/index, material-code candidate list, read-only DOCX material-book mappings, unnumbered stainless-material mention diagnostics and candidate edges, raw-DXF repeated-vector quantity probes, evidence graph, review pack, takeoff JSON, quotation workbook, pending-confirmation list, and run diagnostics. A quotation with unresolved evidence or prices is a takeoff draft, not a completed commercial quote.
 
 This skill currently targets Windows because the supported launcher is PowerShell. DWG conversion is an external adapter (ODA File Converter, AutoCAD Core Console, or `dwg2dxf`) and is not distributed by this project.

@@ -648,3 +648,72 @@ def test_opt_in_material_workbook_yields_both_codes_and_thickness() -> None:
     assert all(spec.thickness_mm == pytest.approx(1.2) for spec in relevant)
     assert all("\ufffd" not in (spec.name or "") for spec in relevant)
     assert all(spec.status == ReviewStatus.REVIEW for spec in relevant)
+
+
+def test_unnumbered_metal_component_is_diagnostic_not_fabricated_mt() -> None:
+    entities = [entity("entity:metal-mention", "金属栏板", 10, 10)]
+
+    detected = detect_mt_occurrences(entities)
+    mentions = detect_material_mentions(entities, occurrences=detected)
+
+    assert detected == []
+    assert len(mentions) == 1
+    assert mentions[0].raw_text == "金属栏板"
+    assert mentions[0].reason == "metal component description has no recognized material code"
+    assert "mt_code" not in mentions[0].model_dump()
+
+
+def test_generic_nonmetal_component_is_not_a_material_mention() -> None:
+    entities = [entity("entity:nonmetal", "木饰面栏板", 10, 10)]
+
+    assert detect_material_mentions(entities) == []
+
+
+def test_structured_explicit_edges_are_not_truncated_by_top_k() -> None:
+    plan = Sheet(id="plan-many-refs", source_file_id="synthetic", kind="elevation_index")
+    elevations = [
+        Sheet(
+            id=f"elevation:{number}",
+            source_file_id="synthetic",
+            kind="elevation",
+            drawing_number=f"B2-E-{number:02d}",
+        )
+        for number in range(1, 8)
+    ]
+    entities: list[CadEntity] = []
+    for number in range(1, 8):
+        parent = f"CALL-{number}"
+        entities.extend(
+            [
+                entity(
+                    f"view:{number}",
+                    f"{number:02d}",
+                    number * 10,
+                    0,
+                    sheet_id=plan.id,
+                    entity_type="ATTRIB",
+                    geometry={"parent_insert_handle": parent, "tag": "VIEW_NO"},
+                ),
+                entity(
+                    f"page:{number}",
+                    f"B2-E-{number:02d}",
+                    number * 10,
+                    -5,
+                    sheet_id=plan.id,
+                    entity_type="ATTRIB",
+                    geometry={"parent_insert_handle": parent, "tag": "SHEET_NO"},
+                ),
+            ]
+        )
+
+    edges = rank_evidence_edges([plan, *elevations], entities=entities, top_k=1)
+    plan_edges = [edge for edge in edges if edge.relation == "plan_to_elevation"]
+
+    assert len(plan_edges) == 7
+    assert {edge.target_id for edge in plan_edges} == {
+        elevation.id for elevation in elevations
+    }
+    assert all(
+        any(value.startswith("view_reference:") for value in edge.basis)
+        for edge in plan_edges
+    )

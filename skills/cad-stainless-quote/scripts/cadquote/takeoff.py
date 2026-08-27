@@ -51,6 +51,11 @@ _QUANTITY_RE = re.compile(
     r"(?:数量|QTY)\s*[:=：]?\s*(?P<label>\d+)(?![\d.]))",
     re.IGNORECASE,
 )
+_SPLIT_COUNT_INTEGER_RE = re.compile(r"\d+")
+_SPLIT_COUNT_LABEL_RE = re.compile(r"(?P<label>QTY|数量)(?:[:=：])?", re.IGNORECASE)
+_SPLIT_COUNT_SEPARATOR_RE = re.compile(r"[:=：]")
+_DIMENSION_PRODUCT_RE = re.compile(r"\d+(?:\.\d+)?\s*[*xX×]\s*\d+(?:\.\d+)?")
+_LEADER_TYPES = {"LEADER", "MLEADER", "MULTILEADER"}
 _HEIGHT_RE = re.compile(r"(?:高度|高\s*[:=：]?|\bH\s*[:=])", re.IGNORECASE)
 _DIMENSION_TYPES = {"DIMENSION", "ARC_DIMENSION", "LARGE_RADIAL_DIMENSION"}
 _MAX_MEASUREMENT_CANDIDATES_PER_ROLE = 24
@@ -180,10 +185,21 @@ class _MeasurementFact:
     basis_label: str
     confidence_base: float
     identity: tuple[str, str, str]
+    evidence_entity_ids: tuple[str, ...] = ()
+    basis_details: tuple[str, ...] = ()
 
     def candidate_id(self, component_id: str) -> str:
         if self.basis_label == "cad_dimension":
             return _stable_id("measurement", component_id, self.role, self.entity.id)
+        if self.evidence_entity_ids:
+            return _stable_id(
+                "measurement",
+                component_id,
+                self.role,
+                self.entity.id,
+                self.raw_value,
+                self.evidence_entity_ids,
+            )
         return _stable_id(
             "measurement",
             component_id,
@@ -191,6 +207,139 @@ class _MeasurementFact:
             self.entity.id,
             self.raw_value,
         )
+
+
+def _compact_annotation_token(text: str) -> str:
+    return re.sub(r"\s+", "", text).strip()
+
+
+def _annotation_cluster_key(
+    entity: CadEntity,
+    leader_annotation_handles: set[str],
+) -> tuple[str, str, str, str] | None:
+    """Return only an explicit annotation identity, never a proximity cluster."""
+
+    if entity.sheet_id is None:
+        return None
+    parent_handle = entity.geometry.get("parent_insert_handle")
+    if parent_handle is not None and str(parent_handle).strip():
+        return (
+            entity.source_file_id,
+            entity.sheet_id,
+            "parent_insert_handle",
+            str(parent_handle).strip(),
+        )
+
+    # A producer may preserve a leader annotation handle directly on cloned
+    # text. Accept it only when a real leader on this sheet references the same
+    # handle; the identity is never inferred by distance.
+    for key in ("leader_annotation_identity", "leader_annotation_handle"):
+        raw_identity = entity.geometry.get(key)
+        normalized_identity = str(raw_identity).strip() if raw_identity is not None else ""
+        if normalized_identity and normalized_identity in leader_annotation_handles:
+            return (
+                entity.source_file_id,
+                entity.sheet_id,
+                "leader_annotation_handle",
+                normalized_identity,
+            )
+
+    if entity.entity_type in _LEADER_TYPES:
+        annotation_handle = entity.geometry.get("annotation_handle")
+        if annotation_handle is not None and str(annotation_handle).strip():
+            return (
+                entity.source_file_id,
+                entity.sheet_id,
+                "leader_annotation_handle",
+                str(annotation_handle).strip(),
+            )
+    if entity.handle and entity.handle in leader_annotation_handles:
+        return (
+            entity.source_file_id,
+            entity.sheet_id,
+            "leader_annotation_handle",
+            entity.handle,
+        )
+    return None
+
+
+def _split_explicit_quantity_facts(
+    text_entities: Sequence[CadEntity],
+    leader_annotation_handles: set[str],
+) -> list[_MeasurementFact]:
+    """Join count tokens only inside one explicit CAD annotation identity.
+
+    This deliberately does not use spatial proximity. A split ``QTY = 2`` or
+    ``× 2`` is evidence only when the CAD structure says every participating
+    token belongs to the same INSERT/leader annotation.
+    """
+
+    clusters: dict[tuple[str, str, str, str], list[CadEntity]] = defaultdict(list)
+    for entity in text_entities:
+        if not entity.text:
+            continue
+        cluster_key = _annotation_cluster_key(entity, leader_annotation_handles)
+        if cluster_key is not None:
+            clusters[cluster_key].append(entity)
+
+    output: list[_MeasurementFact] = []
+    for cluster_key, members in sorted(clusters.items()):
+        markers: list[tuple[CadEntity, str, str]] = []
+        numbers: list[tuple[CadEntity, int]] = []
+        separators: list[CadEntity] = []
+        has_dimension_product = False
+        for entity in sorted(members, key=lambda value: value.id):
+            compact = _compact_annotation_token(entity.text or "")
+            label_match = _SPLIT_COUNT_LABEL_RE.fullmatch(compact)
+            if label_match is not None:
+                label = label_match.group("label")
+                canonical = "QTY" if label.casefold() == "qty" else "数量"
+                markers.append((entity, "label", canonical))
+                continue
+            if compact.casefold() == "x" or compact == "×":
+                markers.append((entity, "multiplier", "×"))
+                continue
+            if _SPLIT_COUNT_SEPARATOR_RE.fullmatch(compact):
+                separators.append(entity)
+                continue
+            if _SPLIT_COUNT_INTEGER_RE.fullmatch(compact):
+                numbers.append((entity, int(compact)))
+                continue
+            if _DIMENSION_PRODUCT_RE.search(compact):
+                has_dimension_product = True
+
+        # One marker plus one integer is the minimum deterministic statement.
+        # Multiple markers or numbers are ambiguous fields inside the block and
+        # must not be resolved by ordering or proximity.
+        if len(markers) != 1 or len(numbers) != 1 or len(separators) > 1:
+            continue
+        marker_entity, marker_kind, marker_text = markers[0]
+        number_entity, value = numbers[0]
+        if value <= 0 or value > 100_000:
+            continue
+        if marker_kind == "multiplier" and (separators or has_dimension_product):
+            continue
+
+        evidence_entities = [marker_entity, number_entity, *separators]
+        evidence_ids = tuple(sorted({entity.id for entity in evidence_entities}))
+        cluster_kind = cluster_key[2]
+        cluster_identity = cluster_key[3]
+        raw_value = f"{marker_text}{'=' if marker_kind == 'label' else ''}{value}"
+        output.append(
+            _MeasurementFact(
+                entity=marker_entity,
+                role="quantity",
+                raw_value=raw_value,
+                numeric_value=float(value),
+                unit="count",
+                basis_label="explicit_count_text_cluster",
+                confidence_base=0.60,
+                identity=(marker_entity.id, "quantity", f"{value:g}"),
+                evidence_entity_ids=evidence_ids,
+                basis_details=(f"annotation_cluster:{cluster_kind}:{cluster_identity}",),
+            )
+        )
+    return output
 
 
 class _PointGrid:
@@ -256,6 +405,7 @@ class _MeasurementIndex:
     facts_by_sheet: dict[str, list[_MeasurementFact]]
     fact_grids: dict[str, _PointGrid]
     unlocated_facts: dict[str, list[_MeasurementFact]]
+    occurrences_by_sheet_code: dict[tuple[str, str], list[MtOccurrence]]
 
     @classmethod
     def build(
@@ -271,6 +421,14 @@ class _MeasurementIndex:
         }
         text_by_sheet: dict[str, list[CadEntity]] = defaultdict(list)
         dimensions_by_sheet: dict[str, list[CadEntity]] = defaultdict(list)
+        leader_annotation_handles_by_sheet: dict[str, set[str]] = defaultdict(set)
+        occurrences_by_sheet_code: dict[tuple[str, str], list[MtOccurrence]] = defaultdict(list)
+
+        for occurrence in occurrences:
+            if occurrence.sheet_id is not None:
+                occurrences_by_sheet_code[(occurrence.sheet_id, occurrence.mt_code)].append(
+                    occurrence
+                )
 
         # This is the only full entity-table scan performed by build_takeoff().
         for entity in entities:
@@ -280,6 +438,12 @@ class _MeasurementIndex:
                 text_by_sheet[entity.sheet_id].append(entity)
             if entity.entity_type in _DIMENSION_TYPES:
                 dimensions_by_sheet[entity.sheet_id].append(entity)
+            if entity.entity_type in _LEADER_TYPES:
+                annotation_handle = entity.geometry.get("annotation_handle")
+                if annotation_handle is not None and str(annotation_handle).strip():
+                    leader_annotation_handles_by_sheet[entity.sheet_id].add(
+                        str(annotation_handle).strip()
+                    )
 
         height_text_grids: dict[str, _PointGrid] = {}
         for sheet_id, text_entities in text_by_sheet.items():
@@ -395,6 +559,13 @@ class _MeasurementIndex:
                         )
                     )
 
+            facts_by_sheet[sheet_id].extend(
+                _split_explicit_quantity_facts(
+                    text_by_sheet.get(sheet_id, ()),
+                    leader_annotation_handles_by_sheet.get(sheet_id, set()),
+                )
+            )
+
         fact_grids: dict[str, _PointGrid] = {}
         unlocated_facts: dict[str, list[_MeasurementFact]] = defaultdict(list)
         for sheet_id, facts in facts_by_sheet.items():
@@ -414,6 +585,7 @@ class _MeasurementIndex:
             facts_by_sheet=dict(facts_by_sheet),
             fact_grids=fact_grids,
             unlocated_facts=dict(unlocated_facts),
+            occurrences_by_sheet_code=dict(occurrences_by_sheet_code),
         )
 
     def facts_near(
@@ -741,6 +913,109 @@ def _component_points(
     return points
 
 
+def _trusted_detail_sheet_ids(
+    component: ComponentInstance,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    sheet_by_id: Mapping[str, Sheet],
+    edges: Sequence[EvidenceEdge],
+    confirmed_detail_edge_id: str | None,
+) -> set[str]:
+    """Return detail targets that may contribute local measurement candidates.
+
+    Relation ranking intentionally retains weak title/file-name candidates for
+    human review.  Those sheet-level hints must not fan every DIM or ``10+20``
+    expression on a target page into every component.  Native automatic use is
+    limited to an explicit drawing reference whose target is a detail/door view;
+    an explicit reviewer-selected edge may override the target kind.  A local
+    detail occurrence is still required separately before any facts are read.
+    """
+
+    elevation_sheet_ids = {
+        occurrence_by_id[value].sheet_id
+        for value in component.elevation_occurrence_ids
+        if value in occurrence_by_id and occurrence_by_id[value].sheet_id
+    }
+    candidate_edges = [
+        edge
+        for edge in edges
+        if edge.relation == "elevation_to_detail"
+        and edge.source_id in elevation_sheet_ids
+        and edge.target_id in component.detail_sheet_ids
+        and edge.status != ReviewStatus.BLOCK
+    ]
+    if confirmed_detail_edge_id is not None:
+        return {
+            edge.target_id
+            for edge in candidate_edges
+            if edge.id == confirmed_detail_edge_id
+        }
+
+    trusted: set[str] = set()
+    for edge in candidate_edges:
+        target = sheet_by_id.get(edge.target_id)
+        if target is None or target.kind not in {"detail", "door"}:
+            continue
+        if any(
+            marker.startswith(("explicit_reference:", "view_reference:"))
+            for marker in edge.basis
+        ):
+            trusted.add(edge.target_id)
+    return trusted
+
+
+def _unique_local_detail_group(
+    component: ComponentInstance,
+    sheet_id: str,
+    measurement_index: _MeasurementIndex,
+) -> list[MtOccurrence]:
+    """Resolve one leader-backed, same-code detail occurrence group.
+
+    A unique group is a usable local search anchor.  When a detail subview has
+    several same-code callouts, exact room/component semantics may disambiguate;
+    otherwise the component remains unanchored and receives no sheet-wide facts.
+    """
+
+    candidates = [
+        occurrence
+        for occurrence in measurement_index.occurrences_by_sheet_code.get(
+            (sheet_id, component.mt_code),
+            (),
+        )
+        if occurrence.leader_target is not None
+    ]
+    groups = _group_duplicate_occurrences(candidates, measurement_index.sheet_by_id)
+    if len(groups) == 1:
+        return groups[0]
+    if not groups:
+        return []
+
+    component_room = _semantic_key(component.room)
+    component_hint = _semantic_key(component.name)
+    if component_room is None and component_hint is None:
+        return []
+    matching: list[list[MtOccurrence]] = []
+    for group in groups:
+        candidate_room = _semantic_key(_consensus([value.room for value in group]))
+        candidate_hint = _semantic_key(
+            _consensus([value.component_hint for value in group])
+        )
+        room_match = component_room is not None and candidate_room == component_room
+        hint_match = component_hint is not None and candidate_hint == component_hint
+        room_conflict = (
+            component_room is not None
+            and candidate_room is not None
+            and candidate_room != component_room
+        )
+        hint_conflict = (
+            component_hint is not None
+            and candidate_hint is not None
+            and candidate_hint != component_hint
+        )
+        if (room_match or hint_match) and not room_conflict and not hint_conflict:
+            matching.append(group)
+    return matching[0] if len(matching) == 1 else []
+
+
 def _proximity(
     entity: CadEntity,
     points: Sequence[tuple[float, float]],
@@ -766,6 +1041,8 @@ def collect_measurement_candidates(
     entities: Sequence[CadEntity],
     occurrences: Sequence[MtOccurrence],
     *,
+    relation_edges: Sequence[EvidenceEdge] = (),
+    confirmed_detail_edge_id: str | None = None,
     _measurement_index: _MeasurementIndex | None = None,
 ) -> list[MeasurementCandidate]:
     """Collect dimensions/specifications/counts; do not silently select ambiguous values."""
@@ -783,7 +1060,26 @@ def collect_measurement_candidates(
         for value in component.elevation_occurrence_ids
         if value in occurrence_by_id and occurrence_by_id[value].sheet_id
     }
-    relevant_sheet_ids = set(elevation_sheet_ids) | set(component.detail_sheet_ids)
+    trusted_detail_sheet_ids = _trusted_detail_sheet_ids(
+        component,
+        occurrence_by_id,
+        sheet_by_id,
+        relation_edges,
+        confirmed_detail_edge_id,
+    )
+    detail_anchor_ids_by_sheet: dict[str, list[str]] = {}
+    for sheet_id in sorted(trusted_detail_sheet_ids):
+        detail_group = _unique_local_detail_group(component, sheet_id, measurement_index)
+        detail_points = [
+            value.leader_target
+            for value in detail_group
+            if value.leader_target is not None
+        ]
+        if not detail_points:
+            continue
+        points[sheet_id].extend(detail_points)
+        detail_anchor_ids_by_sheet[sheet_id] = [value.id for value in detail_group]
+    relevant_sheet_ids = set(elevation_sheet_ids) | set(detail_anchor_ids_by_sheet)
     output: list[MeasurementCandidate] = []
 
     for sheet_id in sorted(relevant_sheet_ids):
@@ -824,7 +1120,19 @@ def collect_measurement_candidates(
         for fact in selected_facts.values():
             entity = fact.entity
             distance = _proximity(entity, sheet_points)
-            basis = [f"entity:{entity.id}", f"sheet:{sheet_id}"]
+            evidence_entity_ids = fact.evidence_entity_ids or (entity.id,)
+            basis = [
+                *(f"entity:{entity_id}" for entity_id in evidence_entity_ids),
+                f"sheet:{sheet_id}",
+                *fact.basis_details,
+            ]
+            detail_anchor_ids = detail_anchor_ids_by_sheet.get(sheet_id, ())
+            if detail_anchor_ids:
+                basis.append("component_local_detail_anchor")
+                basis.extend(
+                    f"detail_occurrence:{occurrence_id}"
+                    for occurrence_id in detail_anchor_ids
+                )
             if distance is not None:
                 basis.append(f"anchor_distance:{distance:.3f}")
             is_fallback = fact.identity in fallback_identities
@@ -847,7 +1155,7 @@ def collect_measurement_candidates(
                     unit=fact.unit,
                     source_file_id=entity.source_file_id,
                     sheet_id=sheet_id,
-                    entity_ids=[entity.id],
+                    entity_ids=list(evidence_entity_ids),
                     distance=distance,
                     basis=[*basis, fact.basis_label],
                     confidence=confidence,
@@ -1486,11 +1794,21 @@ def build_takeoff(
             )
     confirmed_relation_edge_ids: set[str] = set()
     for sequence, component in enumerate(components, start=1):
+        raw_confirmations = confirmations.get(component.id, {})
+        component_confirmations = (
+            raw_confirmations if isinstance(raw_confirmations, Mapping) else {}
+        )
+        raw_detail_edge_id = component_confirmations.get("elevation_to_detail_edge")
+        confirmed_detail_edge_id = (
+            raw_detail_edge_id if isinstance(raw_detail_edge_id, str) else None
+        )
         measurements = collect_measurement_candidates(
             component,
             sheets,
             entities,
             occurrences,
+            relation_edges=relation_edges,
+            confirmed_detail_edge_id=confirmed_detail_edge_id,
             _measurement_index=measurement_index,
         )
         result.measurements.extend(measurements)
@@ -1524,10 +1842,6 @@ def build_takeoff(
             *occurrence_confirmation_errors.get(component.id, ()),
             *merge_confirmation_errors.get(component.id, ()),
         ]
-        raw_confirmations = confirmations.get(component.id, {})
-        component_confirmations = (
-            raw_confirmations if isinstance(raw_confirmations, Mapping) else {}
-        )
         if raw_confirmations and not isinstance(raw_confirmations, Mapping):
             block_reasons.append("component confirmation must be an object")
 

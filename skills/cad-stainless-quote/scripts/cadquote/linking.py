@@ -56,7 +56,7 @@ class StructuredReferenceCallout:
     """A plan callout that explicitly pairs a view index with a target sheet.
 
     Interior drawings commonly store the two halves of an elevation bubble as
-    sibling ATTRIB values, for example ``07`` and ``2F-E-08``.  They are two
+    sibling ATTRIB values, for example ``07`` and ``B2-E-08``.  They are two
     different identifiers: the first is the local view number and the second
     is the drawing sheet.  Keeping both prevents later stages from silently
     treating one as the other.
@@ -472,7 +472,25 @@ def _rank_relation(
                     else edge
                     for edge in ranked
                 ]
-        result.extend(ranked[:top_k])
+        # ``top_k`` limits weak semantic/similarity suggestions only.  A
+        # structured view-number/sheet-number pair and a reviewer-confirmed
+        # pair are part of the evidence graph, not optional shortlist entries.
+        # Truncating them made a plan index with many elevation bubbles retain
+        # only the first few targets.  Bare short aliases (for example EL-18),
+        # however, still stay inside the shortlist because they can collide
+        # across floors.
+        explicit_or_confirmed = [
+            edge
+            for edge in ranked
+            if edge.status == ReviewStatus.PASS
+            or any(value.startswith("view_reference:") for value in edge.basis)
+            or any(value.startswith("confirmed:") for value in edge.basis)
+        ]
+        weak_candidates = [
+            edge for edge in ranked if edge not in explicit_or_confirmed
+        ]
+        result.extend(explicit_or_confirmed)
+        result.extend(weak_candidates[:top_k])
     return result
 
 

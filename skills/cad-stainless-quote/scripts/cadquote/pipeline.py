@@ -52,6 +52,7 @@ from .panels import PanelExpansion, choose_analysis_view, expand_viewport_panels
 from .pricing import apply_price, load_price_book
 from .render import render_regions
 from .takeoff import TakeoffBuildResult, build_takeoff
+from .vector_probe import probe_repeated_vectors
 
 _MATERIAL_WORKBOOK_TERMS = (
     "材料",
@@ -597,6 +598,7 @@ def _build_review_pack(
     materials: Sequence[MaterialSpec] = (),
     material_mentions: Sequence[MaterialMention] = (),
     material_mention_edges: Sequence[EvidenceEdge] = (),
+    vector_probe_payload: Mapping[str, Any] | None = None,
     issues: Sequence[RunIssue] = (),
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -608,6 +610,16 @@ def _build_review_pack(
     occurrence_by_id = {occurrence.id: occurrence for occurrence in occurrences}
     material_by_id = {material.id: material for material in materials}
     mention_by_id = {mention.id: mention for mention in material_mentions}
+    vector_probes = [
+        value
+        for value in (vector_probe_payload or {}).get("probes", [])
+        if isinstance(value, Mapping)
+    ]
+    vector_probes_by_occurrence: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for probe in vector_probes:
+        occurrence_id = probe.get("occurrence_id")
+        if isinstance(occurrence_id, str):
+            vector_probes_by_occurrence[occurrence_id].append(probe)
     item_by_component = {
         item.component_id: item for item in priced_items if item.component_id is not None
     }
@@ -643,6 +655,11 @@ def _build_review_pack(
                 *component.elevation_occurrence_ids,
             ]
             if occurrence_id in occurrence_by_id
+        ]
+        component_vector_probes = [
+            probe
+            for occurrence in component_occurrences
+            for probe in vector_probes_by_occurrence.get(occurrence.id, ())
         ]
         relevant_sheet_ids = {
             occurrence.sheet_id
@@ -837,6 +854,7 @@ def _build_review_pack(
                     "entity_ids": sorted(referenced_entity_ids),
                 },
                 "measurement_candidates": measurement_records,
+                "vector_quantity_probes": component_vector_probes,
                 "measurement_edges": measurement_edge_records,
                 "occurrence_edges": occurrence_edge_records,
                 "price_edges": price_edge_records,
@@ -915,6 +933,9 @@ def _build_review_pack(
             "material_mention_blocked_candidate_count": sum(
                 edge.status == ReviewStatus.BLOCK for edge in material_mention_edges
             ),
+            "vector_quantity_review_candidate_count": sum(
+                probe.get("recommended_quantity") is not None for probe in vector_probes
+            ),
         },
         "components": groups,
         "material_evidence": {
@@ -944,6 +965,7 @@ def _build_review_pack(
                 for edge in sorted(material_mention_edges, key=lambda value: value.id)
             ],
         },
+        "vector_quantity_evidence": dict(vector_probe_payload or {}),
         "evidence_catalog": {
             "source_files": {
                 source_id: _source_ref(source_by_id[source_id])
@@ -1800,13 +1822,51 @@ def run_pipeline(
         analysis_dir / "material_mention_matches.json",
         [edge.model_dump(mode="json") for edge in material_mention_edges],
     )
+    vector_probe_payload = probe_repeated_vectors(
+        source_dxfs,
+        sheets,
+        occurrences,
+    )
+    vector_probe_path = analysis_dir / "vector_quantity_probes.json"
+    write_json_atomic(vector_probe_path, vector_probe_payload)
+    vector_review_count = int(
+        vector_probe_payload.get("summary", {}).get("review_candidate_count", 0) or 0
+    )
+    if vector_review_count:
+        issues.append(
+            _issue(
+                "takeoff",
+                Severity.INFO,
+                "VECTOR_QUANTITY_REVIEW_CANDIDATES",
+                f"原始DXF局部重复图形产生{vector_review_count}条数量审核候选；"
+                "仅供REVIEW，未自动写入工程量。",
+                evidence=[
+                    str(probe.get("occurrence_id"))
+                    for probe in vector_probe_payload.get("probes", [])
+                    if probe.get("recommended_quantity") is not None
+                ][:24],
+            )
+        )
+    if vector_probe_payload.get("issues"):
+        issues.append(
+            _issue(
+                "takeoff",
+                Severity.WARNING,
+                "VECTOR_QUANTITY_PROBE_PARTIAL",
+                "部分原始DXF局部图形无法读取；对应项目未生成数量候选。",
+                evidence=[
+                    str(value.get("source_file_id") or value.get("code"))
+                    for value in vector_probe_payload["issues"]
+                ][:24],
+            )
+        )
     if material_mentions:
         issues.append(
             _issue(
                 "materials",
                 Severity.INFO,
-                "UNNUMBERED_STAINLESS_MATERIAL_MENTIONS",
-                f"发现{len(material_mentions)}条无可识别材料代号的不锈钢描述；"
+                "UNNUMBERED_METAL_MATERIAL_MENTIONS",
+                f"发现{len(material_mentions)}条无可识别材料代号的金属/不锈钢描述；"
                 "仅保留为低置信审核候选，未伪造MT编号。",
                 evidence=[mention.id for mention in material_mentions[:24]],
             )
@@ -1903,6 +1963,7 @@ def run_pipeline(
             materials=materials,
             material_mentions=material_mentions,
             material_mention_edges=material_mention_edges,
+            vector_probe_payload=vector_probe_payload,
             issues=issues,
             metadata={
                 "run_mode": "full",
@@ -1939,6 +2000,7 @@ def run_pipeline(
             "material_mention_match_candidates": len(material_mention_edges),
             "material_mention_unique_matches": len(unique_docx_mentions),
             "material_mention_blocked_matches": len(blocked_docx_mentions),
+            "vector_quantity_review_candidates": vector_review_count,
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmed_components": sum(
                 bool(value) for value in confirmation_bundle.selections.values()
@@ -1992,6 +2054,7 @@ def run_pipeline(
                 "material_mention_match_candidates": len(material_mention_edges),
                 "material_mention_unique_matches": len(unique_docx_mentions),
                 "material_mention_blocked_matches": len(blocked_docx_mentions),
+                "vector_quantity_review_candidates": vector_review_count,
                 "components": len(takeoff.components),
                 "takeoff_items": len(priced_items),
             },
@@ -2015,6 +2078,7 @@ def run_pipeline(
         "mt_occurrences": str(analysis_dir / "mt_occurrences.json"),
         "material_mentions": str(analysis_dir / "material_mentions.json"),
         "material_mention_matches": str(analysis_dir / "material_mention_matches.json"),
+        "vector_quantity_probes": str(vector_probe_path),
         "relation_edges": str(analysis_dir / "relation_edges.json"),
         "takeoff": str(output_dir / "takeoff.json"),
         "evidence_graph": str(output_dir / "evidence_graph.json"),
@@ -2061,6 +2125,7 @@ def resume_pipeline(
     occurrences_path = analysis_dir / "mt_occurrences.json"
     mentions_path = analysis_dir / "material_mentions.json"
     mention_matches_path = analysis_dir / "material_mention_matches.json"
+    vector_probe_path = analysis_dir / "vector_quantity_probes.json"
     edges_path = analysis_dir / "relation_edges.json"
     ingest_path = root / "ingest.json"
     required = [index_path, panels_path, materials_path, occurrences_path, edges_path, ingest_path]
@@ -2135,6 +2200,14 @@ def resume_pipeline(
         ]
         if mention_matches_path.is_file()
         else []
+    )
+    vector_probe_payload = (
+        json.loads(vector_probe_path.read_text(encoding="utf-8"))
+        if vector_probe_path.is_file()
+        else {}
+    )
+    vector_review_count = int(
+        vector_probe_payload.get("summary", {}).get("review_candidate_count", 0) or 0
     )
     relation_edges = [
         EvidenceEdge.model_validate(value)
@@ -2255,6 +2328,7 @@ def resume_pipeline(
             materials=materials,
             material_mentions=material_mentions,
             material_mention_edges=material_mention_edges,
+            vector_probe_payload=vector_probe_payload,
             issues=issues,
             metadata={
                 "run_mode": "resume",
@@ -2300,6 +2374,7 @@ def resume_pipeline(
                 material.source_type == "docx_material_book" for material in materials
             ),
             "material_mention_match_candidates": len(material_mention_edges),
+            "vector_quantity_review_candidates": vector_review_count,
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmed_components": sum(
                 bool(value) for value in confirmation_bundle.selections.values()
@@ -2332,6 +2407,7 @@ def resume_pipeline(
             material.source_type == "docx_material_book" for material in materials
         ),
         "material_mention_match_candidates": len(material_mention_edges),
+        "vector_quantity_review_candidates": vector_review_count,
         "material_mention_unique_matches": len(
             {
                 edge.source_id
@@ -2414,5 +2490,7 @@ def resume_pipeline(
     )
     if mentions_path.is_file():
         result.paths["material_mentions"] = str(mentions_path)
+    if vector_probe_path.is_file():
+        result.paths["vector_quantity_probes"] = str(vector_probe_path)
     write_json_atomic(root / "run.json", result.to_dict())
     return result
