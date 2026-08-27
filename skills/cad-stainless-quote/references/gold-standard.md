@@ -12,6 +12,7 @@
 - 每个导入行保留工作表、Excel 行号、单元格坐标、原始值、数值格式、公式（`.xlsx/.xlsm` 可得时）和字段到单元格的映射。
 - `.xlsx/.xlsm` 同时保留公式、缓存显示值、普通/数组公式类型及数组范围。没有缓存值且无法可靠复算时，必须产生 `REVIEW/BLOCK`，不能把公式文本冒充数值。
 - 工作表内的嵌入图片和 `DISPIMG` 图片单元格会记录锚点、证据类别与所在行；当前只建立图片证据索引，不对图片内容做 OCR。
+- 对 `.xlsx/.xlsm` 可另行只读导出图片原始字节。导出器直接解析 OOXML 关系，普通嵌入图按 drawing 锚点定位，WPS `DISPIMG` 按公式 ID 关联 `cellimages.xml`；图片使用内容哈希命名，不改写源工作簿。
 - 工作表的逻辑边界按实际有值的单元格、合并区域和图片锚点计算，忽略仅由远端空白样式造成的夸大 OOXML dimension。
 
 ## 复算规则
@@ -27,10 +28,21 @@
 
 ```python
 from cadquote.gold import import_gold_workbook
+from cadquote.gold_images import export_gold_image_assets
 
 result = import_gold_workbook("人工不锈钢清单.xls")
 result.write_json("runs/example/gold-import.json")
 print(result.summary.model_dump())
+
+# XLSX/XLSM：原始图片写入 assets/，同目录生成 manifest.json。
+image_source = "人工不锈钢清单.xlsx"
+image_gold = import_gold_workbook(image_source)
+images = export_gold_image_assets(
+    image_source,
+    "runs/example/gold-images",
+    gold_result=image_gold,
+)
+print(images.asset_count, images.issues)
 ```
 
 通过 SKILL 启动器导入：
@@ -38,12 +50,26 @@ print(result.summary.model_dump())
 ```powershell
 & .\scripts\run.ps1 gold-import "人工不锈钢清单.xls" `
   --out "runs\example\gold-import.json"
+
+# 导入清单的同时导出图片证据
+& .\scripts\run.ps1 gold-import "人工不锈钢清单.xlsx" `
+  --out "runs\example\gold-import.json" `
+  --image-assets-dir "runs\example\gold-images"
+
+# 也可独立执行图片资产导出
+& .\scripts\run.ps1 gold-image-export "人工不锈钢清单.xlsx" `
+  --out "runs\example\gold-images"
 ```
+
+图片 manifest 每个证据项至少包含 `sheet、cell、row、category、formula_id、sha256、package_path、export_relative_path`。同一原始图片被多个单元格引用时，manifest 保留每个引用，但内容相同的文件只落盘一次。所有路径均为包内路径或相对导出路径；绝对源路径不会写入 manifest。
+
+旧 `.xls` 不是 OOXML ZIP 包。当前图片导出器不会猜测或静默忽略其 OLE/BIFF 图片，而是在 manifest 中写入 `LEGACY_XLS_IMAGE_EXPORT_UNSUPPORTED` 阻断问题；清单行数据仍可按既有 `xlrd` 路径导入。
 
 ## 主 CLI 行为
 
 - 位置参数 `workbook`；
 - 必填的 `--out`；
+- 可选 `--image-assets-dir`：只读导出 XLSX/XLSM 图片并写 `manifest.json`；
 - 输出终端摘要：行数、`REVIEW/BLOCK` 数量、问题总数和输出路径；MT/单位分布及逐类偏差保存在完整输出 JSON 中；
 - 进程退出码：读取/解析异常或没有识别到报价行时非零；零行仍会生成 `row_count = 0` 的审计 JSON 供诊断。行级偏差会保存在输出 JSON 中，不能被自动提升为 PASS。
 

@@ -41,8 +41,24 @@ _NUMBER_RE = re.compile(r"^\s*0*(\d{1,3})\s*$")
 _STAINLESS_RE = re.compile(r"不锈钢", re.I)
 _MATERIAL_KEYWORD_RE = re.compile(
     r"不锈钢|钢板|金属|铝板|铝合金|铜板|铁板|钛金|玫瑰金|镜面|拉丝|喷砂|"
-    r"苹果砂|古铜|烤漆|镀色|雕花|蚀刻"
+    r"苹果砂|古铜|烤漆|镀色|雕花|蚀刻|铁艺|扁铁"
 )
+_GENERIC_MATERIAL_ALIAS_TERMS = {
+    "不锈钢",
+    "钢板",
+    "金属",
+    "铝板",
+    "铝合金",
+    "铜板",
+    "铁板",
+    "镜面",
+    "拉丝",
+    "喷砂",
+    "烤漆",
+    "镀色",
+    "雕花",
+    "蚀刻",
+}
 _ROOM_RE = re.compile(
     r"(?:房|厅|室|区|走廊|过道|前厅|大堂|会所|售楼部|卫生间|洗手间|茶室|"
     r"瑜伽|水吧|书吧|接待|洽谈|会议|办公室|门厅)"
@@ -74,6 +90,12 @@ class _Seed:
     entities: tuple[CadEntity, ...]
     confidence: float
     method: str
+
+
+@dataclass(frozen=True)
+class _MaterialPhraseIndex:
+    exact: Mapping[str, set[str]]
+    aliases: Mapping[str, set[str]]
 
 
 def clean_cad_text(value: Any) -> str:
@@ -300,24 +322,38 @@ def _detached_seeds(
     return seeds
 
 
-def _material_phrases(materials: Sequence[MaterialSpec]) -> dict[str, set[str]]:
+def _material_phrases(materials: Sequence[MaterialSpec]) -> _MaterialPhraseIndex:
     phrases: dict[str, set[str]] = defaultdict(set)
+    aliases: dict[str, set[str]] = defaultdict(set)
     for material in materials:
         for value in (material.name, material.finish):
             text = clean_cad_text(value)
             compact = re.sub(r"[\s,，。()（）/]+", "", text).casefold()
             if len(compact) >= 3 and contains_material_keyword(compact):
                 phrases[compact].add(material.mt_code)
-    return phrases
+            for term in _MATERIAL_KEYWORD_RE.findall(text):
+                alias = term.casefold()
+                if alias not in _GENERIC_MATERIAL_ALIAS_TERMS:
+                    aliases[alias].add(material.mt_code)
+    return _MaterialPhraseIndex(exact=phrases, aliases=aliases)
 
 
-def _match_material_code(text: str, phrases: Mapping[str, set[str]]) -> str | None:
+def _match_material_code(text: str, phrases: _MaterialPhraseIndex) -> str | None:
     compact = re.sub(r"[\s,，。()（）/]+", "", clean_cad_text(text)).casefold()
     matches: set[str] = set()
-    for phrase, codes in phrases.items():
+    for phrase, codes in phrases.exact.items():
         if phrase in compact or compact in phrase:
             matches.update(codes)
-    return next(iter(matches)) if len(matches) == 1 else None
+    if len(matches) == 1:
+        return next(iter(matches))
+    if matches:
+        return None
+
+    alias_matches: set[str] = set()
+    for alias, codes in phrases.aliases.items():
+        if alias in compact and len(codes) == 1:
+            alias_matches.update(codes)
+    return next(iter(alias_matches)) if len(alias_matches) == 1 else None
 
 
 def _nearest_descriptor(

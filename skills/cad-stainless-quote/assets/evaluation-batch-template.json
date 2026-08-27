@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "batch_id": "held-out-batch-v1",
+  "policy": "evaluation-policy.json",
+  "tolerance": 0.001,
+  "projects": [
+    {
+      "project_id": "held-out-01",
+      "predicted": "predictions/held-out-01.json",
+      "gold": "gold/held-out-01.json"
+    },
+    {
+      "project_id": "held-out-02",
+      "predicted": "predictions/held-out-02.json",
+      "gold": "gold/held-out-02.json",
+      "policy": "evaluation-policy-special-case.json"
+    }
+  ]
+}

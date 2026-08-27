@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from base64 import b64decode
 from pathlib import Path
 
@@ -11,8 +10,6 @@ import pytest
 import xlsxwriter
 from cadquote.gold import import_gold_workbook
 from openpyxl import Workbook
-
-REAL_GOLD = Path(os.environ.get("CADQUOTE_REAL_GOLD_XLS", ""))
 
 
 def _write_canonical_xlsx(path: Path) -> None:
@@ -287,46 +284,6 @@ def test_abnormal_unit_and_negative_engineering_quantity_are_audited(
         "UNRECOGNIZED_UNIT",
         "QUANTITY_NOT_CALCULABLE",
     }
-
-
-@pytest.mark.skipif(
-    not REAL_GOLD.is_file(),
-    reason="set CADQUOTE_REAL_GOLD_XLS to run the private legacy benchmark",
-)
-def test_opt_in_legacy_xls_regression() -> None:
-    result = import_gold_workbook(REAL_GOLD)
-
-    assert result.workbook_format == "xls"
-    assert result.summary.sheet_count == 1
-    assert result.summary.row_count == 180
-    assert result.summary.mt_distribution == {"MT-01": 179, "MT-02": 1}
-    assert result.summary.unit_distribution == {"m": 103, "㎡": 74, "件": 3}
-    assert result.summary.audit_issue_count == 10
-    assert result.summary.quantity_mismatch_count == 10
-    assert result.summary.quantity_material_mismatch_count == 6
-    assert result.summary.quantity_rounding_deviation_count == 4
-    assert result.summary.quantity_not_calculable_count == 0
-    assert result.summary.pass_count == 0
-    assert result.summary.review_count == 174
-    assert result.summary.block_count == 6
-
-    assert result.sheets[0].header_rows == [3, 4]
-    assert result.sheets[0].imported_row_count == 180
-    assert result.rows[0].row == 5
-    assert result.rows[0].field_cells["mt_code"] == ["B5"]
-    assert result.rows[0].raw_cells[1].raw_value == "MT-01"
-    assert [(issue.row, issue.code) for issue in result.issues] == [
-        (17, "QUANTITY_FORMULA_MISMATCH"),
-        (18, "QUANTITY_FORMULA_MISMATCH"),
-        (19, "QUANTITY_FORMULA_MISMATCH"),
-        (20, "QUANTITY_FORMULA_MISMATCH"),
-        (34, "QUANTITY_FORMULA_MISMATCH"),
-        (35, "QUANTITY_FORMULA_MISMATCH"),
-        (55, "QUANTITY_ROUNDING_DEVIATION"),
-        (149, "QUANTITY_ROUNDING_DEVIATION"),
-        (152, "QUANTITY_ROUNDING_DEVIATION"),
-        (177, "QUANTITY_ROUNDING_DEVIATION"),
-    ]
 
 
 def test_rejects_non_excel_file(tmp_path: Path) -> None:

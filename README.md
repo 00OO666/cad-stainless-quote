@@ -16,8 +16,13 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Converts DWG to DXF through an installed ODA File Converter and records conversion/audit results.
 - Indexes layouts, viewports, block-expanded text, dimensions, leaders, and coordinates into JSON plus SQLite.
 - Detects normalized `MT` annotations and conservative material-table candidates.
+- Splits multi-view sheets into local drawing panels and keeps leader text attached to the arrow-target panel.
+- Resolves explicit view-number → target-sheet callouts and preserves the supporting entity IDs.
+- Uses exact or unique distinctive material aliases; ambiguous shared aliases remain unresolved.
 - Builds reviewable plan → elevation → detail relationships without treating annotation count as quantity.
 - Extracts bounded length, height, quantity, and unfolded-width candidates with unit and paper-space safeguards.
+- Exports embedded workbook image evidence and can register screenshots to rendered CAD panels with an optional vision dependency.
+- Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
 - Applies audited reviewer confirmations and resumes without re-running immutable upstream stages.
 - Computes `m`, `m²`, piece, and set quantities deterministically.
 - Matches only approved, versioned, specification-compatible prices.
@@ -82,6 +87,7 @@ tests/                     unit, security, integration, and regression tests
 
 ```powershell
 & .\skills\cad-stainless-quote\.venv\Scripts\python.exe -m pip install pytest ruff
+& .\skills\cad-stainless-quote\.venv\Scripts\python.exe -m pip install -e ".[vision]"
 & .\skills\cad-stainless-quote\.venv\Scripts\python.exe -m pytest -q
 & .\skills\cad-stainless-quote\.venv\Scripts\python.exe -m ruff check .
 ```

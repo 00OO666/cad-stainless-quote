@@ -73,12 +73,23 @@ _RULES: tuple[_Rule, ...] = (
 _DRAWING_NUMBER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"(?<![A-Z0-9])"
-        r"([A-Z]{1,4}(?:-[A-Z]{1,4})?-\d{1,3}"
-        r"(?:\s*[~～至]\s*(?:[A-Z]{1,4}(?:-[A-Z]{1,4})?-)?\d{1,3})?)"
+        r"([A-Z0-9]{1,4}(?:-[A-Z0-9]{1,4})?-\d{1,3}"
+        r"(?:\s*[~～至]\s*(?:[A-Z0-9]{1,4}(?:-[A-Z0-9]{1,4})?-)?\d{1,3})?)"
         r"(?!\d)",
         re.IGNORECASE,
     ),
     re.compile(r"(?:图号|DRAWING\s*(?:NO\.?|NUMBER))\s*[:：]?\s*([A-Z0-9._/-]+)", re.IGNORECASE),
+)
+
+_DETAIL_VIEW_RE = re.compile(r"节点|大样|详图|剖面|DETAIL|SECTION", re.IGNORECASE)
+_CEILING_SUBJECT_RE = re.compile(
+    r"天花|顶面|吊顶|REFLECTED\s+CEILING|CEILING|\bRCP\b",
+    re.IGNORECASE,
+)
+_CEILING_PLAN_RE = re.compile(
+    r"(?:天花|顶面|吊顶).{0,16}(?:平面|布置)|"
+    r"REFLECTED\s+CEILING(?:\s+PLAN)?|CEILING\s+PLAN|\bRCP\b",
+    re.IGNORECASE,
 )
 
 
@@ -98,6 +109,9 @@ def extract_drawing_number(values: Iterable[str]) -> str | None:
             if match:
                 candidate = re.sub(r"\s+", "", match.group(1))
                 if re.match(r"MT[-_/]", candidate, re.IGNORECASE):
+                    continue
+                prefix = candidate.split("~", 1)[0].rsplit("-", 1)[0]
+                if not re.search(r"[A-Z]", prefix, re.IGNORECASE):
                     continue
                 return candidate
     return None
@@ -123,6 +137,7 @@ def classify_sheet(
     *,
     layout_name: str | None = None,
     drawing_number: str | None = None,
+    primary_title_texts: Iterable[str] = (),
 ) -> ClassificationResult:
     """Classify one layout/sheet and retain human-readable evidence.
 
@@ -133,8 +148,16 @@ def classify_sheet(
 
     path = Path(filename)
     file_text = normalize_text(path.stem)
+    primary_titles = [
+        normalize_text(value) for value in primary_title_texts if normalize_text(value)
+    ]
     titles = [normalize_text(value) for value in title_texts if normalize_text(value)]
     sources = [("filename", file_text, 1.0)]
+    # A structured title-block field (for example an ATTRIB tagged SHEET_TITLE)
+    # is stronger than a nearby fixed glyph such as the bare word DETAIL.  The
+    # latter is still retained as supporting evidence, but cannot outvote the
+    # human-readable local view title on its own.
+    sources.extend(("primary_title", title, 1.5) for title in primary_titles)
     sources.extend(("title", title, 1.0) for title in titles)
     if layout_name:
         sources.append(("layout", normalize_text(layout_name), 0.55))
@@ -161,12 +184,23 @@ def classify_sheet(
             if re.search(r"立面(?:图)?索引|ELEVATION\s+INDEX", text, re.IGNORECASE):
                 scores["elevation"] = max(0.0, scores["elevation"] - 3.8 * source_weight)
 
-    # Domain-specific detail sheets retain their business kind; the generic
-    # word 大样/DETAIL is not an independent competing classification.
+    # Ceiling/floor/door describe a subject, while plan/elevation/detail
+    # describe a view type.  With the current one-axis Sheet.kind contract we
+    # choose the explicit view type when a ceiling title says 节点/大样/剖面,
+    # and keep the ceiling kind only for an actual ceiling plan/RCP.  This also
+    # prevents "REFLECTED CEILING PLAN" from tying with the generic PLAN rule.
+    for _source_name, text, source_weight in sources:
+        if _CEILING_SUBJECT_RE.search(text) and _DETAIL_VIEW_RE.search(text):
+            scores["ceiling"] = max(0.0, scores.get("ceiling", 0.0) - 4.5 * source_weight)
+        if _CEILING_PLAN_RE.search(text) and "plan" in scores:
+            scores["plan"] = max(0.0, scores["plan"] - 3.8 * source_weight)
+
+    # Door/floor details retain their existing business kind. Ceiling is
+    # intentionally absent: a ceiling *detail* is a detail view, whereas a
+    # ceiling plan/RCP is handled by the rule above.
     if "detail" in scores:
         specific_patterns = {
             "door": r"门表|门大样|门详图|DOOR\s+(?:SCHEDULE|DETAIL)",
-            "ceiling": r"天花|顶面|吊顶|REFLECTED\s+CEILING|CEILING\s+PLAN|\bRCP\b",
             "floor": r"地花|地面铺装|地坪|FLOOR\s+(?:FINISH|PATTERN)",
         }
         for kind, pattern in specific_patterns.items():
@@ -179,9 +213,19 @@ def classify_sheet(
                     scores["detail"] = max(0.0, scores["detail"] - 4.2 * source_weight)
 
     ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    floor_number_titles = [
+        title
+        for title in titles
+        if re.search(
+            r"(?<![A-Z0-9])(?:B\d+|\d+F|L\d+)-[A-Z0-9]{1,4}-\d{1,3}(?!\d)",
+            title,
+            re.IGNORECASE,
+        )
+    ]
     number_titles = [
         title
         for title in titles
+        if title not in floor_number_titles
         if re.search(
             r"图号|DRAWING\s*(?:NO\.?|NUMBER)|立面|平面|节点|大样|详图|"
             r"ELEVATION|PLAN|DETAIL|SECTION",
@@ -190,9 +234,9 @@ def classify_sheet(
         )
     ]
     inferred_number = drawing_number or extract_drawing_number(
-        [file_text, layout_name or "", *number_titles]
+        [file_text, layout_name or "", *floor_number_titles, *number_titles]
     )
-    title = _candidate_title(titles, path.stem)
+    title = _candidate_title(primary_titles or titles, path.stem)
     if not ordered:
         return ClassificationResult(
             kind="unknown",

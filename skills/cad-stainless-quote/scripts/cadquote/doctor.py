@@ -16,6 +16,7 @@ from .converter import discover_converters
 REQUIRED_DISTRIBUTIONS = {
     "ezdxf": "ezdxf",
     "openpyxl": "openpyxl",
+    "cv2": "opencv-python-headless",
     "pydantic": "pydantic",
     "xlsxwriter": "XlsxWriter",
     "xlrd": "xlrd",

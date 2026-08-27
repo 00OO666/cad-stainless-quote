@@ -8,6 +8,7 @@ This repository contains original project code under the MIT License. It does no
 |---|---|---|
 | ezdxf | MIT | DXF parsing, audit, and drawing frontend |
 | openpyxl | MIT | Reading XLSX and validating generated workbooks |
+| OpenCV Python (headless) | Apache-2.0 | Screenshot-to-CAD-panel feature registration |
 | Pydantic | MIT | Data contracts and validation |
 | XlsxWriter | BSD-2-Clause | Portable formula-driven XLSX export |
 | xlrd | BSD | Legacy XLS reading |

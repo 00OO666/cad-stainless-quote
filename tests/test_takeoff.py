@@ -157,6 +157,27 @@ def test_mt_occurrence_count_is_not_used_as_quantity():
     assert draft.items[0].status == ReviewStatus.BLOCK
 
 
+def test_dimension_multiplication_is_not_misread_as_quantity():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [entity for entity in entities if entity.id != "quantity-text"]
+    entities.append(
+        CadEntity(
+            id="dimension-expression",
+            source_file_id="f",
+            sheet_id="elevation",
+            entity_type="TEXT",
+            space="model",
+            text="50*200*10 50x19 x0.6",
+            insert=(52, 50),
+            bbox=(50, 49, 65, 52),
+        )
+    )
+
+    draft = build_takeoff(sheets, entities, occurrences, edges)
+
+    assert not [candidate for candidate in draft.measurements if candidate.role == "quantity"]
+
+
 def test_duplicate_mt_evidence_is_conservatively_grouped_without_quantity():
     sheet = Sheet(
         id="plan",
@@ -281,6 +302,7 @@ def test_unabsorbed_elevation_and_door_occurrences_become_review_candidates():
             source_file_id="source",
             sheet_id="orphan-elevation",
             entity_ids=["same-original-entity"],
+            leader_target=(20, 20),
         ),
         # Duplicate detector output for the same original annotation must not
         # become a second physical component candidate.
@@ -290,12 +312,14 @@ def test_unabsorbed_elevation_and_door_occurrences_become_review_candidates():
             source_file_id="source",
             sheet_id="orphan-elevation",
             entity_ids=["same-original-entity"],
+            leader_target=(20, 20),
         ),
         MtOccurrence(
             id="orphan-door-mt",
             mt_code="MT-02",
             source_file_id="source",
             sheet_id="orphan-door",
+            leader_target=(30, 30),
         ),
         # Repeating an occurrence ID in input cannot create a duplicate candidate.
         MtOccurrence(
@@ -303,6 +327,16 @@ def test_unabsorbed_elevation_and_door_occurrences_become_review_candidates():
             mt_code="MT-02",
             source_file_id="source",
             sheet_id="orphan-door",
+            leader_target=(30, 30),
+        ),
+        # A bare material label remains occurrence evidence and must not become
+        # a physical orphan line item by itself.
+        MtOccurrence(
+            id="bare-elevation-mt",
+            mt_code="MT-03",
+            source_file_id="source",
+            sheet_id="orphan-elevation",
+            anchor=(80, 80),
         ),
     ]
     edges = [
@@ -672,7 +706,9 @@ def test_unparseable_dimension_override_does_not_fall_back_to_hidden_geometry():
 def test_sheet_level_mt_fanout_does_not_claim_every_elevation_occurrence():
     sheets, occurrences, edges, _ = _fixture()
     occurrences[0] = occurrences[0].model_copy(update={"room": None})
-    occurrences[1] = occurrences[1].model_copy(update={"room": None})
+    occurrences[1] = occurrences[1].model_copy(
+        update={"room": None, "leader_target": (50, 50)}
+    )
     occurrences.extend(
         [
             occurrences[1].model_copy(update={"id": "elevation-mt-2", "anchor": (60, 50)}),
@@ -694,7 +730,9 @@ def test_sheet_level_mt_fanout_does_not_claim_every_elevation_occurrence():
 def test_confirmed_elevation_occurrence_is_validated_and_suppresses_its_orphan():
     sheets, occurrences, edges, entities = _fixture()
     occurrences[0] = occurrences[0].model_copy(update={"room": None})
-    occurrences[1] = occurrences[1].model_copy(update={"room": None})
+    occurrences[1] = occurrences[1].model_copy(
+        update={"room": None, "leader_target": (50, 50)}
+    )
     occurrences.append(
         occurrences[1].model_copy(update={"id": "elevation-mt-2", "anchor": (60, 50)})
     )
@@ -770,6 +808,7 @@ def _merge_fixture():
             source_file_id="f",
             sheet_id="door",
             anchor=(50, 50),
+            leader_target=(50, 50),
             room="洽谈区",
         )
     )

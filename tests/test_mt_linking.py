@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from cadquote.linking import (
     extract_reference_codes,
+    extract_structured_reference_callouts,
     normalize_reference_code,
     rank_evidence_edges,
 )
@@ -334,6 +335,29 @@ def test_material_name_only_detection_requires_unique_registry_match() -> None:
     assert detected[0].status == ReviewStatus.REVIEW
 
 
+def test_unique_distinctive_material_alias_can_recover_material_code() -> None:
+    materials = [
+        MaterialSpec(id="material:4", mt_code="MT-04", name="深灰铁艺,实心扁铁"),
+    ]
+    entities = [entity("entity:rail", "铁艺栏板", 10, 10)]
+
+    detected = detect_mt_occurrences(entities, materials=materials, cluster_distance=20)
+
+    assert len(detected) == 1
+    assert detected[0].mt_code == "MT-04"
+    assert detected[0].status == ReviewStatus.REVIEW
+
+
+def test_shared_material_alias_remains_unresolved() -> None:
+    materials = [
+        MaterialSpec(id="material:4", mt_code="MT-04", name="深灰铁艺,实心扁铁"),
+        MaterialSpec(id="material:5", mt_code="MT-05", name="铁艺雕花"),
+    ]
+    entities = [entity("entity:rail", "铁艺栏板", 10, 10)]
+
+    assert detect_mt_occurrences(entities, materials=materials, cluster_distance=20) == []
+
+
 def test_shared_descriptor_does_not_merge_two_callouts() -> None:
     entities = [
         entity("entity:code-left", "MT-01", 0, 0),
@@ -390,10 +414,17 @@ def test_numeric_attribute_with_mt_tag_is_structured_code_evidence() -> None:
 
 def test_reference_normalization_range_and_ranked_evidence_edges() -> None:
     assert normalize_reference_code("ＡＥ１") == "A-E-01"
+    assert normalize_reference_code("１Ｆ－Ｅ－１") == "1F-E-01"
+    assert normalize_reference_code("2026-03-16") is None
     assert extract_reference_codes("会所立面 A-E-01～A-E-03") >= {
         "A-E-01",
         "A-E-02",
         "A-E-03",
+    }
+    assert extract_reference_codes("大厅立面 1F-E-01～1F-E-03") >= {
+        "1F-E-01",
+        "1F-E-02",
+        "1F-E-03",
     }
 
     sheets = [
@@ -480,6 +511,77 @@ def test_reference_normalization_range_and_ranked_evidence_edges() -> None:
             assert edge.status == ReviewStatus.PASS
         else:
             assert edge.status == ReviewStatus.REVIEW
+
+
+def test_structured_plan_callout_preserves_view_number_and_target_sheet() -> None:
+    parent = "CALL-SYNTHETIC"
+    entities = [
+        entity(
+            "entity:view",
+            "07",
+            0,
+            0,
+            sheet_id="sheet:plan",
+            entity_type="ATTRIB",
+            geometry={"parent_insert_handle": parent, "tag": "DETAIL_NO"},
+        ),
+        entity(
+            "entity:page",
+            "2F-E-08",
+            0,
+            -5,
+            sheet_id="sheet:plan",
+            entity_type="ATTRIB",
+            geometry={"parent_insert_handle": parent, "tag": "SHEET_NO"},
+        ),
+    ]
+
+    callouts = extract_structured_reference_callouts(entities)
+
+    assert len(callouts) == 1
+    assert callouts[0].view_number == "07"
+    assert callouts[0].code == "2F-E-08"
+    assert set(callouts[0].entity_ids) == {"entity:view", "entity:page"}
+
+    sheets = [
+        Sheet(id="sheet:plan", source_file_id="file:fixture", kind="plan"),
+        Sheet(
+            id="sheet:elevation",
+            source_file_id="file:fixture",
+            kind="elevation",
+            drawing_number="2F-E-08",
+        ),
+    ]
+    edges = rank_evidence_edges(sheets, entities=entities)
+
+    assert len(edges) == 1
+    assert any(
+        value.startswith("view_reference:07->2F-E-08@") for value in edges[0].basis
+    )
+
+
+def test_title_block_without_view_number_is_not_a_structured_callout() -> None:
+    parent = "TITLE-BLOCK"
+    entities = [
+        entity(
+            "entity:page",
+            "2F-E-08",
+            0,
+            0,
+            entity_type="ATTRIB",
+            geometry={"parent_insert_handle": parent, "tag": "SHEET_NO"},
+        ),
+        entity(
+            "entity:scale",
+            "1:30",
+            0,
+            -5,
+            entity_type="ATTRIB",
+            geometry={"parent_insert_handle": parent, "tag": "SCALE"},
+        ),
+    ]
+
+    assert extract_structured_reference_callouts(entities) == []
 
 
 def test_multiple_explicit_sheet_targets_are_not_all_promoted() -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -12,13 +13,20 @@ from pathlib import Path
 from typing import Any
 
 from cadquote.cad_index import build_cad_index
+from cadquote.candidate_benchmark import build_candidate_benchmark
 from cadquote.converter import convert_dwgs
 from cadquote.doctor import run_doctor
-from cadquote.evaluation import evaluate_takeoff
+from cadquote.evaluation import (
+    evaluate_takeoff,
+    evaluation_batch_markdown,
+    summarize_evaluation_batch,
+)
 from cadquote.exporter import build_quote_workbook
 from cadquote.gold import import_gold_workbook
+from cadquote.gold_images import MANIFEST_NAME, export_gold_image_assets
+from cadquote.image_matching import register_screenshot_to_panel, write_registration
 from cadquote.ingest import ingest_input
-from cadquote.io import write_json_atomic
+from cadquote.io import sha256_file, write_json_atomic
 from cadquote.linking import rank_evidence_edges
 from cadquote.materials import (
     DEFAULT_REVIEW_CODE_FAMILIES,
@@ -38,9 +46,20 @@ from cadquote.models import (
     TakeoffItem,
 )
 from cadquote.mt import detect_material_mentions, detect_mt_occurrences
-from cadquote.panels import PanelExpansion, choose_analysis_view
-from cadquote.pipeline import load_confirmation_bundle, resume_pipeline, run_pipeline
-from cadquote.render import load_regions_json, render_regions, viewport_model_regions
+from cadquote.panels import PanelExpansion, choose_analysis_view, expand_viewport_panels
+from cadquote.pipeline import (
+    _render_occurrences,
+    load_confirmation_bundle,
+    resume_pipeline,
+    run_pipeline,
+)
+from cadquote.render import (
+    load_regions_json,
+    render_indexed_occurrences,
+    render_panel_occurrence_crops,
+    render_regions,
+    viewport_model_regions,
+)
 from cadquote.takeoff import build_takeoff
 
 
@@ -149,6 +168,158 @@ def _evaluation_project_id(payload: Any, fallback: str) -> str:
         metadata.get("project_name") if isinstance(metadata, dict) else None,
     )
     return next((str(value).strip() for value in values if value and str(value).strip()), fallback)
+
+
+def _evaluation_batch_manifest(path: Path) -> dict[str, Any]:
+    payload = _load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError("evaluation batch manifest must be an object")
+    allowed = {"schema_version", "batch_id", "policy", "tolerance", "projects"}
+    unexpected = sorted(set(payload) - allowed)
+    if unexpected:
+        raise ValueError("unexpected evaluation batch fields: " + ", ".join(unexpected))
+    if payload.get("schema_version", "1.0") != "1.0":
+        raise ValueError("evaluation batch schema_version must be 1.0")
+    batch_id = str(payload.get("batch_id") or path.stem).strip()
+    if not batch_id:
+        raise ValueError("evaluation batch_id cannot be empty")
+    global_policy = payload.get("policy")
+    if global_policy is not None and not isinstance(global_policy, str):
+        raise ValueError("evaluation batch policy must be a path string")
+    global_tolerance = payload.get("tolerance", 1e-3)
+    if (
+        isinstance(global_tolerance, bool)
+        or not isinstance(global_tolerance, (int, float))
+        or global_tolerance < 0
+    ):
+        raise ValueError("evaluation batch tolerance must be a non-negative number")
+    raw_projects = payload.get("projects")
+    if not isinstance(raw_projects, list) or not raw_projects:
+        raise ValueError("evaluation batch projects must be a non-empty array")
+    project_ids: set[str] = set()
+    projects: list[dict[str, Any]] = []
+    project_allowed = {"project_id", "predicted", "gold", "policy", "tolerance"}
+    for index, value in enumerate(raw_projects, start=1):
+        if not isinstance(value, dict):
+            raise ValueError(f"evaluation batch project {index} must be an object")
+        unexpected = sorted(set(value) - project_allowed)
+        if unexpected:
+            raise ValueError(
+                f"unexpected fields in evaluation batch project {index}: " + ", ".join(unexpected)
+            )
+        project_id = str(value.get("project_id") or "").strip()
+        if not project_id:
+            raise ValueError(f"evaluation batch project {index} has no project_id")
+        if project_id in project_ids:
+            raise ValueError(f"duplicate evaluation project_id: {project_id}")
+        project_ids.add(project_id)
+        predicted = value.get("predicted")
+        gold = value.get("gold")
+        if not isinstance(predicted, str) or not predicted.strip():
+            raise ValueError(f"evaluation batch project {project_id} has no predicted path")
+        if not isinstance(gold, str) or not gold.strip():
+            raise ValueError(f"evaluation batch project {project_id} has no gold path")
+        policy = value.get("policy", global_policy)
+        if policy is not None and (not isinstance(policy, str) or not policy.strip()):
+            raise ValueError(f"evaluation batch project {project_id} policy must be a path string")
+        tolerance = value.get("tolerance", global_tolerance)
+        if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0:
+            raise ValueError(
+                f"evaluation batch project {project_id} tolerance must be non-negative"
+            )
+        projects.append(
+            {
+                "project_id": project_id,
+                "predicted": predicted.strip(),
+                "gold": gold.strip(),
+                "policy": policy.strip() if isinstance(policy, str) else None,
+                "tolerance": float(tolerance),
+            }
+        )
+    return {
+        "schema_version": "1.0",
+        "batch_id": batch_id,
+        "projects": projects,
+    }
+
+
+def _manifest_file(base: Path, value: str, label: str) -> Path:
+    candidate = Path(value)
+    resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} is not a file: {resolved}")
+    return resolved
+
+
+def _batch_project_report_name(index: int, project_id: str) -> str:
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:12]
+    return f"{index:03d}-{digest}.json"
+
+
+def _assert_batch_outputs_preserve_inputs(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    manifest_base = manifest_path.parent
+    inputs = {manifest_path.resolve()}
+    for project in manifest["projects"]:
+        for field in ("predicted", "gold", "policy"):
+            value = project.get(field)
+            if not value:
+                continue
+            candidate = Path(value)
+            inputs.add(
+                (candidate if candidate.is_absolute() else manifest_base / candidate).resolve()
+            )
+    outputs = {
+        (output_dir / "summary.json").resolve(),
+        (output_dir / "summary.md").resolve(),
+        *(
+            (
+                output_dir / "projects" / _batch_project_report_name(index, project["project_id"])
+            ).resolve()
+            for index, project in enumerate(manifest["projects"], start=1)
+        ),
+    }
+    collisions = sorted(inputs & outputs, key=str)
+    if collisions:
+        raise ValueError(
+            "evaluation batch outputs would overwrite input files: "
+            + ", ".join(str(path) for path in collisions)
+        )
+
+
+def _batch_project_summary(
+    report: dict[str, Any],
+    *,
+    project_id: str,
+    report_path: str,
+    inputs: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "project_id": project_id,
+        "overall_gate": report.get("overall_gate", "BLOCKED"),
+        "gold_rows": report.get("gold_count", report.get("gold_rows")),
+        "predicted_rows": report.get("predicted_count", report.get("predicted_rows")),
+        "eligible_gold_rows": report.get("eligible_gold_rows"),
+        "correct_rows": report.get("correct_rows"),
+        "matched_rows": report.get("matched_count"),
+        "missing_rows": report.get("missing_count"),
+        "unexpected_rows": report.get("unexpected_count"),
+        "replication_recall": report.get("replication_recall"),
+        "output_precision": report.get("output_precision"),
+        "target_accuracy": report.get("target_accuracy"),
+        "meets_target": report.get("meets_target"),
+        "policy_version": report.get("policy_version"),
+        "policy_hash": report.get("policy_hash"),
+        "policy_pending_fields": report.get("policy_pending_fields", []),
+        "duplicate_predicted_count": report.get("duplicate_predicted_count"),
+        "duplicate_gold_count": report.get("duplicate_gold_count"),
+        "report_path": report_path,
+        "inputs": inputs,
+        "error": report.get("batch_error"),
+    }
 
 
 def _load_index(path: Path | str) -> tuple[list[Sheet], list[CadEntity]]:
@@ -261,6 +432,40 @@ def command_index(args: argparse.Namespace) -> int:
             "entity_count": len(bundle.entities),
             "json": str(output / "cad_index.json"),
             "sqlite": str(output / "cad_index.sqlite"),
+        }
+    )
+    return 0
+
+
+def command_panels(args: argparse.Namespace) -> int:
+    """Rebuild viewport panels from an immutable CAD index without re-conversion."""
+
+    payload = _load_json(args.index)
+    sources = payload.get("sources", []) if isinstance(payload, dict) else []
+    sheets = [
+        Sheet.model_validate(value) for source in sources for value in source.get("sheets", [])
+    ]
+    entities = [
+        CadEntity.model_validate(value)
+        for source in sources
+        for value in source.get("entities", [])
+    ]
+    source_names = {
+        str(source.get("source_file_id")): str(source.get("source_path") or "")
+        for source in sources
+        if source.get("source_file_id")
+    }
+    expansion = expand_viewport_panels(sheets, entities, source_names=source_names)
+    write_json_atomic(Path(args.out), expansion.to_dict())
+    _print(
+        {
+            "panel_count": len(expansion.sheets),
+            "entity_count": len(expansion.entities),
+            "warning_count": len(expansion.warnings),
+            "kind_distribution": dict(
+                sorted(Counter(sheet.kind for sheet in expansion.sheets).items())
+            ),
+            "output": str(Path(args.out).resolve()),
         }
     )
     return 0
@@ -464,6 +669,119 @@ def command_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_render_occurrences(args: argparse.Namespace) -> int:
+    """Render MT evidence from saved index/panel snapshots without exporting XLSX."""
+
+    if args.maximum < 1:
+        raise ValueError("maximum must be at least 1")
+    if args.raw_dxf and args.panel_crops:
+        raise ValueError("raw-dxf and panel-crops are mutually exclusive")
+    index_payload = _load_json(args.index)
+    sheets, entities = _load_index(args.index)
+    sheets, entities = _apply_panels(sheets, entities, args.panels)
+    occurrences = [MtOccurrence.model_validate(value) for value in _load_json(args.occurrences)]
+    sources = index_payload.get("sources", []) if isinstance(index_payload, dict) else []
+    source_dxfs = {
+        str(source["source_file_id"]): Path(str(source["source_path"])).resolve()
+        for source in sources
+        if source.get("source_file_id") and source.get("source_path")
+    }
+    if args.panel_crops:
+        result = render_panel_occurrence_crops(
+            sheets,
+            occurrences,
+            source_dxfs,
+            Path(args.out).resolve(),
+            maximum=args.maximum,
+        )
+        _print(
+            {
+                "backend": "raw-panel-then-crop",
+                "panel_count": result.get("panel_count", 0),
+                "occurrence_count": result.get("rendered_count", 0),
+                "skipped_entity_count": result.get("skipped_entity_count", 0),
+                "issue_count": 0,
+                "output": str(Path(args.out).resolve()),
+            }
+        )
+        return 0
+    if not args.raw_dxf:
+        result = render_indexed_occurrences(
+            sheets,
+            entities,
+            occurrences,
+            Path(args.out).resolve(),
+            maximum=args.maximum,
+        )
+        _print(
+            {
+                "backend": "indexed-matplotlib-agg",
+                "occurrence_count": result.get("rendered_count", 0),
+                "skipped_entity_count": result.get("skipped_entity_count", 0),
+                "issue_count": 0,
+                "output": str(Path(args.out).resolve()),
+            }
+        )
+        return 0
+    issues: list[RunIssue] = []
+    result = _render_occurrences(
+        occurrences,
+        sheets,
+        source_dxfs,
+        Path(args.out).resolve(),
+        issues,
+        maximum=args.maximum,
+    )
+    write_json_atomic(
+        Path(args.out).resolve() / "issues.json",
+        [issue.model_dump(mode="json") for issue in issues],
+    )
+    _print(
+        {
+            "group_count": result.get("group_count", 0),
+            "occurrence_count": result.get("occurrence_count", 0),
+            "skipped_entity_count": result.get("skipped_entity_count", 0),
+            "issue_count": len(issues),
+            "output": str(Path(args.out).resolve()),
+        }
+    )
+    return 0
+
+
+def command_image_match(args: argparse.Namespace) -> int:
+    result = register_screenshot_to_panel(args.screenshot, args.panel)
+    if args.out:
+        write_registration(args.out, result)
+    _print(result)
+    return 0 if result["status"] in {"MATCH", "REVIEW"} else 2
+
+
+def command_candidate_benchmark(args: argparse.Namespace) -> int:
+    panel_payload = _load_json(args.panels)
+    occurrences = [MtOccurrence.model_validate(value) for value in _load_json(args.occurrences)]
+    takeoff_payload = _load_json(args.takeoff)
+    gold_payload = _load_json(args.gold)
+    evidence_payload = _load_json(args.evidence_index) if args.evidence_index else None
+    gold_image_payload = (
+        _load_json(args.gold_image_manifest) if args.gold_image_manifest else None
+    )
+    result = build_candidate_benchmark(
+        panel_payload,
+        occurrences,
+        takeoff_payload,
+        gold_payload,
+        evidence_payload=evidence_payload,
+        evidence_root=args.evidence_index.parent if args.evidence_index else None,
+        gold_image_payload=gold_image_payload,
+        gold_image_root=(
+            args.gold_image_manifest.parent if args.gold_image_manifest else None
+        ),
+    )
+    write_json_atomic(args.out, result)
+    _print({**result["summary"], "output": str(args.out.resolve())})
+    return 0
+
+
 def command_evaluate(args: argparse.Namespace) -> int:
     predicted_payload = _load_json(args.predicted)
     gold_payload = _load_json(args.gold)
@@ -519,9 +837,148 @@ def command_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_evaluate_batch(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest).resolve()
+    manifest = _evaluation_batch_manifest(manifest_path)
+    manifest_base = manifest_path.parent
+    output_dir = Path(args.out).resolve()
+    _assert_batch_outputs_preserve_inputs(manifest_path, manifest, output_dir)
+    projects_dir = output_dir / "projects"
+    project_summaries: list[dict[str, Any]] = []
+    for index, project in enumerate(manifest["projects"], start=1):
+        project_id = project["project_id"]
+        report_name = _batch_project_report_name(index, project_id)
+        report_relative = (Path("projects") / report_name).as_posix()
+        report_path = projects_dir / report_name
+        inputs: dict[str, Any] = {
+            "predicted": project["predicted"],
+            "gold": project["gold"],
+            "policy": project["policy"],
+            "legacy_tolerance": project["tolerance"],
+        }
+        try:
+            predicted_path = _manifest_file(
+                manifest_base,
+                project["predicted"],
+                f"{project_id} predicted",
+            )
+            gold_path = _manifest_file(
+                manifest_base,
+                project["gold"],
+                f"{project_id} gold",
+            )
+            policy_path = (
+                _manifest_file(
+                    manifest_base,
+                    project["policy"],
+                    f"{project_id} policy",
+                )
+                if project["policy"]
+                else None
+            )
+            predicted_payload = _load_json(predicted_path)
+            gold_payload = _load_json(gold_path)
+            predicted_rows, predicted_row_ids = _evaluation_rows(predicted_payload)
+            gold_rows, gold_row_ids = _evaluation_rows(gold_payload)
+            policy = _load_json(policy_path) if policy_path else None
+            report = evaluate_takeoff(
+                [TakeoffItem.model_validate(value) for value in predicted_rows],
+                [TakeoffItem.model_validate(value) for value in gold_rows],
+                tolerance=project["tolerance"],
+                policy=policy,
+                predicted_row_ids=predicted_row_ids,
+                gold_row_ids=gold_row_ids,
+                project_id=project_id,
+            )
+            inputs.update(
+                {
+                    "predicted_sha256": sha256_file(predicted_path),
+                    "gold_sha256": sha256_file(gold_path),
+                    "policy_file_sha256": (sha256_file(policy_path) if policy_path else None),
+                }
+            )
+            report["batch_context"] = {
+                "batch_id": manifest["batch_id"],
+                "manifest_sha256": sha256_file(manifest_path),
+                "inputs": inputs,
+            }
+        except Exception as exc:
+            report = {
+                "evaluation_schema_version": "2.0",
+                "project_id": project_id,
+                "overall_gate": "BLOCKED",
+                "meets_target": None,
+                "policy_pending_fields": [],
+                "batch_error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+                "batch_context": {
+                    "batch_id": manifest["batch_id"],
+                    "manifest_sha256": sha256_file(manifest_path),
+                    "inputs": inputs,
+                },
+            }
+        write_json_atomic(report_path, report)
+        project_summaries.append(
+            _batch_project_summary(
+                report,
+                project_id=project_id,
+                report_path=report_relative,
+                inputs=inputs,
+            )
+        )
+
+    summary = summarize_evaluation_batch(
+        project_summaries,
+        batch_id=manifest["batch_id"],
+        manifest_sha256=sha256_file(manifest_path),
+    )
+    summary["manifest_path"] = str(manifest_path)
+    summary["outputs"] = {
+        "summary_json": "summary.json",
+        "summary_markdown": "summary.md",
+        "projects_directory": "projects",
+    }
+    summary_json_path = output_dir / "summary.json"
+    summary_markdown_path = output_dir / "summary.md"
+    write_json_atomic(summary_json_path, summary)
+    summary_markdown_path.write_text(
+        evaluation_batch_markdown(summary),
+        encoding="utf-8",
+        newline="\n",
+    )
+    _print(
+        {
+            "batch_id": summary["batch_id"],
+            "overall_gate": summary["overall_gate"],
+            "project_count": summary["project_count"],
+            "gate_counts": summary["gate_counts"],
+            "aggregate": summary["aggregate"],
+            "summary_json": str(summary_json_path),
+            "summary_markdown": str(summary_markdown_path),
+        }
+    )
+    return 0
+
+
 def command_gold_import(args: argparse.Namespace) -> int:
     result = import_gold_workbook(args.workbook)
     result.write_json(args.out)
+    image_manifest = None
+    image_asset_count = 0
+    image_issue_count = 0
+    image_export_blocked = False
+    if args.image_assets_dir:
+        image_result = export_gold_image_assets(
+            args.workbook,
+            args.image_assets_dir,
+            gold_result=result,
+        )
+        image_manifest = str(Path(args.image_assets_dir).resolve() / MANIFEST_NAME)
+        image_asset_count = image_result.asset_count
+        image_issue_count = len(image_result.issues)
+        image_export_blocked = any(issue.severity == "BLOCK" for issue in image_result.issues)
     _print(
         {
             "row_count": result.summary.row_count,
@@ -529,9 +986,25 @@ def command_gold_import(args: argparse.Namespace) -> int:
             "block_count": result.summary.block_count,
             "issue_count": result.summary.audit_issue_count,
             "output": str(Path(args.out).resolve()),
+            "image_asset_count": image_asset_count,
+            "image_issue_count": image_issue_count,
+            "image_manifest": image_manifest,
         }
     )
-    return 0 if result.summary.row_count > 0 else 2
+    return 0 if result.summary.row_count > 0 and not image_export_blocked else 2
+
+
+def command_gold_image_export(args: argparse.Namespace) -> int:
+    result = export_gold_image_assets(args.workbook, args.out)
+    _print(
+        {
+            "asset_count": result.asset_count,
+            "unique_file_count": result.unique_file_count,
+            "issue_count": len(result.issues),
+            "manifest": str(Path(args.out).resolve() / MANIFEST_NAME),
+        }
+    )
+    return 2 if any(issue.severity == "BLOCK" for issue in result.issues) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -590,6 +1063,14 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("dxf", type=Path, nargs="+")
     index.add_argument("--out", type=Path, required=True)
     index.set_defaults(handler=command_index)
+
+    panels = subparsers.add_parser(
+        "panels",
+        help="从既有CAD索引重建纸空间视口面板（不重复转换）",
+    )
+    panels.add_argument("index", type=Path)
+    panels.add_argument("--out", type=Path, required=True)
+    panels.set_defaults(handler=command_panels)
 
     materials = subparsers.add_parser("materials", help="解析XLS/XLSX或DOCX材料表")
     materials.add_argument("workbook", type=Path)
@@ -656,6 +1137,49 @@ def build_parser() -> argparse.ArgumentParser:
     source_group.add_argument("--viewports", action="store_true")
     render.set_defaults(handler=command_render)
 
+    render_occurrences = subparsers.add_parser(
+        "render-occurrences",
+        help="从既有索引和MT候选批量渲染局部证据（不导出工作簿）",
+    )
+    render_occurrences.add_argument("index", type=Path)
+    render_occurrences.add_argument("occurrences", type=Path)
+    render_occurrences.add_argument("--panels", type=Path)
+    render_occurrences.add_argument("--out", type=Path, required=True)
+    render_occurrences.add_argument("--maximum", type=int, default=250)
+    render_occurrences.add_argument(
+        "--raw-dxf",
+        action="store_true",
+        help="使用较慢的原始DXF渲染；默认使用含纸空间投影标注的快速索引渲染",
+    )
+    render_occurrences.add_argument(
+        "--panel-crops",
+        action="store_true",
+        help="每个视口只渲染一次，再按MT引线批量裁证据图（推荐）",
+    )
+    render_occurrences.set_defaults(handler=command_render_occurrences)
+
+    image_match = subparsers.add_parser(
+        "image-match",
+        help="将人工清单中的CAD截图配准到自动渲染面板",
+    )
+    image_match.add_argument("screenshot", type=Path)
+    image_match.add_argument("panel", type=Path)
+    image_match.add_argument("--out", type=Path)
+    image_match.set_defaults(handler=command_image_match)
+
+    candidate_benchmark = subparsers.add_parser(
+        "candidate-benchmark",
+        help="对人工候选金标准统计页码/代号/尺寸/数量候选召回，不冒充逐行准确率",
+    )
+    candidate_benchmark.add_argument("panels", type=Path)
+    candidate_benchmark.add_argument("occurrences", type=Path)
+    candidate_benchmark.add_argument("takeoff", type=Path)
+    candidate_benchmark.add_argument("gold", type=Path)
+    candidate_benchmark.add_argument("--evidence-index", type=Path)
+    candidate_benchmark.add_argument("--gold-image-manifest", type=Path)
+    candidate_benchmark.add_argument("--out", type=Path, required=True)
+    candidate_benchmark.set_defaults(handler=command_candidate_benchmark)
+
     evaluate = subparsers.add_parser("evaluate", help="比较预测算量与审核金标准")
     evaluate.add_argument("predicted", type=Path)
     evaluate.add_argument("gold", type=Path)
@@ -677,10 +1201,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.set_defaults(handler=command_evaluate)
 
+    evaluate_batch = subparsers.add_parser(
+        "evaluate-batch",
+        help="按项目清单批量评测并输出逐项目JSON与JSON/Markdown汇总",
+    )
+    evaluate_batch.add_argument("manifest", type=Path, help="批量评测清单JSON")
+    evaluate_batch.add_argument("--out", type=Path, required=True, help="批量评测输出目录")
+    evaluate_batch.set_defaults(handler=command_evaluate_batch)
+
     gold = subparsers.add_parser("gold-import", help="导入并审计人工算量清单金标准")
     gold.add_argument("workbook", type=Path)
     gold.add_argument("--out", type=Path, required=True)
+    gold.add_argument(
+        "--image-assets-dir",
+        type=Path,
+        help="可选：只读导出 XLSX/XLSM 原始图片及确定性 manifest",
+    )
     gold.set_defaults(handler=command_gold_import)
+
+    gold_images = subparsers.add_parser(
+        "gold-image-export",
+        help="只读导出人工 XLSX/XLSM 的嵌入图片和 DISPIMG 原始资产",
+    )
+    gold_images.add_argument("workbook", type=Path)
+    gold_images.add_argument("--out", type=Path, required=True, help="图片资产输出目录")
+    gold_images.set_defaults(handler=command_gold_image_export)
     return parser
 
 

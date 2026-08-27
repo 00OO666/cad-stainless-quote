@@ -1568,7 +1568,7 @@ def _render_occurrences(
             point[1] + radius,
         )
     render_index: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "groups": [],
     }
     for (source_id, layout), regions in sorted(grouped.items()):
@@ -1622,6 +1622,10 @@ def _render_occurrences(
                     },
                     "requested_count": result.get("requested_count", len(regions)),
                     "rendered_count": result.get("rendered_count", 0),
+                    "skipped_entity_count": result.get("skipped_entity_count", 0),
+                    "skipped_entity_type_counts": result.get(
+                        "skipped_entity_type_counts", {}
+                    ),
                 }
             )
     if len(occurrences) > maximum:
@@ -1637,6 +1641,11 @@ def _render_occurrences(
     render_index["occurrence_count"] = sum(
         len(group["occurrence_ids"]) for group in render_index["groups"]
     )
+    skipped_type_counts: Counter[str] = Counter()
+    for group in render_index["groups"]:
+        skipped_type_counts.update(group.get("skipped_entity_type_counts", {}))
+    render_index["skipped_entity_count"] = sum(skipped_type_counts.values())
+    render_index["skipped_entity_type_counts"] = dict(sorted(skipped_type_counts.items()))
     write_json_atomic(output_dir / "index.json", render_index)
     return render_index
 

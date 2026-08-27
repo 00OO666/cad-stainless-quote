@@ -326,6 +326,7 @@ def _viewport_geometry(entity: Any) -> dict[str, Any]:
         "status": _dxf_get(entity, "status"),
         "viewport_id": _dxf_get(entity, "id"),
         "view_height": _finite(_dxf_get(entity, "view_height")),
+        "view_twist_angle": _finite(_dxf_get(entity, "view_twist_angle")),
         "custom_scale": _finite(_dxf_get(entity, "custom_scale")),
     }
     for name in ("view_center_point", "view_target_point", "view_direction_vector"):

@@ -15,6 +15,7 @@ import re
 import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from statistics import median
 from typing import Any
@@ -24,7 +25,7 @@ from .models import CadEntity, EvidenceEdge, MtOccurrence, ReviewStatus, Sheet
 from .mt import entity_center
 
 _REF_RE = re.compile(
-    r"(?<![A-Z0-9])(?:[A-Z]{1,4}-){1,2}\d{1,4}(?![A-Z0-9])",
+    r"(?<![A-Z0-9])(?:[A-Z0-9]{1,4}-){1,2}\d{1,4}(?![A-Z0-9])",
     re.I,
 )
 _COMPACT_REF_RE = re.compile(
@@ -33,8 +34,8 @@ _COMPACT_REF_RE = re.compile(
     re.I,
 )
 _RANGE_RE = re.compile(
-    r"(?P<left>(?:[A-Z]{1,4}-){1,2}\d{1,4})\s*[~～至]\s*"
-    r"(?P<right>(?:(?:[A-Z]{1,4}-){1,2})?\d{1,4})",
+    r"(?P<left>(?:[A-Z0-9]{1,4}-){1,2}\d{1,4})\s*[~～至]\s*"
+    r"(?P<right>(?:(?:[A-Z0-9]{1,4}-){1,2})?\d{1,4})",
     re.I,
 )
 _DETACHED_REF_PREFIX_RE = re.compile(r"^(?:[AB]-[ED]|EL|DS|DT|FD|TD|CD|P|M)-?$", re.I)
@@ -44,6 +45,28 @@ _GENERIC_TITLE_RE = re.compile(
     r"天花|地花|墙身|门表|会所|售楼部|SCALE|比例",
     re.I,
 )
+_STRUCTURED_VIEW_NUMBER_RE = re.compile(
+    r"^(?:0*(?P<number>\d{1,3})(?P<suffix>[A-Z]?)|(?P<letter>[A-D]))$",
+    re.I,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredReferenceCallout:
+    """A plan callout that explicitly pairs a view index with a target sheet.
+
+    Interior drawings commonly store the two halves of an elevation bubble as
+    sibling ATTRIB values, for example ``07`` and ``2F-E-08``.  They are two
+    different identifiers: the first is the local view number and the second
+    is the drawing sheet.  Keeping both prevents later stages from silently
+    treating one as the other.
+    """
+
+    sheet_id: str
+    code: str
+    view_number: str
+    entity_ids: tuple[str, ...]
+    parent_insert_handle: str
 
 
 def _stable_id(prefix: str, payload: Mapping[str, Any]) -> str:
@@ -56,7 +79,7 @@ def normalize_reference_code(value: Any) -> str | None:
 
     text = unicodedata.normalize("NFKC", normalize_text(value)).upper()
     text = re.sub(r"[—–－_:/／\\\s]+", "-", text).strip("-")
-    match = re.fullmatch(r"((?:[A-Z]{1,4}-){1,2})(\d{1,4})", text)
+    match = re.fullmatch(r"((?:[A-Z0-9]{1,4}-){1,2})(\d{1,4})", text)
     if not match:
         compact = _COMPACT_REF_RE.fullmatch(text.replace("-", ""))
         if not compact:
@@ -68,6 +91,10 @@ def normalize_reference_code(value: Any) -> str | None:
         number = compact.group("number")
         return f"{prefix.upper()}-{int(number):0{max(2, len(number))}d}"
     prefix, number = match.groups()
+    # Accept floor prefixes such as 1F-E-03 and B1-DE-02, but never turn a
+    # date-like all-numeric token (2026-03-16) into a drawing reference.
+    if not re.search(r"[A-Z]", prefix, re.I):
+        return None
     return f"{prefix.rstrip('-')}-{int(number):0{max(2, len(number))}d}"
 
 
@@ -109,6 +136,92 @@ def extract_reference_codes(value: Any) -> set[str]:
         if code:
             result.add(code)
     return result
+
+
+def extract_structured_reference_callouts(
+    entities: Iterable[CadEntity],
+) -> list[StructuredReferenceCallout]:
+    """Extract explicit ``view number / target sheet`` ATTRIB pairs.
+
+    Only sibling attributes inside the same INSERT are considered.  A title
+    block that contains a sheet code but no local view number is therefore not
+    misclassified as an elevation-index callout.
+    """
+
+    groups: dict[
+        tuple[str, str, str, str],
+        list[CadEntity],
+    ] = defaultdict(list)
+    for entity in entities:
+        if entity.entity_type.upper() != "ATTRIB" or not entity.text or not entity.sheet_id:
+            continue
+        parent = entity.geometry.get("parent_insert_handle")
+        if not parent:
+            continue
+        groups[
+            (
+                entity.source_file_id,
+                entity.sheet_id,
+                entity.space,
+                str(parent),
+            )
+        ].append(entity)
+
+    output: list[StructuredReferenceCallout] = []
+    for (_, sheet_id, _, parent), members in sorted(groups.items()):
+        references: dict[str, set[str]] = defaultdict(set)
+        view_values: dict[str, set[str]] = defaultdict(set)
+        for entity in members:
+            extracted_codes = extract_reference_codes(entity.text)
+            specificity = max(
+                ((code.count("-"), len(code)) for code in extracted_codes),
+                default=None,
+            )
+            codes = {
+                code
+                for code in extracted_codes
+                if (code.count("-"), len(code)) == specificity
+            }
+            for code in codes:
+                references[code].add(entity.id)
+            if codes:
+                continue
+            compact = unicodedata.normalize("NFKC", normalize_text(entity.text)).upper()
+            compact = re.sub(r"[\s_-]+", "", compact)
+            match = _STRUCTURED_VIEW_NUMBER_RE.fullmatch(compact)
+            if match is None:
+                continue
+            if match.group("letter"):
+                view_number = match.group("letter").upper()
+            else:
+                raw_number = match.group("number")
+                assert raw_number is not None
+                suffix = (match.group("suffix") or "").upper()
+                view_number = f"{int(raw_number):0{max(2, len(raw_number))}d}{suffix}"
+            view_values[view_number].add(entity.id)
+
+        if len(references) != 1 or len(view_values) != 1:
+            continue
+        code, reference_ids = next(iter(references.items()))
+        view_number, view_ids = next(iter(view_values.items()))
+        output.append(
+            StructuredReferenceCallout(
+                sheet_id=sheet_id,
+                code=code,
+                view_number=view_number,
+                entity_ids=tuple(sorted(reference_ids | view_ids)),
+                parent_insert_handle=parent,
+            )
+        )
+    return sorted(
+        output,
+        key=lambda value: (
+            value.sheet_id,
+            value.code,
+            value.view_number,
+            value.parent_insert_handle,
+        ),
+    )
 
 
 def _sheet_aliases(sheet: Sheet) -> set[str]:
@@ -252,6 +365,7 @@ def _rank_relation(
     target_sheets: Sequence[Sheet],
     *,
     source_entity_refs: Mapping[str, Mapping[str, set[str]]],
+    source_reference_context: Mapping[str, Mapping[str, set[str]]],
     mt_by_sheet: Mapping[str, set[str]],
     rooms_by_sheet: Mapping[str, set[str]],
     confirmed: Mapping[tuple[str, str], list[str]],
@@ -283,6 +397,9 @@ def _rank_relation(
                 for code in explicit_codes:
                     handles = ",".join(sorted(source_refs[code]))
                     basis.append(f"explicit_reference:{code}@{handles}")
+                    basis.extend(
+                        sorted(source_reference_context.get(source.id, {}).get(code, ()))
+                    )
 
             common_mt = sorted(source_mt & mt_by_sheet.get(target.id, set()))
             if common_mt:
@@ -385,6 +502,9 @@ def rank_evidence_edges(
     mt_by_sheet, rooms_by_sheet = _occurrence_metadata(occurrence_list)
 
     source_entity_refs: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    source_reference_context: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
     entity_list = list(entities)
     for entity in entity_list:
         if not entity.sheet_id or not entity.text:
@@ -396,6 +516,12 @@ def rank_evidence_edges(
         sheet_id = entity_by_id[entity_ids[0]].sheet_id
         if sheet_id:
             source_entity_refs[sheet_id][code].update(entity_ids)
+    for callout in extract_structured_reference_callouts(entity_list):
+        source_entity_refs[callout.sheet_id][callout.code].update(callout.entity_ids)
+        handles = ",".join(callout.entity_ids)
+        source_reference_context[callout.sheet_id][callout.code].add(
+            f"view_reference:{callout.view_number}->{callout.code}@{handles}"
+        )
 
     confirmed = _confirmed_map(confirmed_links)
     plans = [sheet for sheet in sheet_list if sheet.kind in {"plan", "elevation_index"}]
@@ -411,6 +537,7 @@ def rank_evidence_edges(
         plans,
         elevations,
         source_entity_refs=source_entity_refs,
+        source_reference_context=source_reference_context,
         mt_by_sheet=mt_by_sheet,
         rooms_by_sheet=rooms_by_sheet,
         confirmed=confirmed,
@@ -424,6 +551,7 @@ def rank_evidence_edges(
             elevations,
             details,
             source_entity_refs=source_entity_refs,
+            source_reference_context=source_reference_context,
             mt_by_sheet=mt_by_sheet,
             rooms_by_sheet=rooms_by_sheet,
             confirmed=confirmed,
@@ -465,7 +593,9 @@ def rank_elevation_to_detail_edges(
 
 
 __all__ = [
+    "StructuredReferenceCallout",
     "extract_reference_codes",
+    "extract_structured_reference_callouts",
     "normalize_reference_code",
     "rank_elevation_to_detail_edges",
     "rank_evidence_edges",

@@ -43,9 +43,12 @@ _EXPLICIT_HEIGHT_RE = re.compile(
     re.IGNORECASE,
 )
 _QUANTITY_RE = re.compile(
-    r"(?:[xX×*]\s*(?P<prefix>\d+(?:\.\d+)?)|"
-    r"(?P<suffix>\d+(?:\.\d+)?)\s*(?:件|套|块|处|樘|个)|"
-    r"(?:数量|QTY)\s*[:=：]?\s*(?P<label>\d+(?:\.\d+)?))",
+    # A bare '*' is ordinary dimension multiplication (for example 50*200)
+    # and must never be promoted to physical quantity.  Only an explicit
+    # count marker, count noun, or QTY/数量 label is accepted.
+    r"(?:(?<![\d.])[xX×]\s*(?P<prefix>\d+)(?![\d.])|"
+    r"(?P<suffix>\d+)\s*(?:件|套|块|处|樘|个)|"
+    r"(?:数量|QTY)\s*[:=：]?\s*(?P<label>\d+)(?![\d.]))",
     re.IGNORECASE,
 )
 _HEIGHT_RE = re.compile(r"(?:高度|高\s*[:=：]?|\bH\s*[:=])", re.IGNORECASE)
@@ -558,11 +561,14 @@ def build_component_instances(
     edges: Sequence[EvidenceEdge],
     *,
     include_orphan_elevations: bool = True,
+    include_unanchored_orphans: bool = False,
 ) -> list[ComponentInstance]:
     """Build plan-led and isolated elevation/door component candidates.
 
-    Orphan candidates preserve otherwise-lost MT evidence, but remain REVIEW and
-    never convert occurrence count into a physical quantity.
+    Leader-backed orphan candidates preserve otherwise-lost MT evidence, but
+    remain REVIEW and never convert occurrence count into a physical quantity.
+    A bare elevation material tag is retained in the occurrence audit yet does
+    not become a physical line item unless the caller explicitly opts in.
     """
 
     sheet_by_id = {sheet.id: sheet for sheet in sheets}
@@ -669,6 +675,10 @@ def build_component_instances(
             sheet_by_id,
         )
         for occurrence_group in orphan_groups:
+            if not include_unanchored_orphans and not any(
+                value.leader_target is not None for value in occurrence_group
+            ):
+                continue
             group_ids = {value.id for value in occurrence_group}
             if group_ids & claimed_elevation_ids:
                 continue

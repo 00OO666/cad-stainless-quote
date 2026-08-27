@@ -16,6 +16,7 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 - After reviewing `<run-dir>/review-pack.json`, run `scripts/run.ps1 resume <run-dir> --confirmations <json>` so conversion and indexing are reused. `resume` inherits the original pricing context unless it is explicitly changed.
 - For diagnosis or another partial rerun, use the stage commands shown by `scripts/run.ps1 --help`.
 - For an accuracy check, run `scripts/run.ps1 evaluate <predicted-json> <gold-json> --policy <versioned-policy-json> --out <report-json>`. The bundled policy template deliberately leaves disputed length/quantity tolerances pending, so it cannot produce a 95% PASS until those rules are explicitly approved.
+- For a held-out suite, run `scripts/run.ps1 evaluate-batch <manifest-json> --out <batch-dir>`. Inspect every project gate in addition to the JSON/Markdown aggregate; the batch may PASS only when every project PASSes.
 - A CLI exit code of 2 can mean a safe BLOCK result, not a crash; inspect the printed `status`/`safe_outcome` and `<run-dir>/issues.json`.
 - Read [references/workflow.md](references/workflow.md) before adjudicating REVIEW/BLOCK items.
 - Read [references/confirmations.md](references/confirmations.md) before writing or applying reviewer choices.

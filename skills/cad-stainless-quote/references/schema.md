@@ -65,13 +65,33 @@ categories, and `DISPIMG` references. `GoldCellEvidence` retains cached values t
 with normal/array formula metadata. These records are candidate evidence only and do
 not satisfy CAD plan → elevation → detail PASS requirements by themselves.
 
+## Gold image asset manifest
+
+`gold-image-export` writes manifest schema `1.0` next to a content-addressed `assets/`
+directory. It is a read-only companion to `gold-import`; it does not replace or rewrite the
+source workbook. Each `GoldImageAsset` contains:
+
+- `sheet`, zero-based `sheet_index`, `cell`, one-based `row`/`column`, and optional `end_cell`;
+- evidence `category` and `source_type` (`embedded` or `dispimg`);
+- `formula_id` for `DISPIMG` references;
+- SHA-256 of the original media bytes;
+- normalized `package_path` inside the OOXML ZIP;
+- `export_relative_path` below the requested output directory.
+
+Assets are sorted deterministically. Identical media bytes with the same safe extension share a
+content-addressed export path, while each workbook use remains a separate manifest entry. Unsafe
+or ambiguous ZIP members/relationships are BLOCK issues and are never extracted. A legacy `.xls`
+request produces `LEGACY_XLS_IMAGE_EXPORT_UNSUPPORTED`; absence of exported assets must not be
+interpreted as absence of images in that workbook.
+
 ## Evaluation policy and report
 
 `EvaluationPolicy` schema `1.0` is the canonical versioned acceptance contract. It contains
 per-field enablement, text normalization, unfolded-expression mode, independent numeric relative
 tolerances, explicit gold-zero handling, the optional exact amount rule, and the project target
 accuracy. A `null` numeric tolerance is a pending business decision, not a wildcard or zero
-tolerance.
+tolerance. `source_evidence` is an unconditional evaluation result derived from non-empty
+`TakeoffItem.evidence_ids`; it cannot be disabled by policy.
 
 Evaluation report schema `2.0` writes the validated policy body, `policy_version`, and canonical
 `policy_hash`. Each entry in `projects` contains eligible/correct row counts, replication recall,
@@ -79,3 +99,14 @@ output precision, missing/extra/duplicate diagnostics, field summaries, and row-
 results. `overall_gate` is one of `PASS`, `FAIL`, `INDETERMINATE`, or `BLOCKED`. The aggregate block
 does not supersede the individual project result. Legacy comparison metrics remain top-level for
 backward-compatible diagnostics but do not control the versioned acceptance gate.
+
+Evaluation batch manifest schema `1.0` contains a unique `batch_id`, an optional global policy and
+legacy diagnostic tolerance, and a non-empty `projects` array. Every project requires a unique
+`project_id`, prediction JSON path, and gold JSON path, and may override the policy/tolerance.
+Paths are relative to the manifest unless absolute.
+
+Batch summary schema `1.0` stores compact project summaries, gate counts, summed row counts,
+micro/macro recall and precision, a manifest SHA-256, and links to the full per-project reports.
+Its `overall_gate` is conservative: any `BLOCKED` project blocks the batch; otherwise an
+`INDETERMINATE` project keeps the batch indeterminate, then any `FAIL` fails it. Only all-project
+PASS yields batch PASS. Aggregate percentages are never an acceptance override.

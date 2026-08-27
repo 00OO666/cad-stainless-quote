@@ -26,6 +26,8 @@ and its SHA-256 hash are embedded in every evaluation report.
 - Amount comparison is disabled by default. When explicitly enabled it is exact (0%) and is
   evaluated only when both rows contain an amount.
 - Unit and unit price are outside the current row-correctness gate.
+- Non-empty source evidence is mandatory on both sides and is not a policy opt-out. Missing gold
+  evidence blocks eligibility; missing prediction evidence fails the row.
 
 The safe default fixes engineering quantity at 5% but leaves length and physical-quantity
 tolerances as `null`. Those pending fields force `overall_gate=INDETERMINATE`; callers must approve
@@ -75,6 +77,41 @@ scripts/run.ps1 evaluate predicted.json gold.json `
 
 The legacy absolute engineering-quantity metrics and `--tolerance` option remain diagnostic only;
 they do not control the authoritative 95% gate.
+
+## Multi-project batch evaluation
+
+Use `evaluate-batch` to run the same evaluator across a versioned project list. The manifest uses
+schema `1.0`; paths are resolved relative to the manifest and a project may override the global
+policy or legacy diagnostic tolerance.
+
+```json
+{
+  "schema_version": "1.0",
+  "batch_id": "held-out-batch-v1",
+  "policy": "evaluation-policy.json",
+  "projects": [
+    {
+      "project_id": "held-out-01",
+      "predicted": "predictions/held-out-01.json",
+      "gold": "gold/held-out-01.json"
+    }
+  ]
+}
+```
+
+```powershell
+scripts/run.ps1 evaluate-batch batch.json --out evaluation-batch
+```
+
+The output directory contains `projects/*.json`, `summary.json`, and `summary.md`. Project report
+filenames use an ordinal plus a project-ID hash, so a project ID cannot become a path. The command
+also rejects output paths that would overwrite the manifest, prediction, gold, or policy inputs.
+A missing or invalid project input produces a per-project `BLOCKED` report while the remaining
+projects continue.
+
+Batch micro/macro rates are diagnostic. The batch gate is `PASS` only when every project is
+`PASS`; otherwise `BLOCKED` takes precedence, followed by `INDETERMINATE` and `FAIL`. Thus a large
+easy project can never hide a failed or evidence-incomplete project.
 
 ## Additional pipeline metrics
 

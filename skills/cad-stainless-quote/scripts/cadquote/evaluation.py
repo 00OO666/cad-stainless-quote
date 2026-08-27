@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -365,6 +365,8 @@ def _required_gold_missing(item: TakeoffItem, policy: EvaluationPolicy) -> list[
     for field, rule in _enabled_rules(policy):
         if rule.required_in_gold and not _present(getattr(item, field)):
             missing.append(field)
+    if not item.evidence_ids:
+        missing.append("source_evidence")
     return missing
 
 
@@ -622,6 +624,35 @@ def _compare_amount(
     )
 
 
+def _compare_source_evidence(
+    predicted: TakeoffItem,
+    gold: TakeoffItem,
+) -> dict[str, Any]:
+    if not gold.evidence_ids:
+        return _base_result(
+            "source_evidence",
+            predicted.evidence_ids,
+            gold.evidence_ids,
+            "UNRESOLVED",
+            "gold_source_evidence_missing",
+        )
+    if not predicted.evidence_ids:
+        return _base_result(
+            "source_evidence",
+            predicted.evidence_ids,
+            gold.evidence_ids,
+            "FAIL",
+            "predicted_source_evidence_missing",
+        )
+    return _base_result(
+        "source_evidence",
+        predicted.evidence_ids,
+        gold.evidence_ids,
+        "PASS",
+        "source_evidence_present_on_both_sides",
+    )
+
+
 def _compare_fields(
     predicted: TakeoffItem,
     gold: TakeoffItem,
@@ -642,6 +673,7 @@ def _compare_fields(
         else:  # pragma: no cover - strict model types make this unreachable
             raise TypeError(f"unsupported evaluation rule for {field}")
         results[field] = result
+    results["source_evidence"] = _compare_source_evidence(predicted, gold)
     return results
 
 
@@ -659,6 +691,14 @@ def _missing_prediction_fields(
             status,
             "predicted_row_missing" if status == "FAIL" else "gold_value_missing",
         )
+    evidence_status = "FAIL" if gold.evidence_ids else "UNRESOLVED"
+    results["source_evidence"] = _base_result(
+        "source_evidence",
+        None,
+        gold.evidence_ids,
+        evidence_status,
+        ("predicted_row_missing" if evidence_status == "FAIL" else "gold_source_evidence_missing"),
+    )
     return results
 
 
@@ -778,6 +818,7 @@ def evaluate_takeoff(
         field: {"PASS": 0, "FAIL": 0, "UNRESOLVED": 0}
         for field, _ in _enabled_rules(validated_policy)
     }
+    field_summary["source_evidence"] = {"PASS": 0, "FAIL": 0, "UNRESOLVED": 0}
     row_results: list[dict[str, Any]] = []
     correct_gold_indices: set[int] = set()
     unresolved_reasons: set[str] = set()
@@ -907,3 +948,182 @@ def evaluate_takeoff(
         "row_results": row_results,
         **legacy,
     }
+
+
+def summarize_evaluation_batch(
+    projects: list[dict[str, Any]],
+    *,
+    batch_id: str,
+    manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build conservative macro/micro metrics without masking a project failure.
+
+    ``projects`` contains compact per-project summaries produced from independent
+    :func:`evaluate_takeoff` calls. Aggregate percentages are diagnostic only: the
+    batch gate is PASS exclusively when every project gate is PASS.
+    """
+
+    gate_order = ("BLOCKED", "INDETERMINATE", "FAIL", "PASS")
+    gate_counts = {
+        gate: sum(project.get("overall_gate") == gate for project in projects)
+        for gate in gate_order
+    }
+    unknown_gates = sorted(
+        {
+            str(project.get("overall_gate"))
+            for project in projects
+            if project.get("overall_gate") not in gate_order
+        }
+    )
+    project_ids = [str(project.get("project_id") or "").strip() for project in projects]
+    project_id_counts = Counter(project_ids)
+    invalid_project_ids = sorted(
+        {
+            project_id
+            for project_id in project_ids
+            if not project_id or project_id_counts[project_id] > 1
+        }
+    )
+    if not projects or unknown_gates or invalid_project_ids:
+        overall_gate = "BLOCKED"
+    else:
+        overall_gate = next(
+            (gate for gate in gate_order if gate_counts[gate]),
+            "BLOCKED",
+        )
+
+    def total(field: str) -> int:
+        return sum(int(value) for project in projects if (value := project.get(field)) is not None)
+
+    def defined_mean(field: str) -> float | None:
+        values = [float(value) for project in projects if (value := project.get(field)) is not None]
+        return mean(values) if values else None
+
+    gold_rows = total("gold_rows")
+    predicted_rows = total("predicted_rows")
+    eligible_gold_rows = total("eligible_gold_rows")
+    correct_rows = total("correct_rows")
+    matched_rows = total("matched_rows")
+    missing_rows = total("missing_rows")
+    unexpected_rows = total("unexpected_rows")
+    micro_recall = correct_rows / eligible_gold_rows if eligible_gold_rows else None
+    micro_precision = correct_rows / predicted_rows if predicted_rows else 0.0
+    all_projects_pass = (
+        bool(projects) and not invalid_project_ids and gate_counts["PASS"] == len(projects)
+    )
+    return {
+        "batch_evaluation_schema_version": "1.0",
+        "batch_id": batch_id,
+        "manifest_sha256": manifest_sha256,
+        "overall_gate": overall_gate,
+        "all_projects_pass": all_projects_pass,
+        "unknown_gates": unknown_gates,
+        "invalid_project_ids": invalid_project_ids,
+        "project_count": len(projects),
+        "gate_counts": gate_counts,
+        "aggregate": {
+            "gold_rows": gold_rows,
+            "predicted_rows": predicted_rows,
+            "eligible_gold_rows": eligible_gold_rows,
+            "correct_rows": correct_rows,
+            "matched_rows": matched_rows,
+            "missing_rows": missing_rows,
+            "unexpected_rows": unexpected_rows,
+            "micro_replication_recall": micro_recall,
+            "micro_output_precision": micro_precision,
+            "macro_replication_recall": defined_mean("replication_recall"),
+            "macro_output_precision": defined_mean("output_precision"),
+            "project_pass_rate": (gate_counts["PASS"] / len(projects) if projects else None),
+        },
+        "projects": projects,
+        "gate_rule": (
+            "PASS only when every project PASS; aggregate rates never override "
+            "BLOCKED, INDETERMINATE, or FAIL projects"
+        ),
+    }
+
+
+def evaluation_batch_markdown(summary: dict[str, Any]) -> str:
+    """Render a compact, deterministic Markdown companion to a batch report."""
+
+    def escaped(value: Any) -> str:
+        return (
+            str(value if value is not None else "—")
+            .replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("`", "\\`")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+
+    def percentage(value: Any) -> str:
+        return "—" if value is None else f"{float(value):.2%}"
+
+    aggregate = summary.get("aggregate", {})
+    lines = [
+        "# CAD takeoff batch evaluation",
+        "",
+        f"- Batch: `{escaped(summary.get('batch_id'))}`",
+        f"- Overall gate: **{escaped(summary.get('overall_gate'))}**",
+        f"- Projects: {int(summary.get('project_count', 0))}",
+        (
+            "- Micro recall / precision: "
+            f"{percentage(aggregate.get('micro_replication_recall'))} / "
+            f"{percentage(aggregate.get('micro_output_precision'))}"
+        ),
+        "",
+        "> Aggregate percentages are diagnostic. Every project must PASS individually; "
+        "missing evidence never becomes PASS.",
+        "",
+        "| Project | Gate | Gold | Predicted | Eligible | Correct | Matched | "
+        "Recall | Precision | Missing | Extra | Report |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for project in summary.get("projects", []):
+        report_path = project.get("report_path")
+        report_cell = f"[{escaped(report_path)}]({escaped(report_path)})" if report_path else "—"
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    escaped(project.get("project_id")),
+                    escaped(project.get("overall_gate")),
+                    escaped(project.get("gold_rows")),
+                    escaped(project.get("predicted_rows")),
+                    escaped(project.get("eligible_gold_rows")),
+                    escaped(project.get("correct_rows")),
+                    escaped(project.get("matched_rows")),
+                    percentage(project.get("replication_recall")),
+                    percentage(project.get("output_precision")),
+                    escaped(project.get("missing_rows")),
+                    escaped(project.get("unexpected_rows")),
+                    report_cell,
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Totals",
+            "",
+            f"- Gold / predicted: {int(aggregate.get('gold_rows', 0))} / "
+            f"{int(aggregate.get('predicted_rows', 0))}",
+            f"- Eligible / correct: {int(aggregate.get('eligible_gold_rows', 0))} / "
+            f"{int(aggregate.get('correct_rows', 0))}",
+            f"- Missing / extra: {int(aggregate.get('missing_rows', 0))} / "
+            f"{int(aggregate.get('unexpected_rows', 0))}",
+            "",
+        ]
+    )
+    errors = [project for project in summary.get("projects", []) if project.get("error")]
+    if errors:
+        lines.extend(["## Project errors", ""])
+        for project in errors:
+            error = project["error"]
+            lines.append(
+                f"- `{escaped(project.get('project_id'))}`: "
+                f"{escaped(error.get('type'))}: {escaped(error.get('message'))}"
+            )
+        lines.append("")
+    return "\n".join(lines)

@@ -51,6 +51,10 @@ def test_classifier_uses_semantics_and_stays_conservative() -> None:
     assert elevation_index.kind == "elevation_index"
     assert elevation_index.drawing_number == "EL-01"
 
+    floor_prefixed = classify_sheet("drawing.dwg", ["1F-E-03", "大厅立面图"])
+    assert floor_prefixed.kind == "elevation"
+    assert floor_prefixed.drawing_number == "1F-E-03"
+
     code_only = classify_sheet("A-E-01.dwg")
     assert code_only.kind == "unknown"
     assert code_only.confidence < 0.5
@@ -59,7 +63,9 @@ def test_classifier_uses_semantics_and_stays_conservative() -> None:
     assert mixed.kind == "unknown"
 
     assert classify_sheet("地花大样图-FD-01.dwg").kind == "floor"
-    assert classify_sheet("天花大样图-CD-01.dwg").kind == "ceiling"
+    assert classify_sheet("天花大样图-CD-01.dwg").kind == "detail"
+    assert classify_sheet("天花平面图-CP-01.dwg").kind == "ceiling"
+    assert classify_sheet("REFLECTED CEILING PLAN-RCP-01.dwg").kind == "ceiling"
     assert classify_sheet("售楼部门大样图-M-01.dwg").kind == "door"
 
 
