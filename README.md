@@ -87,6 +87,26 @@ When repeated occurrences share a sheet and MT code, generate a numbered review 
   --out "D:\cadquote-runs\project\analysis\candidate-boards"
 ```
 
+After a reviewer or vision stage explicitly selects occurrence IDs for each
+physical component, render row-specific locator and close-up images. This
+stage refuses to guess by taking the first candidate and blocks one occurrence
+from being assigned to differently named components:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 selected-evidence `
+  "D:\cadquote-runs\project\analysis\candidate-boards\candidate_boards.json" `
+  "D:\cadquote-runs\project\analysis\candidate-boards\panel-cache\index.json" `
+  "D:\cadquote-runs\project\analysis\component-selections.json" `
+  --out "D:\cadquote-runs\project\analysis\selected-evidence"
+```
+
+The images remain `CANDIDATE` evidence until the component bounding box,
+plan/elevation/detail chain, dimension roles, and quantity basis are confirmed.
+When a reviewed CAD-coordinate `object_bbox` is present in the selection, the
+close-up frames that geometry together with the selected MT leader; otherwise
+the manifest records `LEADER_POINT_FALLBACK` so it cannot be mistaken for a
+human-equivalent component crop.
+
 Run the negative-only image gate on row-level evidence JSON before calling a workbook reviewable:
 
 ```powershell

@@ -64,6 +64,7 @@ from cadquote.render import (
     render_regions,
     viewport_model_regions,
 )
+from cadquote.selected_evidence import render_selected_occurrence_evidence
 from cadquote.takeoff import build_takeoff
 from cadquote.vector_probe import probe_repeated_vectors
 
@@ -840,6 +841,40 @@ def command_evidence_quality(args: argparse.Namespace) -> int:
     return 0 if report.status == ReviewStatus.PASS else 2
 
 
+def command_selected_evidence(args: argparse.Namespace) -> int:
+    """Render row-specific images only from explicit occurrence selections."""
+
+    candidate_manifest = _load_json(args.candidate_boards)
+    panel_index = _load_json(args.panel_index)
+    selection_payload = _load_json(args.selections)
+    if isinstance(selection_payload, list):
+        selections = selection_payload
+    elif isinstance(selection_payload, dict):
+        selections = selection_payload.get("rows") or selection_payload.get("selections")
+    else:
+        selections = None
+    if not isinstance(selections, list):
+        raise ValueError("selected-evidence selections must be a list or contain rows/selections")
+    result = render_selected_occurrence_evidence(
+        candidate_manifest,
+        panel_index,
+        selections,
+        args.out,
+    )
+    _print(
+        {
+            "selection_count": result.get("selection_count", 0),
+            "rendered_selection_count": result.get("rendered_selection_count", 0),
+            "candidate_count": result.get("candidate_count", 0),
+            "review_count": result.get("review_count", 0),
+            "missing_count": result.get("missing_count", 0),
+            "block_count": result.get("block_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 0 if result.get("candidate_count") == result.get("selection_count") else 2
+
+
 def command_image_match(args: argparse.Namespace) -> int:
     result = register_screenshot_to_panel(args.screenshot, args.panel)
     if args.out:
@@ -1297,6 +1332,16 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_quality.add_argument("--thresholds", type=Path)
     evidence_quality.add_argument("--base-dir", type=Path)
     evidence_quality.set_defaults(handler=command_evidence_quality)
+
+    selected_evidence = subparsers.add_parser(
+        "selected-evidence",
+        help="按显式occurrence选择生成逐行定位图和近景，绝不默认首候选",
+    )
+    selected_evidence.add_argument("candidate_boards", type=Path)
+    selected_evidence.add_argument("panel_index", type=Path)
+    selected_evidence.add_argument("selections", type=Path)
+    selected_evidence.add_argument("--out", type=Path, required=True)
+    selected_evidence.set_defaults(handler=command_selected_evidence)
 
     image_match = subparsers.add_parser(
         "image-match",

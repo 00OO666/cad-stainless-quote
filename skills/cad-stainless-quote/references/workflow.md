@@ -50,6 +50,22 @@ physical-component name/location, and object bbox. Never default to the first re
 Different component names sharing one occurrence image, or one image used as both elevation and
 node/detail, is an automatic REVIEW/BLOCK condition.
 
+After recording explicit selections, render row-specific candidate evidence:
+
+```powershell
+& .\scripts\run.ps1 selected-evidence `
+  "C:\runs\project\analysis\candidate-boards\candidate_boards.json" `
+  "C:\runs\project\analysis\candidate-boards\panel-cache\index.json" `
+  "C:\review\component-selections.json" `
+  --out "C:\runs\project\analysis\selected-evidence"
+```
+
+The command refuses cross-component occurrence reuse. Its locator/close-up pair proves only which
+occurrence was selected; keep it `CANDIDATE` until the object bbox, dimensions, quantity, and
+plan→elevation→detail chain are all confirmed. Put a reviewed CAD-coordinate `object_bbox` in the
+selection (or a `{group_id: bbox}` mapping for multi-sheet rows) to frame the physical component;
+otherwise the evidence manifest records `LEADER_POINT_FALLBACK`.
+
 Frame the close-up around the selected component geometry, MT leader, and governing dimensions.
 Preserve the content aspect ratio; a fixed square around the leader point is not a valid substitute.
 Use a dark CAD render for workbook evidence. Missing Xrefs/fonts/proxy objects/plot styles or a
