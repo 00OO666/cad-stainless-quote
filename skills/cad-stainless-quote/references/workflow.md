@@ -60,16 +60,101 @@ After recording explicit selections, render row-specific candidate evidence:
   --out "C:\runs\project\analysis\selected-evidence"
 ```
 
-The command refuses cross-component occurrence reuse. Its locator/close-up pair proves only which
-occurrence was selected; keep it `CANDIDATE` until the object bbox, dimensions, quantity, and
-plan→elevation→detail chain are all confirmed. Put a reviewed CAD-coordinate `object_bbox` in the
-selection (or a `{group_id: bbox}` mapping for multi-sheet rows) to frame the physical component;
-otherwise the evidence manifest records `LEADER_POINT_FALLBACK`.
+Before that render, a geometry envelope can be suggested without pretending it is confirmed:
+
+```powershell
+& .\scripts\run.ps1 component-frames `
+  "C:\runs\project\analysis\panels.json" `
+  "C:\runs\project\analysis\candidate-boards\candidate_boards.json" `
+  "C:\review\component-selections.json" `
+  --out "C:\runs\project\analysis\component-frames"
+```
+
+The suggestion writes `object_bbox_state=REVIEW`. A reviewer must change the state to
+`CONFIRMED` only after checking the physical boundary and governing dimensions. The
+`selected-evidence` command refuses cross-component occurrence reuse. Its locator/close-up pair
+proves only which occurrence was selected; the pair is two framings of the same drawing stage,
+not a plan/elevation/detail chain.
+
+Render cross-drawing panels and assemble the distinct stages next:
+
+```powershell
+& .\scripts\run.ps1 panel-catalog `
+  "C:\runs\project\index\cad_index.json" `
+  --panels "C:\runs\project\analysis\panels.json" `
+  --render-profile cad-dark-full `
+  --out "C:\runs\project\analysis\panel-catalog"
+
+& .\scripts\run.ps1 annotate-panel-catalog `
+  "C:\runs\project\analysis\panels.json" `
+  "C:\runs\project\analysis\panel-catalog\panel_catalog.json" `
+  --out "C:\runs\project\analysis\panel-catalog-annotated"
+
+& .\scripts\run.ps1 stage-evidence `
+  "C:\runs\project\analysis\panels.json" `
+  "C:\runs\project\analysis\relation_edges.json" `
+  "C:\runs\project\analysis\selected-evidence\selected_evidence.json" `
+  "C:\runs\project\analysis\panel-catalog-annotated\panel_catalog_annotated.json" `
+  "C:\review\component-selections.json" `
+  --out "C:\runs\project\analysis\stage-evidence"
+```
+
+`stage-evidence` preserves all explicit-reference candidates. Candidate ordering is never a
+selection. A plan source must be an incoming `plan_to_elevation` edge, and a detail must be an
+outgoing `elevation_to_detail` target; ambiguity remains REVIEW. Put a reviewed CAD-coordinate
+`object_bbox` in the explicit stage selection to frame the physical component; otherwise the
+chain cannot become `CONFIRMED`.
+
+For confirmation, every stage selection must name its exact `candidate_id`; plan and detail must
+also name the exact `relation_edge_id`. The two edges must connect through the selected elevation.
+Require a unique non-empty `component_id`, reviewer, reason, timezone-aware `reviewed_at`, verified
+context/close-up image files and SHA-256 values, and an allowed dark-CAD render profile. A detail
+selection additionally requires at least one same-sheet `DIMENSION` entity ID. Reusing one image
+SHA for context and close-up or across stages is BLOCK. A stable key that does not bind exactly is
+BLOCK; sequence fallback is legacy REVIEW-only and can never confirm a chain.
+
+Minimal selection shape (IDs and hashes must come from the generated candidate manifests):
+
+```json
+{
+  "component_id": "component:stable-id",
+  "sequence": 1,
+  "stages": {
+    "plan": {
+      "state": "CONFIRMED",
+      "candidate_id": "stage-candidate:...",
+      "relation_edge_id": "edge:plan-to-elevation",
+      "object_bbox": [0, 0, 100, 100],
+      "context_image": "relative/path/to/plan-context.png",
+      "context_sha256": "<sha256>",
+      "closeup_image": "relative/path/to/plan-closeup.png",
+      "closeup_sha256": "<different-sha256>",
+      "review": {
+        "reviewer": "reviewer-id",
+        "reviewed_at": "2026-01-01T10:00:00+08:00",
+        "reason": "verified against the CAD callout"
+      }
+    }
+  }
+}
+```
+
+The panel-catalog, merged/annotated catalog, and stage-evidence manifests are
+`path_scope=local_run_diagnostics`; they may contain absolute paths. Keep the entire run directory
+private and never commit or publish these manifests without a deliberate redaction/export step.
+These commands are explicit review stages and are not yet invoked automatically by the standard
+`run`/`resume` workflow or merged into its standard quotation workbook.
 
 Frame the close-up around the selected component geometry, MT leader, and governing dimensions.
 Preserve the content aspect ratio; a fixed square around the leader point is not a valid substitute.
 Use a dark CAD render for workbook evidence. Missing Xrefs/fonts/proxy objects/plot styles or a
 blocks-and-hatches fallback must be recorded as degraded evidence.
+
+For final review screenshots prefer `cad-dark-full` on bounded model panels, then overlay the
+paper annotations already projected by panel expansion. Rendering an entire paper layout can be
+pathologically slow. Full rendering still cannot guarantee missing Xrefs/SHX, unsupported proxy
+objects, WIPEOUT behavior, or CTB/STB fidelity; record those limitations. Do not reuse an existing
+PNG solely because its filename matches a panel ID.
 
 Use explicit evidence states:
 

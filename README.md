@@ -25,6 +25,9 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Rejects sheet-wide detail dimensions unless an explicit detail relation and a unique component-local material anchor exist.
 - Generates component-bound locator and close-up images directly from vector CAD for plan, elevation, and detail stages; missing images stay visible as review rows.
 - Generates numbered dark-CAD candidate boards for repeated same-sheet/same-MT occurrences and forbids selecting the first rendered occurrence by default.
+- Suggests component/dimension envelopes for better framing while keeping algorithmic bboxes explicitly `REVIEW`.
+- Renders bounded `cad-dark-full` panel catalogs (including no-MT details), overlays projected paper annotations, and stores plan/elevation/detail as distinct stage candidates.
+- Preserves every evidence candidate instead of silently displaying only the first image bundle.
 - Audits screenshot evidence for missing files, cross-component reuse, one image masquerading as multiple stages, near-blank renders, and unreadably small spreadsheet embedding.
 - Preserves image aspect ratio, source/image hashes, CAD bounding boxes, entity IDs, DXF handles, and rendered pixel dimensions for audit.
 - Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
@@ -100,12 +103,19 @@ from being assigned to differently named components:
   --out "D:\cadquote-runs\project\analysis\selected-evidence"
 ```
 
-The images remain `CANDIDATE` evidence until the component bounding box,
+The locator and close-up are two views of the same drawing stage. They remain review evidence until the component bounding box,
 plan/elevation/detail chain, dimension roles, and quantity basis are confirmed.
-When a reviewed CAD-coordinate `object_bbox` is present in the selection, the
+When a reviewed CAD-coordinate `object_bbox` with `object_bbox_state=CONFIRMED` is present in the selection, the
 close-up frames that geometry together with the selected MT leader; otherwise
-the manifest records `LEADER_POINT_FALLBACK` so it cannot be mistaken for a
-human-equivalent component crop.
+the row remains REVIEW. Use `component-frames`, `panel-catalog`,
+`annotate-panel-catalog`, and `stage-evidence` to build the auditable three-stage
+review pack; none of those commands chooses a relation merely because it ranks first.
+
+These staged-evidence commands are currently explicit review steps. The standard
+`run`/`resume` commands do not yet invoke them or merge their manifest into the
+standard quotation workbook automatically. Their panel and stage manifests use
+`path_scope=local_run_diagnostics` and may contain absolute paths; do not commit or
+publish those manifests. Export only deliberately redacted, source-relative data.
 
 Run the negative-only image gate on row-level evidence JSON before calling a workbook reviewable:
 

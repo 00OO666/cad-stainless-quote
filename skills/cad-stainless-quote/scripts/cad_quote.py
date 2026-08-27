@@ -15,6 +15,7 @@ from typing import Any
 from cadquote.cad_index import build_cad_index
 from cadquote.candidate_benchmark import build_candidate_benchmark
 from cadquote.candidate_boards import render_occurrence_candidate_boards
+from cadquote.component_frames import suggest_component_frames
 from cadquote.converter import convert_dwgs
 from cadquote.doctor import run_doctor
 from cadquote.evaluation import (
@@ -50,6 +51,12 @@ from cadquote.models import (
     TakeoffItem,
 )
 from cadquote.mt import detect_material_mentions, detect_mt_occurrences
+from cadquote.panel_catalog import (
+    merge_panel_catalogs,
+    overlay_panel_catalog_annotations,
+    panel_catalog_is_incomplete,
+    render_panel_catalog,
+)
 from cadquote.panels import PanelExpansion, choose_analysis_view, expand_viewport_panels
 from cadquote.pipeline import (
     _render_occurrences,
@@ -65,6 +72,7 @@ from cadquote.render import (
     viewport_model_regions,
 )
 from cadquote.selected_evidence import render_selected_occurrence_evidence
+from cadquote.stage_evidence import build_stage_evidence_manifest
 from cadquote.takeoff import build_takeoff
 from cadquote.vector_probe import probe_repeated_vectors
 
@@ -812,6 +820,112 @@ def command_candidate_boards(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_panel_catalog(args: argparse.Namespace) -> int:
+    """Render every viewport panel once, including panels without an MT label."""
+
+    index_payload = _load_json(args.index)
+    sheets, _ = _load_index(args.index)
+    sheets, _ = _apply_panels(sheets, [], args.panels)
+    sources = index_payload.get("sources", []) if isinstance(index_payload, dict) else []
+    source_dxfs = {
+        str(source["source_file_id"]): Path(str(source["source_path"])).resolve()
+        for source in sources
+        if source.get("source_file_id") and source.get("source_path")
+    }
+    result = render_panel_catalog(
+        sheets,
+        source_dxfs,
+        args.out,
+        maximum=args.maximum,
+        target_px=args.target_px,
+        render_profile=args.render_profile,
+        sheet_ids=args.sheet_id,
+    )
+    _print(
+        {
+            "eligible_count": result.get("eligible_count", 0),
+            "rendered_count": result.get("rendered_count", 0),
+            "failure_count": result.get("failure_count", 0),
+            "missing_requested_count": len(result.get("missing_requested_sheet_ids", [])),
+            "unrendered_eligible_count": len(result.get("unrendered_eligible_sheet_ids", [])),
+            "truncated_eligible_count": len(result.get("truncated_eligible_sheet_ids", [])),
+            "render_profile": result.get("render_profile"),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 2 if panel_catalog_is_incomplete(result) else 0
+
+
+def command_component_frames(args: argparse.Namespace) -> int:
+    """Suggest review-only object and dimension envelopes for screenshot framing."""
+
+    panel_payload = _load_json(args.panels)
+    candidate_manifest = _load_json(args.candidate_boards)
+    selection_payload = _load_json(args.selections)
+    if isinstance(selection_payload, list):
+        selections = selection_payload
+    elif isinstance(selection_payload, dict):
+        selections = selection_payload.get("rows") or selection_payload.get("selections")
+    else:
+        selections = None
+    if not isinstance(selections, list):
+        raise ValueError("component-frames selections must be a list or contain rows/selections")
+    result = suggest_component_frames(
+        panel_payload,
+        candidate_manifest,
+        selections,
+        args.out,
+    )
+    _print(
+        {
+            "selection_count": result.get("selection_count", 0),
+            "suggested_count": result.get("suggested_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 0 if result.get("suggested_count") == result.get("selection_count") else 2
+
+
+def command_annotate_panel_catalog(args: argparse.Namespace) -> int:
+    """Overlay projected paper annotations on an existing full model catalog."""
+
+    result = overlay_panel_catalog_annotations(
+        _load_json(args.panels),
+        _load_json(args.panel_catalog),
+        args.out,
+    )
+    _print(
+        {
+            "panel_count": result.get("panel_count", 0),
+            "annotation_count": result.get("annotation_count", 0),
+            "missing_image_count": len(result.get("missing_image_sheet_ids", [])),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 0 if not result.get("missing_image_sheet_ids") else 2
+
+
+def command_merge_panel_catalogs(args: argparse.Namespace) -> int:
+    """Merge parallel catalog shards after validating their render contracts."""
+
+    result = merge_panel_catalogs(
+        [_load_json(path) for path in args.catalogs],
+        args.out,
+    )
+    _print(
+        {
+            "shard_count": result.get("shard_count", 0),
+            "rendered_count": result.get("rendered_count", 0),
+            "failure_count": result.get("failure_count", 0),
+            "missing_requested_count": len(result.get("missing_requested_sheet_ids", [])),
+            "unrendered_eligible_count": len(result.get("unrendered_eligible_sheet_ids", [])),
+            "truncated_eligible_count": len(result.get("truncated_eligible_sheet_ids", [])),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 2 if panel_catalog_is_incomplete(result) else 0
+
+
 def command_evidence_quality(args: argparse.Namespace) -> int:
     """Reject missing, reused, blank, or unreadably embedded evidence images."""
 
@@ -875,6 +989,44 @@ def command_selected_evidence(args: argparse.Namespace) -> int:
     return 0 if result.get("candidate_count") == result.get("selection_count") else 2
 
 
+def command_stage_evidence(args: argparse.Namespace) -> int:
+    """Assemble distinct plan/elevation/detail stages without taking the first edge."""
+
+    panel_payload = _load_json(args.panels)
+    relation_edges = _load_json(args.edges)
+    selected_evidence = _load_json(args.selected_evidence)
+    panel_catalog = _load_json(args.panel_catalog)
+    selection_payload = _load_json(args.selections)
+    if isinstance(selection_payload, list):
+        selections = selection_payload
+    elif isinstance(selection_payload, dict):
+        selections = selection_payload.get("rows") or selection_payload.get("selections")
+    else:
+        selections = None
+    if not isinstance(relation_edges, list):
+        raise ValueError("stage-evidence edges must be a list")
+    if not isinstance(selections, list):
+        raise ValueError("stage-evidence selections must be a list or contain rows/selections")
+    result = build_stage_evidence_manifest(
+        panel_payload,
+        relation_edges,
+        selected_evidence,
+        panel_catalog,
+        selections,
+        args.out,
+        selected_evidence_root=args.selected_evidence.parent,
+    )
+    _print(
+        {
+            "selection_count": result.get("selection_count", 0),
+            "confirmed_chain_count": result.get("confirmed_chain_count", 0),
+            "review_chain_count": result.get("review_chain_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 0 if result.get("confirmed_chain_count") == result.get("selection_count") else 2
+
+
 def command_image_match(args: argparse.Namespace) -> int:
     result = register_screenshot_to_panel(args.screenshot, args.panel)
     if args.out:
@@ -895,9 +1047,7 @@ def command_candidate_benchmark(args: argparse.Namespace) -> int:
     )
     vector_probe_payload = _load_json(args.vector_probes) if args.vector_probes else None
     evidence_payload = _load_json(args.evidence_index) if args.evidence_index else None
-    gold_image_payload = (
-        _load_json(args.gold_image_manifest) if args.gold_image_manifest else None
-    )
+    gold_image_payload = _load_json(args.gold_image_manifest) if args.gold_image_manifest else None
     result = build_candidate_benchmark(
         panel_payload,
         occurrences,
@@ -908,9 +1058,7 @@ def command_candidate_benchmark(args: argparse.Namespace) -> int:
         evidence_payload=evidence_payload,
         evidence_root=args.evidence_index.parent if args.evidence_index else None,
         gold_image_payload=gold_image_payload,
-        gold_image_root=(
-            args.gold_image_manifest.parent if args.gold_image_manifest else None
-        ),
+        gold_image_root=(args.gold_image_manifest.parent if args.gold_image_manifest else None),
     )
     write_json_atomic(args.out, result)
     _print({**result["summary"], "output": str(args.out.resolve())})
@@ -1323,6 +1471,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candidate_boards.set_defaults(handler=command_candidate_boards)
 
+    panel_catalog = subparsers.add_parser(
+        "panel-catalog",
+        help="完整渲染全部视口面板，供跨图证据链审核（含无MT节点）",
+    )
+    panel_catalog.add_argument("index", type=Path)
+    panel_catalog.add_argument("--panels", type=Path, required=True)
+    panel_catalog.add_argument("--out", type=Path, required=True)
+    panel_catalog.add_argument("--maximum", type=int, default=500)
+    panel_catalog.add_argument("--target-px", type=int, default=2_600)
+    panel_catalog.add_argument(
+        "--sheet-id",
+        action="append",
+        help="只渲染指定panel sheet ID（可重复；省略则渲染全部）",
+    )
+    panel_catalog.add_argument(
+        "--render-profile",
+        choices=("white-fast", "cad-dark", "cad-dark-full"),
+        default="cad-dark-full",
+    )
+    panel_catalog.set_defaults(handler=command_panel_catalog)
+
+    component_frames = subparsers.add_parser(
+        "component-frames",
+        help="按已选MT引线建议物理构件/尺寸包络，仅供审核截图，不自动确认",
+    )
+    component_frames.add_argument("panels", type=Path)
+    component_frames.add_argument("candidate_boards", type=Path)
+    component_frames.add_argument("selections", type=Path)
+    component_frames.add_argument("--out", type=Path, required=True)
+    component_frames.set_defaults(handler=command_component_frames)
+
+    annotate_catalog = subparsers.add_parser(
+        "annotate-panel-catalog",
+        help="在完整模型面板上叠加已投影的纸空间文字/引线，避免整张Layout重绘",
+    )
+    annotate_catalog.add_argument("panels", type=Path)
+    annotate_catalog.add_argument("panel_catalog", type=Path)
+    annotate_catalog.add_argument("--out", type=Path, required=True)
+    annotate_catalog.set_defaults(handler=command_annotate_panel_catalog)
+
+    merge_catalogs = subparsers.add_parser(
+        "merge-panel-catalogs",
+        help="校验并合并并行渲染的panel catalog分片",
+    )
+    merge_catalogs.add_argument("catalogs", type=Path, nargs="+")
+    merge_catalogs.add_argument("--out", type=Path, required=True)
+    merge_catalogs.set_defaults(handler=command_merge_panel_catalogs)
+
     evidence_quality = subparsers.add_parser(
         "evidence-quality",
         help="检查截图缺失、串项复用、同图冒充多阶段、空白率和显示缩放",
@@ -1342,6 +1538,18 @@ def build_parser() -> argparse.ArgumentParser:
     selected_evidence.add_argument("selections", type=Path)
     selected_evidence.add_argument("--out", type=Path, required=True)
     selected_evidence.set_defaults(handler=command_selected_evidence)
+
+    stage_evidence = subparsers.add_parser(
+        "stage-evidence",
+        help="生成分离的平面→立面→节点候选/确认清单，禁止按排序默认首项",
+    )
+    stage_evidence.add_argument("panels", type=Path)
+    stage_evidence.add_argument("edges", type=Path)
+    stage_evidence.add_argument("selected_evidence", type=Path)
+    stage_evidence.add_argument("panel_catalog", type=Path)
+    stage_evidence.add_argument("selections", type=Path)
+    stage_evidence.add_argument("--out", type=Path, required=True)
+    stage_evidence.set_defaults(handler=command_stage_evidence)
 
     image_match = subparsers.add_parser(
         "image-match",

@@ -1,7 +1,8 @@
 """Render row-specific evidence after explicit MT occurrence selection.
 
 This stage consumes a reviewer/vision selection; it never chooses the first
-candidate itself.  The resulting locator and close-up are still candidate
+candidate itself.  The resulting locator and close-up are two framing variants
+of one drawing stage, not a plan/elevation/detail chain.  They remain review
 evidence until component geometry, dimensions, cross-drawing links, and
 quantity roles are confirmed.
 """
@@ -85,6 +86,19 @@ def _group_value(selection: Mapping[str, Any], field: str, group_id: str) -> Any
     if isinstance(value, Mapping):
         return value.get(group_id)
     return value
+
+
+def _bbox_values(value: Any) -> list[Any]:
+    """Normalize one bbox or a list of bboxes without splitting coordinates."""
+
+    if (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and len(value) == 4
+        and all(not isinstance(part, Sequence) or isinstance(part, (str, bytes)) for part in value)
+    ):
+        return [value]
+    return _list(value)
 
 
 def _bbox_pixel_points(
@@ -343,10 +357,7 @@ def render_selected_occurrence_evidence(
                 if occurrence_id in candidate_labels
             )
             declared_selected_labels = sorted(_declared_labels(selection, group_id))
-            if (
-                declared_selected_labels
-                and declared_selected_labels != actual_selected_labels
-            ):
+            if declared_selected_labels and declared_selected_labels != actual_selected_labels:
                 row_record["state"] = "BLOCK"
                 row_record["reason_codes"].append("SELECTED_LABELS_MISMATCH")
                 row_record["evidence"] = []
@@ -364,6 +375,7 @@ def render_selected_occurrence_evidence(
                 continue
             framing_points = list(chosen_points)
             normalized_object_bbox: list[float] | None = None
+            object_bbox_state: str | None = None
             framing_basis = "LEADER_POINT_FALLBACK"
             object_bbox_value = _group_value(selection, "object_bbox", group_id)
             if object_bbox_value is not None:
@@ -379,7 +391,30 @@ def render_selected_occurrence_evidence(
                     continue
                 framing_points.extend(object_points)
                 framing_basis = "OBJECT_BBOX_PLUS_LEADER"
-            crop = _crop_box(framing_points, width, height)
+                object_bbox_state = str(
+                    _group_value(selection, "object_bbox_state", group_id) or "REVIEW"
+                ).upper()
+            dimension_bboxes: list[list[float]] = []
+            dimension_bbox_value = _group_value(selection, "dimension_bboxes", group_id)
+            for value in _bbox_values(dimension_bbox_value):
+                try:
+                    dimension_points, normalized_dimension_bbox = _bbox_pixel_points(
+                        value,
+                        (x0, y0, x1, y1),
+                        width,
+                        height,
+                    )
+                except (TypeError, ValueError):
+                    row_record["reason_codes"].append("DIMENSION_BBOX_INVALID")
+                    continue
+                framing_points.extend(dimension_points)
+                dimension_bboxes.append(normalized_dimension_bbox)
+            crop = _crop_box(
+                framing_points,
+                width,
+                height,
+                minimum_ratio=0.18 if normalized_object_bbox is not None else 0.38,
+            )
             locator = panel.copy()
             locator_draw = ImageDraw.Draw(locator)
             locator_draw.rectangle(crop, outline="#32d583", width=max(5, min(width, height) // 250))
@@ -415,7 +450,7 @@ def render_selected_occurrence_evidence(
             closeup_draw = ImageDraw.Draw(closeup)
             closeup_draw.text(
                 (12, 10),
-                f"{sequence} | {name} | selected occurrence",
+                f"{sequence} | {name} | same-stage selected occurrence",
                 fill="#ffffff",
                 font=header_font,
             )
@@ -449,9 +484,7 @@ def render_selected_occurrence_evidence(
                     )
                 ).encode("utf-8")
             ).hexdigest()[:12]
-            stem = (
-                f"{sequence_stem}-{_safe_label(key)}-{group_index}-{collision_guard}"
-            )
+            stem = f"{sequence_stem}-{_safe_label(key)}-{group_index}-{collision_guard}"
             locator_path = locator_dir / f"{stem}.png"
             closeup_path = closeup_dir / f"{stem}.png"
             locator.save(locator_path, format="PNG", optimize=True)
@@ -464,19 +497,17 @@ def render_selected_occurrence_evidence(
                     "drawing_number": group.get("drawing_number"),
                     "selected_occurrence_ids": sorted(rendered_ids),
                     "selected_labels": [
-                        candidate_labels[occurrence_id]
-                        for occurrence_id in sorted(rendered_ids)
+                        candidate_labels[occurrence_id] for occurrence_id in sorted(rendered_ids)
                     ],
                     "panel_bbox": [x0, y0, x1, y1],
                     "object_bbox": normalized_object_bbox,
+                    "object_bbox_state": object_bbox_state,
+                    "dimension_bboxes": dimension_bboxes,
                     "framing_basis": framing_basis,
+                    "stage": str(_group_value(selection, "stage", group_id) or "unknown"),
                     "crop_box_px": list(crop),
-                    "locator_image": str(locator_path.relative_to(destination)).replace(
-                        "\\", "/"
-                    ),
-                    "closeup_image": str(closeup_path.relative_to(destination)).replace(
-                        "\\", "/"
-                    ),
+                    "locator_image": str(locator_path.relative_to(destination)).replace("\\", "/"),
+                    "closeup_image": str(closeup_path.relative_to(destination)).replace("\\", "/"),
                     "locator_pixel_size": list(locator.size),
                     "closeup_pixel_size": list(closeup.size),
                     "locator_sha256": sha256_file(locator_path),
@@ -491,17 +522,28 @@ def render_selected_occurrence_evidence(
         if row_record["state"] == "BLOCK":
             pass
         elif row_record["evidence"] and not row_record["reason_codes"]:
-            row_record["state"] = "CANDIDATE"
+            if all(
+                value.get("object_bbox") and value.get("object_bbox_state") == "CONFIRMED"
+                for value in row_record["evidence"]
+            ):
+                row_record["state"] = "CANDIDATE"
+            else:
+                row_record["state"] = "REVIEW"
+                if any(value.get("object_bbox") for value in row_record["evidence"]):
+                    row_record["reason_codes"].append("OBJECT_BBOX_NOT_CONFIRMED")
+                else:
+                    row_record["reason_codes"].append("OBJECT_BBOX_MISSING")
         elif not row_record["evidence"]:
             row_record["state"] = "MISSING"
         records.append(row_record)
 
     result = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "purpose": "row_specific_candidate_evidence",
         "warning": (
-            "Occurrence selection is not final component proof. Confirm object bbox, "
-            "plan/elevation/detail links, dimensions, and quantity before PASS."
+            "Locator and close-up are variants of one stage, not separate drawing "
+            "stages. Confirm object bbox, plan/elevation/detail links, dimensions, "
+            "and quantity before PASS."
         ),
         "selection_count": len(selections),
         "rendered_selection_count": sum(bool(record["evidence"]) for record in records),

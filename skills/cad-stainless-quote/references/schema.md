@@ -35,6 +35,35 @@ Customer assets and identifying metadata are private-run data. Customer drawings
 screenshots, names, paths, local absolute paths, hashes tied to a real delivery, and identifiable
 project statistics must never be committed to a public repository.
 
+### Stage evidence manifest
+
+`stage-evidence` schema `1.1` stores exactly three required stage buckets: `plan`, `elevation`,
+and `detail`. Each bucket contains its own `state`, `selected`, `candidates`, and `reason_codes`.
+Each candidate retains `sheet_id/kind`, drawing number, occurrence IDs, relation edge ID/basis,
+reference entity IDs, object bbox, measurement IDs, context/close-up image paths, panel bbox, and
+render profile. Locator and close-up are image roles inside one stage; they are never interpreted
+as separate stages.
+
+Candidate order has no semantic meaning. Every selected stage requires an explicit unique
+`candidate_id`; plan and detail also require the exact `relation_edge_id`. The plan edge must end
+at the selected elevation and the detail edge must start at that same elevation. A complete chain
+can be `CONFIRMED` only when it has a non-empty component ID that is unique in the manifest, a
+reviewed CAD bbox, reviewer/reason/timezone-aware timestamp, decodable context and close-up images
+whose SHA-256 values match, and an allowed dark-CAD render profile. Context and close-up may not
+share one SHA, and no image SHA may be reused across plan/elevation/detail. Detail confirmation
+also requires a `DIMENSION` entity on the selected detail sheet.
+
+A declared stable component/row key is authoritative: a missing or ambiguous key is BLOCK and may
+not fall back to sequence. Sequence fallback exists only for uniquely matched legacy rows whose
+declared identity fields agree, and it can never produce `CONFIRMED`. An algorithmic component
+envelope is stored with `object_bbox_state=REVIEW` and cannot satisfy this gate. Workbook
+integrations must iterate every selected/candidate evidence record or write a separate detail row;
+indexing only `[0]` is forbidden because it silently destroys the audit trail.
+
+Panel catalogs, merged/annotated catalogs, and stage manifests declare
+`path_scope=local_run_diagnostics`. They may contain absolute source/image paths and must not be
+committed or published. A public export requires deliberate redaction and source-relative paths.
+
 ## Material-code compatibility
 
 - `mt_code` remains the normalized business-code field used by the existing pipeline and the

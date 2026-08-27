@@ -125,9 +125,7 @@ def test_occurrence_render_uses_real_paper_layout_and_model_for_virtual_panel(
     groups = {group["layout"]: group for group in result["groups"]}
     assert set(groups) == {"Model", "图纸A"}
     assert groups["图纸A"]["regions"]["occurrence:paper"]["bbox"]
-    assert groups["Model"]["regions"]["occurrence:model"]["occurrence_id"] == (
-        "occurrence:model"
-    )
+    assert groups["Model"]["regions"]["occurrence:model"]["occurrence_id"] == ("occurrence:model")
 
 
 def test_indexed_occurrence_render_includes_projected_annotation(tmp_path: Path):

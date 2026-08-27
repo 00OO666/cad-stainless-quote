@@ -26,9 +26,7 @@ SKIPPED_RENDER_ENTITY_TYPES = frozenset({"HATCH", "MPOLYGON"})
 # block trees is the main source of pathological render latency and can pull in
 # thousands of decorative entities unrelated to the crop. The normalized CAD
 # index still retains every INSERT/ATTRIB handle for audit and MT association.
-SKIPPED_RAW_RENDER_ENTITY_TYPES = frozenset(
-    {*SKIPPED_RENDER_ENTITY_TYPES, "INSERT", "WIPEOUT"}
-)
+SKIPPED_RAW_RENDER_ENTITY_TYPES = frozenset({*SKIPPED_RENDER_ENTITY_TYPES, "INSERT", "WIPEOUT"})
 
 RENDER_PROFILES = frozenset({"white-fast", "cad-dark", "cad-dark-full"})
 
@@ -46,8 +44,7 @@ def _render_profile(name: str) -> dict[str, Any]:
     normalized = str(name).strip().casefold()
     if normalized not in RENDER_PROFILES:
         raise ValueError(
-            f"Unknown render profile {name!r}; expected one of "
-            f"{', '.join(sorted(RENDER_PROFILES))}"
+            f"Unknown render profile {name!r}; expected one of {', '.join(sorted(RENDER_PROFILES))}"
         )
     dark = normalized.startswith("cad-dark")
     return {
@@ -389,11 +386,7 @@ def _indexed_intersects(entity: Any, region: Region) -> bool:
             and entity.bbox[3] >= region[1]
         )
     point = entity.insert
-    return bool(
-        point
-        and region[0] <= point[0] <= region[2]
-        and region[1] <= point[1] <= region[3]
-    )
+    return bool(point and region[0] <= point[0] <= region[2] and region[1] <= point[1] <= region[3])
 
 
 def render_indexed_occurrences(
@@ -644,21 +637,14 @@ def render_panel_occurrence_crops(
     skipped_counts: Counter[str] = Counter()
     for source_id, source_sheets in sorted(grouped_sheets.items()):
         group_dir = panel_root / _safe_label(source_id)
-        pending_regions: dict[str, Any] = {}
-        for sheet_id, sheet in sorted(source_sheets.items()):
-            expected = group_dir / f"{_safe_label(sheet_id)}.png"
-            if expected.is_file():
-                panel_records[sheet_id] = {
-                    "file": expected.name,
-                    "bbox": list(sheet.bbox),
-                    "layout": "Model",
-                    "backend": "matplotlib-agg-cached",
-                    "source_file_id": source_id,
-                    "absolute_path": str(expected),
-                    "render_profile": profile["name"],
-                }
-            else:
-                pending_regions[sheet_id] = sheet.bbox
+        # Never reuse a PNG by filename alone.  Older implementations could
+        # render ``cad-dark`` and then falsely label the same bytes as
+        # ``cad-dark-full`` because profile, source digest, bbox and target_px
+        # were absent from the cache key.  Rebuilding is slower but preserves
+        # evidence integrity until a content-addressed cache is introduced.
+        pending_regions = {
+            sheet_id: sheet.bbox for sheet_id, sheet in sorted(source_sheets.items())
+        }
         if pending_regions:
             result = render_regions(
                 source_dxfs[source_id],
@@ -736,10 +722,7 @@ def render_panel_occurrence_crops(
             fill="#ff3131",
             width=3,
         )
-        label = (
-            f"{occurrence.mt_code}  |  "
-            f"{sheet.drawing_number or sheet.title or sheet.layout}"
-        )
+        label = f"{occurrence.mt_code}  |  {sheet.drawing_number or sheet.title or sheet.layout}"
         draw.text((14, 11), label, fill="#ffffff", font=header_font)
         crop_path = crop_root / f"{_safe_label(occurrence.id)}.png"
         canvas.save(crop_path, format="PNG", optimize=True)
@@ -766,6 +749,7 @@ def render_panel_occurrence_crops(
         "skipped_entity_count": sum(skipped_counts.values()),
         "skipped_entity_type_counts": dict(sorted(skipped_counts.items())),
         "render_profile": profile["name"],
+        "cache_policy": "rebuild_no_unkeyed_reuse",
         "crop_ratio": crop_ratio,
         "panels": panel_records,
         "occurrences": occurrence_records,

@@ -69,9 +69,11 @@ def test_selected_evidence_renders_only_explicit_occurrence(tmp_path: Path):
     )
 
     assert result["rendered_selection_count"] == 1
-    assert result["candidate_count"] == 1
+    assert result["candidate_count"] == 0
+    assert result["review_count"] == 1
     record = result["records"][0]
-    assert record["state"] == "CANDIDATE"
+    assert record["state"] == "REVIEW"
+    assert record["reason_codes"] == ["OBJECT_BBOX_MISSING"]
     evidence = record["evidence"][0]
     assert evidence["selected_occurrence_ids"] == ["occurrence:2"]
     assert evidence["selected_labels"] == ["C2"]
@@ -222,9 +224,10 @@ def test_selected_evidence_paths_are_unique_after_label_normalization(tmp_path: 
     assert len(locator_paths) == len(set(locator_paths)) == 2
     for record in result["records"]:
         evidence = record["evidence"][0]
-        assert sha256_file(tmp_path / "selected" / evidence["locator_image"]) == evidence[
-            "locator_sha256"
-        ]
+        assert (
+            sha256_file(tmp_path / "selected" / evidence["locator_image"])
+            == evidence["locator_sha256"]
+        )
 
 
 def test_selected_evidence_rejects_target_outside_panel_bbox(tmp_path: Path):
@@ -259,9 +262,7 @@ def test_selected_evidence_rejects_target_outside_panel_bbox(tmp_path: Path):
 
     assert result["candidate_count"] == 0
     assert result["missing_count"] == 1
-    assert "SELECTED_OCCURRENCE_OUTSIDE_PANEL_BBOX" in result["records"][0][
-        "reason_codes"
-    ]
+    assert "SELECTED_OCCURRENCE_OUTSIDE_PANEL_BBOX" in result["records"][0]["reason_codes"]
 
 
 def test_selected_evidence_uses_reviewed_object_bbox_for_crop(tmp_path: Path):
@@ -292,13 +293,25 @@ def test_selected_evidence_uses_reviewed_object_bbox_for_crop(tmp_path: Path):
     small = render_selected_occurrence_evidence(
         candidate_manifest,
         panel_index,
-        [{**base_selection, "object_bbox": [100, 100, 300, 300]}],
+        [
+            {
+                **base_selection,
+                "object_bbox": [100, 100, 300, 300],
+                "object_bbox_state": "CONFIRMED",
+            }
+        ],
         tmp_path / "small",
     )
     large = render_selected_occurrence_evidence(
         candidate_manifest,
         panel_index,
-        [{**base_selection, "object_bbox": [100, 50, 900, 450]}],
+        [
+            {
+                **base_selection,
+                "object_bbox": [100, 50, 900, 450],
+                "object_bbox_state": "CONFIRMED",
+            }
+        ],
         tmp_path / "large",
     )
 
@@ -307,6 +320,47 @@ def test_selected_evidence_uses_reviewed_object_bbox_for_crop(tmp_path: Path):
     assert small_evidence["framing_basis"] == "OBJECT_BBOX_PLUS_LEADER"
     assert large_evidence["framing_basis"] == "OBJECT_BBOX_PLUS_LEADER"
     assert small_evidence["crop_box_px"] != large_evidence["crop_box_px"]
+    assert small["records"][0]["state"] == "CANDIDATE"
+
+
+def test_selected_evidence_keeps_dimension_bboxes_and_stage(tmp_path: Path):
+    panel = tmp_path / "panel.png"
+    _panel(panel)
+    result = render_selected_occurrence_evidence(
+        {
+            "groups": [
+                {
+                    "group_id": "group:1",
+                    "sheet_id": "sheet:1",
+                    "panel_bbox": [0, 0, 1_000, 500],
+                    "candidates": [
+                        {
+                            "label": "C1",
+                            "occurrence_id": "occurrence:1",
+                            "leader_target": [200, 250],
+                        }
+                    ],
+                }
+            ]
+        },
+        {"panels": {"sheet:1": {"absolute_path": str(panel)}}},
+        [
+            {
+                "row_id": "row:1",
+                "group_id": "group:1",
+                "selected_occurrence_ids": ["occurrence:1"],
+                "object_bbox": [100, 100, 300, 300],
+                "object_bbox_state": "CONFIRMED",
+                "dimension_bboxes": [[310, 90, 600, 140]],
+                "stage": "elevation",
+            }
+        ],
+        tmp_path / "selected",
+    )
+
+    evidence = result["records"][0]["evidence"][0]
+    assert evidence["stage"] == "elevation"
+    assert evidence["dimension_bboxes"] == [[310.0, 90.0, 600.0, 140.0]]
 
 
 def test_selected_evidence_blocks_declared_label_mismatch(tmp_path: Path):
