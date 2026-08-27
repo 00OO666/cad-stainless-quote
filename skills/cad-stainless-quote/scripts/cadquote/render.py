@@ -30,6 +30,39 @@ SKIPPED_RAW_RENDER_ENTITY_TYPES = frozenset(
     {*SKIPPED_RENDER_ENTITY_TYPES, "INSERT", "WIPEOUT"}
 )
 
+RENDER_PROFILES = frozenset({"white-fast", "cad-dark", "cad-dark-full"})
+
+
+def _render_profile(name: str) -> dict[str, Any]:
+    """Return the visual and entity policy for a bounded evidence render.
+
+    ``white-fast`` preserves the historical diagnostic output.  The dark
+    profiles are intended for evidence embedded in a quote workbook, where a
+    CAD-like canvas and visible layer colours are materially easier to compare
+    with a human AutoCAD screenshot.  ``cad-dark-full`` is deliberately opt-in:
+    expanding blocks and hatches can be expensive on decorative drawings.
+    """
+
+    normalized = str(name).strip().casefold()
+    if normalized not in RENDER_PROFILES:
+        raise ValueError(
+            f"Unknown render profile {name!r}; expected one of "
+            f"{', '.join(sorted(RENDER_PROFILES))}"
+        )
+    dark = normalized.startswith("cad-dark")
+    return {
+        "name": normalized,
+        "background": "#111820" if dark else "#FFFFFF",
+        "label_foreground": "#FFFFFF" if dark else "#111111",
+        "label_background": "#000000" if dark else "#FFFFFF",
+        "label_border": "none" if dark else "#888888",
+        "skipped_types": (
+            frozenset({"WIPEOUT"})
+            if normalized == "cad-dark-full"
+            else SKIPPED_RAW_RENDER_ENTITY_TYPES
+        ),
+    }
+
 
 def _safe_label(value: str) -> str:
     label = re.sub(r"[^0-9A-Za-z._\u4e00-\u9fff-]+", "_", value).strip(" ._")
@@ -96,27 +129,35 @@ def _render_with_matplotlib(
     margin_ratio: float,
     target_px: int,
     mark_center: bool,
+    render_profile: str,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     from ezdxf.addons.drawing import Frontend, RenderContext
-    from ezdxf.addons.drawing.config import BackgroundPolicy, Configuration
+    from ezdxf.addons.drawing.config import BackgroundPolicy, ColorPolicy, Configuration
     from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
+    profile = _render_profile(render_profile)
+    background = profile["background"]
+    skipped_types = profile["skipped_types"]
     space = document.modelspace() if layout_name == "Model" else document.layout(layout_name)
     context = RenderContext(document)
     context.set_current_layout(space)
-    context.current_layout_properties.set_colors("#FFFFFF")
-    configuration = Configuration(background_policy=BackgroundPolicy.WHITE)
+    context.current_layout_properties.set_colors(background)
+    configuration = Configuration(
+        background_policy=BackgroundPolicy.CUSTOM,
+        custom_bg_color=background,
+        color_policy=(ColorPolicy.COLOR_SWAP_BW if background != "#FFFFFF" else ColorPolicy.COLOR),
+    )
     cache = ezbbox.Cache()
     bounded: list[tuple[Any, Region]] = []
     skipped_type_counts: Counter[str] = Counter()
     for entity in space:
         entity_type = entity.dxftype().upper()
-        if entity_type in SKIPPED_RAW_RENDER_ENTITY_TYPES:
+        if entity_type in skipped_types:
             skipped_type_counts[entity_type] += 1
             continue
         try:
@@ -144,7 +185,7 @@ def _render_with_matplotlib(
 
         def draw_entities(self, entities: Any, *, filter_func: Any = None) -> None:
             def evidence_filter(entity: Any) -> bool:
-                if entity.dxftype().upper() in SKIPPED_RAW_RENDER_ENTITY_TYPES:
+                if entity.dxftype().upper() in skipped_types:
                     return False
                 return filter_func(entity) if filter_func is not None else True
 
@@ -174,12 +215,12 @@ def _render_with_matplotlib(
         figure = Figure(
             figsize=(width_px / dpi, height_px / dpi),
             dpi=dpi,
-            facecolor="#FFFFFF",
+            facecolor=background,
         )
         canvas = FigureCanvasAgg(figure)
         axes = figure.add_axes((0, 0, 1, 1))
         backend = MatplotlibBackend(axes, adjust_figure=False)
-        backend.set_background("#FFFFFF")
+        backend.set_background(background)
         EvidenceFrontend(context, backend, config=configuration).draw_entities(entities)
         backend.finalize()
         if mark_center:
@@ -215,9 +256,13 @@ def _render_with_matplotlib(
             transform=axes.transAxes,
             ha="left",
             va="top",
-            color="#111111",
+            color=profile["label_foreground"],
             fontsize=7,
-            bbox={"facecolor": "#ffffff", "alpha": 0.82, "edgecolor": "#888888"},
+            bbox={
+                "facecolor": profile["label_background"],
+                "alpha": 0.82,
+                "edgecolor": profile["label_border"],
+            },
             zorder=11,
         )
         axes.set_xlim(expanded[0], expanded[2])
@@ -240,6 +285,7 @@ def _render_with_matplotlib(
             "layout": layout_name,
             "entity_count": len(entities),
             "backend": "matplotlib-agg",
+            "render_profile": profile["name"],
         }
     return rendered, dict(sorted(skipped_type_counts.items()))
 
@@ -253,6 +299,7 @@ def render_regions(
     margin_ratio: float = 0.04,
     target_px: int = 2_200,
     mark_center: bool = True,
+    render_profile: str = "white-fast",
 ) -> dict[str, Any]:
     """Render named regions and save an index that maps every image back to CAD coordinates."""
 
@@ -260,6 +307,7 @@ def render_regions(
         raise ValueError("margin_ratio must be between 0 and 1")
     if target_px < 256:
         raise ValueError("target_px must be at least 256")
+    profile = _render_profile(render_profile)
     source = Path(dxf_path).resolve()
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -277,6 +325,7 @@ def render_regions(
         margin_ratio,
         target_px,
         mark_center,
+        profile["name"],
     )
     result = {
         "schema_version": "1.1",
@@ -286,7 +335,8 @@ def render_regions(
         "rendered_count": len(rendered),
         "skipped_entity_count": sum(skipped_type_counts.values()),
         "skipped_entity_type_counts": skipped_type_counts,
-        "skipped_entity_types": sorted(SKIPPED_RAW_RENDER_ENTITY_TYPES),
+        "skipped_entity_types": sorted(profile["skipped_types"]),
+        "render_profile": profile["name"],
         "regions": rendered,
     }
     write_json_atomic(destination / "index.json", result)
@@ -549,6 +599,8 @@ def render_panel_occurrence_crops(
     *,
     maximum: int = 250,
     target_px: int = 2_200,
+    crop_ratio: float = 0.38,
+    render_profile: str = "cad-dark",
 ) -> dict[str, Any]:
     """Render each used viewport once, then crop all MT evidence from that image.
 
@@ -559,6 +611,9 @@ def render_panel_occurrence_crops(
 
     if maximum < 1:
         raise ValueError("maximum must be at least 1")
+    if not 0.2 <= crop_ratio <= 1.0:
+        raise ValueError("crop_ratio must be between 0.2 and 1.0")
+    profile = _render_profile(render_profile)
     from PIL import Image, ImageDraw, ImageFont
 
     destination = Path(output_dir).resolve()
@@ -600,6 +655,7 @@ def render_panel_occurrence_crops(
                     "backend": "matplotlib-agg-cached",
                     "source_file_id": source_id,
                     "absolute_path": str(expected),
+                    "render_profile": profile["name"],
                 }
             else:
                 pending_regions[sheet_id] = sheet.bbox
@@ -612,6 +668,7 @@ def render_panel_occurrence_crops(
                 margin_ratio=0.0,
                 target_px=target_px,
                 mark_center=False,
+                render_profile=profile["name"],
             )
             skipped_counts.update(result.get("skipped_entity_type_counts", {}))
             for sheet_id, record in result.get("regions", {}).items():
@@ -642,7 +699,7 @@ def render_panel_occurrence_crops(
             continue
         pixel_x = (point[0] - x0) / (x1 - x0) * width
         pixel_y = (y1 - point[1]) / (y1 - y0) * height
-        crop_side = int(max(420, min(width, height) * 0.62))
+        crop_side = int(max(420, min(width, height) * crop_ratio))
         crop_side = min(crop_side, width, height)
         left = int(round(pixel_x - crop_side / 2))
         top = int(round(pixel_y - crop_side / 2))
@@ -697,6 +754,8 @@ def render_panel_occurrence_crops(
             "panel_pixel": [round(pixel_x, 3), round(pixel_y, 3)],
             "crop_box": [left, top, right, bottom],
             "backend": "raw-panel-then-crop",
+            "render_profile": profile["name"],
+            "crop_ratio": crop_ratio,
         }
     result = {
         "schema_version": "1.0",
@@ -706,6 +765,8 @@ def render_panel_occurrence_crops(
         "rendered_count": len(occurrence_records),
         "skipped_entity_count": sum(skipped_counts.values()),
         "skipped_entity_type_counts": dict(sorted(skipped_counts.items())),
+        "render_profile": profile["name"],
+        "crop_ratio": crop_ratio,
         "panels": panel_records,
         "occurrences": occurrence_records,
     }

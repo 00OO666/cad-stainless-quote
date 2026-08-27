@@ -34,6 +34,27 @@ source-file and evidence-file SHA-256, and original pixel width/height. Preserve
 aspect ratio. Do not enlarge a raster beyond its natural pixels; re-render from vector CAD at a
 recorded scale/DPI when more detail is required.
 
+If more than one occurrence shares the same sheet and MT code, generate a numbered candidate
+board before building the bundle:
+
+```powershell
+& .\scripts\run.ps1 candidate-boards `
+  "C:\runs\project\index\cad_index.json" `
+  "C:\runs\project\analysis\mt_occurrences.json" `
+  --panels "C:\runs\project\analysis\panels.json" `
+  --out "C:\runs\project\analysis\candidate-boards"
+```
+
+The board is a review aid, not evidence of correctness. Record the selected occurrence IDs,
+physical-component name/location, and object bbox. Never default to the first rendered candidate.
+Different component names sharing one occurrence image, or one image used as both elevation and
+node/detail, is an automatic REVIEW/BLOCK condition.
+
+Frame the close-up around the selected component geometry, MT leader, and governing dimensions.
+Preserve the content aspect ratio; a fixed square around the leader point is not a valid substitute.
+Use a dark CAD render for workbook evidence. Missing Xrefs/fonts/proxy objects/plot styles or a
+blocks-and-hatches fallback must be recorded as degraded evidence.
+
 Use explicit evidence states:
 
 - `CANDIDATE`: plausible crop awaiting chain/role confirmation; it must be labelled as such in the workbook.

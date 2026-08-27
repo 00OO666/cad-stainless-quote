@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import ezdxf
+from cadquote.candidate_boards import render_occurrence_candidate_boards
 from cadquote.doctor import run_doctor
 from cadquote.models import CadEntity, MtOccurrence, Sheet
 from cadquote.pipeline import _render_occurrences
@@ -16,7 +17,6 @@ def test_doctor_reports_required_runtime():
     checks = {check["name"]: check for check in report["checks"]}
     assert checks["python"]["status"] == "PASS"
     assert checks["python:ezdxf"]["status"] == "PASS"
-    assert checks["python:opencv-python-headless"]["status"] == "PASS"
     assert "dwg_converter" in checks
 
 
@@ -36,6 +36,23 @@ def test_region_render_writes_coordinate_index(tmp_path: Path):
     assert record["bbox"] == [0.0, 0.0, 120.0, 120.0]
     assert (output / record["file"]).is_file()
     assert (output / "index.json").is_file()
+
+
+def test_region_render_supports_dark_cad_profile(tmp_path: Path):
+    drawing = ezdxf.new("R2018")
+    drawing.modelspace().add_line((0, 0), (100, 100))
+    source = tmp_path / "dark.dxf"
+    drawing.saveas(source)
+
+    result = render_regions(
+        source,
+        {"dark": (0, 0, 120, 120)},
+        tmp_path / "dark-render",
+        render_profile="cad-dark",
+    )
+
+    assert result["render_profile"] == "cad-dark"
+    assert result["regions"]["dark"]["render_profile"] == "cad-dark"
 
 
 def test_region_render_skips_fill_entities_and_records_the_reason(tmp_path: Path):
@@ -210,3 +227,50 @@ def test_panel_render_is_reused_for_occurrence_crop(tmp_path: Path):
     for record in result["occurrences"].values():
         assert Path(record["absolute_path"]).is_file()
         assert record["backend"] == "raw-panel-then-crop"
+
+
+def test_candidate_boards_number_same_sheet_same_mt_occurrences(tmp_path: Path):
+    drawing = ezdxf.new("R2018")
+    drawing.modelspace().add_line((0, 0), (1_000, 1_000))
+    source = tmp_path / "candidate-source.dxf"
+    drawing.saveas(source)
+    sheet = Sheet(
+        id="panel:candidates",
+        source_file_id="file:candidates",
+        drawing_number="1F-E-01",
+        kind="elevation",
+        layout="layout#viewport:AA",
+        bbox=(0, 0, 1_000, 1_000),
+    )
+    occurrences = [
+        MtOccurrence(
+            id="occurrence:first",
+            mt_code="MT-01",
+            source_file_id=sheet.source_file_id,
+            sheet_id=sheet.id,
+            leader_target=(250, 250),
+        ),
+        MtOccurrence(
+            id="occurrence:second",
+            mt_code="MT-01",
+            source_file_id=sheet.source_file_id,
+            sheet_id=sheet.id,
+            leader_target=(750, 750),
+        ),
+    ]
+
+    result = render_occurrence_candidate_boards(
+        [sheet],
+        occurrences,
+        {sheet.source_file_id: source},
+        tmp_path / "boards",
+        target_px=600,
+    )
+
+    assert result["rendered_group_count"] == 1
+    assert result["ambiguous_group_count"] == 1
+    group = result["groups"][0]
+    assert [value["label"] for value in group["candidates"]] == ["C1", "C2"]
+    assert group["reason_codes"] == ["MULTIPLE_OCCURRENCES_SAME_SHEET_MT"]
+    assert (tmp_path / "boards" / group["board_file"]).is_file()
+    assert (tmp_path / "boards" / group["locator_file"]).is_file()

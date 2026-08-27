@@ -95,6 +95,7 @@ class EvidenceRecord(EvidenceTarget):
     detail_sha256: str | None = None
     context_backend: str | None = None
     detail_backend: str | None = None
+    render_profile: str | None = None
     render_reason: str | None = None
 
 
@@ -200,6 +201,13 @@ def _focus_bbox(
 
 
 def _expanded_boxes(focus: BBox, sheet_bbox: BBox | None) -> tuple[BBox, BBox, BBox]:
+    """Build non-square semantic crops and clip them to the source sheet.
+
+    Human evidence follows the object: a skirting line produces a wide crop,
+    while a door jamb produces a tall one.  Preserving that aspect ratio also
+    keeps annotation text larger after the image is embedded in a workbook.
+    """
+
     x0, y0, x1, y1 = focus
     width = max(0.0, x1 - x0)
     height = max(0.0, y1 - y0)
@@ -223,24 +231,33 @@ def _expanded_boxes(focus: BBox, sheet_bbox: BBox | None) -> tuple[BBox, BBox, B
         center_y + focus_half_height,
     )
 
-    detail_half_width = max(focus_half_width * 1.65, base)
-    detail_half_height = max(focus_half_height * 1.65, base)
-    detail = (
-        center_x - detail_half_width,
-        center_y - detail_half_height,
-        center_x + detail_half_width,
-        center_y + detail_half_height,
+    pad_x = max(width * 0.12, base)
+    pad_y = max(height * 0.12, base)
+    detail = (x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
+
+    detail_width = detail[2] - detail[0]
+    detail_height = detail[3] - detail[1]
+    context_pad_x = max(detail_width * 1.5, base * 4.0)
+    context_pad_y = max(detail_height * 1.5, base * 4.0)
+    context = (
+        detail[0] - context_pad_x,
+        detail[1] - context_pad_y,
+        detail[2] + context_pad_x,
+        detail[3] + context_pad_y,
     )
 
-    context_half_width = max(detail_half_width * 2.75, detail_half_width + base)
-    context_half_height = max(detail_half_height * 2.75, detail_half_height + base)
-    context = (
-        center_x - context_half_width,
-        center_y - context_half_height,
-        center_x + context_half_width,
-        center_y + context_half_height,
-    )
-    return normalized_focus, detail, context
+    def clip(box: BBox) -> BBox:
+        if sheet_bbox is None:
+            return box
+        clipped = (
+            max(sheet_bbox[0], box[0]),
+            max(sheet_bbox[1], box[1]),
+            min(sheet_bbox[2], box[2]),
+            min(sheet_bbox[3], box[3]),
+        )
+        return box if clipped[2] <= clipped[0] or clipped[3] <= clipped[1] else clipped
+
+    return clip(normalized_focus), clip(detail), clip(context)
 
 
 def _missing_target(item: TakeoffItem, reason: str) -> EvidenceTarget:
@@ -569,6 +586,7 @@ def _render_one(
     output_dir: Path,
     *,
     target_px: int,
+    render_profile: str,
 ) -> tuple[Path, str]:
     layout = (
         target.layout
@@ -583,6 +601,7 @@ def _render_one(
         margin_ratio=0.0,
         target_px=target_px,
         mark_center=True,
+        render_profile=render_profile,
     )
     record = result.get("regions", {}).get(target.id)
     if not isinstance(record, Mapping) or not record.get("file"):
@@ -600,6 +619,7 @@ def render_excel_evidence(
     *,
     context_target_px: int = 2_800,
     detail_target_px: int = 2_200,
+    render_profile: str = "cad-dark",
 ) -> list[EvidenceRecord]:
     """Render a context/detail pair per target and write ``index.json``.
 
@@ -645,6 +665,7 @@ def render_excel_evidence(
                     source_sha256=source_sha256,
                     context_target_px=context_target_px,
                     detail_target_px=detail_target_px,
+                    render_profile=render_profile,
                     render_reason="；".join(
                         value
                         for value in (
@@ -665,6 +686,7 @@ def render_excel_evidence(
                     source_sha256=source_sha256,
                     context_target_px=context_target_px,
                     detail_target_px=detail_target_px,
+                    render_profile=render_profile,
                     render_reason=source_problem or "来源 DXF 不可用",
                 )
             )
@@ -689,6 +711,7 @@ def render_excel_evidence(
                 target.context_bbox,
                 target_root / "context",
                 target_px=context_target_px,
+                render_profile=render_profile,
             )
             context_image, context_pixel_size, context_sha256 = _image_metadata(
                 path,
@@ -703,6 +726,7 @@ def render_excel_evidence(
                 target.detail_bbox,
                 target_root / "detail",
                 target_px=detail_target_px,
+                render_profile=render_profile,
             )
             detail_image, detail_pixel_size, detail_sha256 = _image_metadata(
                 path,
@@ -739,6 +763,7 @@ def render_excel_evidence(
                 detail_sha256=detail_sha256,
                 context_backend=context_backend,
                 detail_backend=detail_backend,
+                render_profile=render_profile,
                 render_reason="；".join(failures) or None,
             )
         )
@@ -752,6 +777,7 @@ def render_excel_evidence(
             "rendered_count": sum(value.render_state == "RENDERED" for value in records),
             "missing_count": sum(value.render_state == "MISSING" for value in records),
             "failed_count": sum(value.render_state == "FAILED" for value in records),
+            "render_profile": render_profile,
             "records": [value.model_dump(mode="json") for value in records],
         },
     )

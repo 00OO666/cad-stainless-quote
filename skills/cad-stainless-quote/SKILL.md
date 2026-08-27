@@ -12,6 +12,7 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 - Resolve the installed skill root and run commands from that directory; do not assume the user's project is the current directory.
 - On first use on Windows, run `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`, then run `scripts/run.ps1 doctor`. Install any DWG converter and 7-Zip yourself and comply with their licenses; DXF and ZIP input do not require those external tools.
 - For a new drawing package, run `scripts/run.ps1 run <input> --out <run-dir>`.
+- When a sheet contains repeated occurrences of the same MT code, run `scripts/run.ps1 candidate-boards <index-json> <occurrences-json> --panels <panels-json> --out <board-dir>`. Use the numbered dark-CAD boards to assign one or more occurrences to a physical `component_id`; never select the first available occurrence by default.
 - Add `--price-book <xlsx-or-json>` only when the user supplied or approved that price source.
 - After reviewing `<run-dir>/review-pack.json`, run `scripts/run.ps1 resume <run-dir> --confirmations <json>` so conversion and indexing are reused. `resume` inherits the original pricing context unless it is explicitly changed.
 - For diagnosis or another partial rerun, use the stage commands shown by `scripts/run.ps1 --help`.
@@ -42,6 +43,10 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 12. Bind every workbook evidence bundle to `component_id`. Include a locator image and a readable close-up that together trace plan → elevation → detail/dimension, with drawing number, bbox, entity IDs, DXF handles, source/asset SHA-256, and original pixel dimensions.
 13. Preserve aspect ratio and original raster pixels; never upscale a screenshot. A missing required image is `MISSING`/REVIEW, and a candidate image must stay visibly `CANDIDATE` rather than masquerade as confirmed evidence. PASS and amount release require the complete confirmed chain.
 14. Never place customer drawings, workbooks, screenshots, customer paths, local absolute paths, or identifiable project statistics in a public repository.
+15. A screenshot is produced only after physical-component selection. Frame the component geometry plus its MT leader and governing dimensions; use a variable-aspect crop rather than a fixed square around the leader point.
+16. Locator, component close-up, and node/detail are distinct evidence stages. Reusing one image as multiple stages, or reusing one occurrence image for differently named components, is REVIEW/BLOCK.
+17. Use a dark CAD render profile for workbook evidence. If missing Xrefs, fonts, proxy objects, plot styles, blocks, or hatches prevent a faithful render, record the degradation and do not promote the row to PASS.
+18. Human workbooks and screenshots may create development labels (`component_id`, sheet/view, CAD bbox, handles, dimension roles, and quantity basis), but they cannot be visible to a held-out prediction run used to claim accuracy.
 
 ## Outputs
 

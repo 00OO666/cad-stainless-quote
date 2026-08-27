@@ -14,6 +14,7 @@ from typing import Any
 
 from cadquote.cad_index import build_cad_index
 from cadquote.candidate_benchmark import build_candidate_benchmark
+from cadquote.candidate_boards import render_occurrence_candidate_boards
 from cadquote.converter import convert_dwgs
 from cadquote.doctor import run_doctor
 from cadquote.evaluation import (
@@ -21,6 +22,7 @@ from cadquote.evaluation import (
     evaluation_batch_markdown,
     summarize_evaluation_batch,
 )
+from cadquote.evidence_quality import audit_evidence_quality
 from cadquote.exporter import build_quote_workbook
 from cadquote.gold import import_gold_workbook
 from cadquote.gold_images import MANIFEST_NAME, export_gold_image_assets
@@ -41,6 +43,7 @@ from cadquote.models import (
     MaterialSpec,
     MeasurementCandidate,
     MtOccurrence,
+    ReviewStatus,
     RunIssue,
     Severity,
     Sheet,
@@ -776,6 +779,67 @@ def command_render_occurrences(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_candidate_boards(args: argparse.Namespace) -> int:
+    """Render numbered same-sheet/same-MT boards for explicit component review."""
+
+    index_payload = _load_json(args.index)
+    sheets, _ = _load_index(args.index)
+    sheets, _ = _apply_panels(sheets, [], args.panels)
+    occurrences = [MtOccurrence.model_validate(value) for value in _load_json(args.occurrences)]
+    sources = index_payload.get("sources", []) if isinstance(index_payload, dict) else []
+    source_dxfs = {
+        str(source["source_file_id"]): Path(str(source["source_path"])).resolve()
+        for source in sources
+        if source.get("source_file_id") and source.get("source_path")
+    }
+    result = render_occurrence_candidate_boards(
+        sheets,
+        occurrences,
+        source_dxfs,
+        Path(args.out).resolve(),
+        maximum_groups=args.maximum_groups,
+        target_px=args.target_px,
+        render_profile=args.render_profile,
+    )
+    _print(
+        {
+            "rendered_group_count": result.get("rendered_group_count", 0),
+            "ambiguous_group_count": result.get("ambiguous_group_count", 0),
+            "output": str(Path(args.out).resolve()),
+        }
+    )
+    return 0
+
+
+def command_evidence_quality(args: argparse.Namespace) -> int:
+    """Reject missing, reused, blank, or unreadably embedded evidence images."""
+
+    payload = _load_json(args.records)
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = payload.get("records") or payload.get("comparison_rows") or payload.get("rows")
+    else:
+        records = None
+    if not isinstance(records, list):
+        raise ValueError("evidence-quality input must be a row list or contain records/rows")
+    thresholds = _load_json(args.thresholds) if args.thresholds else None
+    report = audit_evidence_quality(
+        records,
+        thresholds=thresholds,
+        base_dir=args.base_dir or args.records.parent,
+    )
+    report.write_json(args.out)
+    _print(
+        {
+            "status": report.status.value,
+            **report.summary.model_dump(mode="json"),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 0 if report.status == ReviewStatus.PASS else 2
+
+
 def command_image_match(args: argparse.Namespace) -> int:
     result = register_screenshot_to_panel(args.screenshot, args.panel)
     if args.out:
@@ -1206,6 +1270,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个视口只渲染一次，再按MT引线批量裁证据图（推荐）",
     )
     render_occurrences.set_defaults(handler=command_render_occurrences)
+
+    candidate_boards = subparsers.add_parser(
+        "candidate-boards",
+        help="将同页同MT候选编号成审核板，禁止默认取第一个候选",
+    )
+    candidate_boards.add_argument("index", type=Path)
+    candidate_boards.add_argument("occurrences", type=Path)
+    candidate_boards.add_argument("--panels", type=Path, required=True)
+    candidate_boards.add_argument("--out", type=Path, required=True)
+    candidate_boards.add_argument("--maximum-groups", type=int, default=200)
+    candidate_boards.add_argument("--target-px", type=int, default=2_600)
+    candidate_boards.add_argument(
+        "--render-profile",
+        choices=("white-fast", "cad-dark", "cad-dark-full"),
+        default="cad-dark",
+    )
+    candidate_boards.set_defaults(handler=command_candidate_boards)
+
+    evidence_quality = subparsers.add_parser(
+        "evidence-quality",
+        help="检查截图缺失、串项复用、同图冒充多阶段、空白率和显示缩放",
+    )
+    evidence_quality.add_argument("records", type=Path)
+    evidence_quality.add_argument("--out", type=Path, required=True)
+    evidence_quality.add_argument("--thresholds", type=Path)
+    evidence_quality.add_argument("--base-dir", type=Path)
+    evidence_quality.set_defaults(handler=command_evidence_quality)
 
     image_match = subparsers.add_parser(
         "image-match",

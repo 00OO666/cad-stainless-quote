@@ -24,6 +24,8 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Revisits raw DXF polylines near leader targets to surface conservative repeated-instance quantity candidates; they remain `REVIEW` and never auto-fill the bill.
 - Rejects sheet-wide detail dimensions unless an explicit detail relation and a unique component-local material anchor exist.
 - Generates component-bound locator and close-up images directly from vector CAD for plan, elevation, and detail stages; missing images stay visible as review rows.
+- Generates numbered dark-CAD candidate boards for repeated same-sheet/same-MT occurrences and forbids selecting the first rendered occurrence by default.
+- Audits screenshot evidence for missing files, cross-component reuse, one image masquerading as multiple stages, near-blank renders, and unreadably small spreadsheet embedding.
 - Preserves image aspect ratio, source/image hashes, CAD bounding boxes, entity IDs, DXF handles, and rendered pixel dimensions for audit.
 - Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
 - Applies audited reviewer confirmations and resumes without re-running immutable upstream stages.
@@ -42,6 +44,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 6. Human benchmark spreadsheets are imported as candidate truth and audited before use.
 7. Repeated linework is only a review candidate; a reviewer must prove that it represents independent billable components.
 8. A `PASS` item must have rendered locator and close-up images for the same sequence and `component_id` at plan, elevation, and detail stages; otherwise its amount is cleared and it returns to `REVIEW`.
+9. Different component names cannot reuse one occurrence image, and one image cannot stand in for multiple evidence stages.
 
 ## Requirements
 
@@ -72,6 +75,24 @@ Review `D:\cadquote-runs\project\review-pack.json`, copy only real candidate IDs
 & .\skills\cad-stainless-quote\scripts\run.ps1 resume `
   "D:\cadquote-runs\project" `
   --confirmations "D:\reviews\confirmations.json"
+```
+
+When repeated occurrences share a sheet and MT code, generate a numbered review board before confirming a physical component:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 candidate-boards `
+  "D:\cadquote-runs\project\index\cad_index.json" `
+  "D:\cadquote-runs\project\analysis\mt_occurrences.json" `
+  --panels "D:\cadquote-runs\project\analysis\panels.json" `
+  --out "D:\cadquote-runs\project\analysis\candidate-boards"
+```
+
+Run the negative-only image gate on row-level evidence JSON before calling a workbook reviewable:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 evidence-quality `
+  "D:\cadquote-runs\project\analysis\evidence-rows.json" `
+  --out "D:\cadquote-runs\project\analysis\evidence-quality.json"
 ```
 
 Add `--price-book` only when the price source is approved. Templates are under `skills/cad-stainless-quote/assets/`.
