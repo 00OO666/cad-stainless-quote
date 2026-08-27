@@ -1,4 +1,6 @@
 import json
+import struct
+import zlib
 from argparse import Namespace
 from pathlib import Path
 
@@ -36,6 +38,24 @@ def item(**updates):
     }
     values.update(updates)
     return TakeoffItem(**values)
+
+
+def _write_test_png(path: Path, width: int = 600, height: int = 300) -> None:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    scanlines = b"".join(b"\x00" + b"\xE8\xEE\xF5" * width for _ in range(height))
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(scanlines))
+        + chunk(b"IEND", b"")
+    )
 
 
 def test_xlsx_price_book_rejects_commercially_incomplete_columns(tmp_path: Path):
@@ -155,6 +175,114 @@ def test_portable_quote_workbook(tmp_path: Path):
     calculated_values = load_workbook(output, data_only=True)
     assert calculated_values["报价表"]["L2"].value == 4
     assert calculated_values["报价表"]["P2"].value == 2000
+
+
+def test_optional_screenshot_evidence_sheet_embeds_images_and_marks_missing(
+    tmp_path: Path,
+):
+    image_path = tmp_path / "evidence.png"
+    _write_test_png(image_path)
+
+    class DumpableEvidence:
+        def model_dump(self, *, mode: str):
+            assert mode == "json"
+            return {
+                "mt_code": "MT-02",
+                "component_id": "component:2",
+                "stage": "节点",
+                "status": "REVIEW",
+                "render_state": "FAILED",
+                "drawing_number": "DT-02",
+                "source_file_id": "file:cad",
+                "focus_bbox": [10, 20, 30, 40],
+                "entity_ids": ["entity:2"],
+                "entity_handles": ["2B"],
+                "context_image": str(image_path),
+                "detail_image": str(tmp_path / "missing.png"),
+                "render_reason": "渲染阶段未产出放大图",
+            }
+
+    report_path = tmp_path / "verification.json"
+    output = build_quote_workbook(
+        [calculate_item(item(unit_price=500, status=ReviewStatus.PASS))],
+        tmp_path / "with-evidence.xlsx",
+        evidence_records=[
+            {
+                "sequence": 7,
+                "mt_code": "MT-01",
+                "component_id": "component:1",
+                "stage": "立面",
+                "status": "REVIEW",
+                "drawing_number": "EL-01",
+                "source_file": "sample.dxf",
+                "cad_bbox": [1, 2, 3, 4],
+                "entity_ids": ["entity:1", "entity:1b"],
+                "dxf_handles": ["1A", "1B"],
+                "location_image": image_path,
+                "zoom_image": image_path,
+            },
+            DumpableEvidence(),
+        ],
+        verification_report=report_path,
+    )
+
+    workbook = load_workbook(output, data_only=False)
+    try:
+        assert workbook.sheetnames == [
+            "报价表",
+            "来源追踪",
+            "待确认",
+            "运行信息",
+            "截图证据",
+        ]
+        sheet = workbook["截图证据"]
+        assert [cell.value for cell in sheet[1]] == [
+            "序号",
+            "MT",
+            "构件ID",
+            "阶段",
+            "状态",
+            "图号",
+            "来源文件",
+            "CAD bbox",
+            "实体ID",
+            "DXF Handle",
+            "定位图",
+            "放大图",
+            "缺图原因",
+        ]
+        assert len(sheet._images) == 3
+        assert all(image.width <= 600 and image.height <= 300 for image in sheet._images)
+        assert all(image.width / image.height == pytest.approx(2.0) for image in sheet._images)
+        assert sheet.row_dimensions[2].height >= 180
+        assert sheet["L3"].value.startswith("缺图：")
+        assert "渲染阶段未产出放大图" in sheet["M3"].value
+        assert sheet["E3"].value == "FAILED"
+        assert sheet["G3"].value == "file:cad"
+        assert sheet["H3"].value == "[10, 20, 30, 40]"
+        assert sheet["J3"].value == "2B"
+        assert sheet["L3"].font.color.rgb.endswith("C00000")
+        assert sheet["M3"].font.color.rgb.endswith("C00000")
+    finally:
+        workbook.close()
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["evidence"] == {
+        "record_count": 2,
+        "image_count": 3,
+        "missing_rows": [3],
+    }
+    assert all(
+        report["checks"][name]
+        for name in (
+            "sheet_order",
+            "evidence_headers",
+            "evidence_image_count",
+            "evidence_missing_rows",
+            "evidence_missing_red",
+            "evidence_image_scale",
+        )
+    )
 
 
 def test_partial_quote_preserves_full_takeoff_evidence(tmp_path: Path):

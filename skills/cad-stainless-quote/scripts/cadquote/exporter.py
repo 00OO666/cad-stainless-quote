@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -14,6 +15,8 @@ from typing import Any
 
 import xlsxwriter
 from openpyxl import load_workbook
+from xlsxwriter.exceptions import XlsxInputError
+from xlsxwriter.image import Image as XlsxWriterImage
 
 from .calculation import calculate_item
 from .io import write_json_atomic
@@ -40,7 +43,26 @@ QUOTE_HEADERS = [
 ]
 
 _SHEET_NAMES = ["报价表", "来源追踪", "待确认", "运行信息"]
+_EVIDENCE_SHEET_NAME = "截图证据"
+_EVIDENCE_HEADERS = [
+    "序号",
+    "MT",
+    "构件ID",
+    "阶段",
+    "状态",
+    "图号",
+    "来源文件",
+    "CAD bbox",
+    "实体ID",
+    "DXF Handle",
+    "定位图",
+    "放大图",
+    "缺图原因",
+]
 _FORMULA_ERROR_VALUES = {"#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A"}
+_EVIDENCE_IMAGE_MAX_WIDTH_PX = 480.0
+_EVIDENCE_IMAGE_MAX_HEIGHT_PX = 340.0
+_EVIDENCE_ROW_MIN_HEIGHT_PX = 240.0
 
 
 def _enum_value(value: Any) -> Any:
@@ -57,6 +79,155 @@ def _safe_text(value: str) -> str:
 
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _first_record_value(record: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in record and record[name] is not None:
+            return record[name]
+    return None
+
+
+def _record_mapping(record: Any) -> dict[str, Any]:
+    if isinstance(record, Mapping):
+        return dict(record)
+    model_dump = getattr(record, "model_dump", None)
+    if not callable(model_dump):
+        raise TypeError("evidence_records entries must be mappings or expose model_dump()")
+    try:
+        payload = model_dump(mode="json")
+    except TypeError:
+        payload = model_dump()
+    if not isinstance(payload, Mapping):
+        raise TypeError("evidence record model_dump() must return a mapping")
+    return dict(payload)
+
+
+def _joined_record_value(value: Any) -> Any:
+    if isinstance(value, (list, tuple, set)):
+        return "；".join(str(_enum_value(item)) for item in value)
+    return value
+
+
+def _image_source(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _first_record_value(value, "absolute_path", "path", "file")
+    return value
+
+
+def _normalize_evidence_record(record: Any, sequence: int) -> dict[str, Any]:
+    payload = _record_mapping(record)
+    images = payload.get("images")
+    image_payload = images if isinstance(images, Mapping) else {}
+    base_dir = _first_record_value(payload, "image_root", "base_dir", "evidence_root")
+
+    location_image = _first_record_value(
+        payload,
+        "location_image",
+        "location_image_path",
+        "context_image",
+        "context_image_path",
+        "locator_image",
+        "overview_image",
+        "overview_image_path",
+        "panel_image",
+        "panel_file",
+        "定位图",
+    )
+    if location_image is None:
+        location_image = _first_record_value(
+            image_payload,
+            "location",
+            "locator",
+            "overview",
+            "panel",
+            "定位图",
+        )
+    zoom_image = _first_record_value(
+        payload,
+        "zoom_image",
+        "zoom_image_path",
+        "detail_image",
+        "detail_image_path",
+        "crop_image",
+        "crop_image_path",
+        "crop_path",
+        "absolute_path",
+        "放大图",
+    )
+    if zoom_image is None:
+        zoom_image = _first_record_value(
+            image_payload,
+            "zoom",
+            "detail",
+            "crop",
+            "放大图",
+        )
+
+    record_sequence = _first_record_value(payload, "sequence", "序号", "index")
+    return {
+        "sequence": sequence if record_sequence is None else record_sequence,
+        "mt": _first_record_value(payload, "mt_code", "mt", "MT", "MT编号"),
+        "component_id": _first_record_value(payload, "component_id", "构件ID"),
+        "stage": _first_record_value(payload, "stage", "阶段"),
+        "status": _first_record_value(
+            payload,
+            "evidence_state",
+            "render_state",
+            "state",
+            "status",
+            "状态",
+        ),
+        "drawing_number": _first_record_value(
+            payload,
+            "drawing_number",
+            "sheet_number",
+            "sheet_code",
+            "图号",
+        ),
+        "source_file": _first_record_value(
+            payload,
+            "source_file",
+            "source_file_id",
+            "source",
+            "source_path",
+            "来源文件",
+        ),
+        "cad_bbox": _first_record_value(
+            payload,
+            "cad_bbox",
+            "focus_bbox",
+            "detail_bbox",
+            "context_bbox",
+            "bbox",
+            "CAD bbox",
+        ),
+        "entity_ids": _joined_record_value(
+            _first_record_value(payload, "entity_ids", "entity_id", "实体ID")
+        ),
+        "dxf_handles": _joined_record_value(
+            _first_record_value(
+                payload,
+                "dxf_handles",
+                "entity_handles",
+                "dxf_handle",
+                "handles",
+                "handle",
+                "DXF Handle",
+            )
+        ),
+        "location_image": _image_source(location_image),
+        "zoom_image": _image_source(zoom_image),
+        "missing_reason": _first_record_value(
+            payload,
+            "missing_reason",
+            "missing_image_reason",
+            "render_reason",
+            "reason",
+            "缺图原因",
+        ),
+        "base_dir": _image_source(base_dir),
+    }
 
 
 def _cell_value(value: Any) -> Any:
@@ -498,6 +669,200 @@ def _write_run_sheet(
     sheet.set_column(1, 1, 78)
 
 
+def _resolve_evidence_image(
+    value: Any,
+    base_dir: Any,
+    label: str,
+) -> tuple[Path | None, XlsxWriterImage | None, str | None]:
+    if value is None or not str(value).strip():
+        return None, None, f"缺图：未提供{label}"
+    try:
+        path = Path(os.fspath(value)).expanduser()
+    except TypeError:
+        return None, None, f"缺图：{label}路径格式无效"
+    if not path.is_absolute() and base_dir is not None and str(base_dir).strip():
+        try:
+            path = Path(os.fspath(base_dir)).expanduser() / path
+        except TypeError:
+            return None, None, f"缺图：{label}的基准目录格式无效"
+    path = path.resolve()
+    if not path.is_file():
+        return path, None, f"缺图：{label}文件不存在（{path}）"
+    try:
+        image = XlsxWriterImage(path)
+    except (OSError, TypeError, ValueError, XlsxInputError) as exc:
+        return path, None, f"缺图：{label}不可读取（{type(exc).__name__}: {exc}）"
+    if image.width <= 0 or image.height <= 0:
+        return path, None, f"缺图：{label}尺寸无效（{path}）"
+    return path, image, None
+
+
+def _insert_evidence_image(
+    sheet: Any,
+    row: int,
+    column: int,
+    value: Any,
+    base_dir: Any,
+    label: str,
+) -> tuple[bool, float, float | None, str | None]:
+    path, image, missing_reason = _resolve_evidence_image(value, base_dir, label)
+    if image is None:
+        return False, 0.0, None, missing_reason
+    scale = min(
+        1.0,
+        _EVIDENCE_IMAGE_MAX_WIDTH_PX / float(image.width),
+        _EVIDENCE_IMAGE_MAX_HEIGHT_PX / float(image.height),
+    )
+    try:
+        result = sheet.insert_image(
+            row,
+            column,
+            image,
+            {
+                "x_offset": 4,
+                "y_offset": 4,
+                "x_scale": scale,
+                "y_scale": scale,
+                "object_position": 1,
+                "description": f"{label}：{path.name if path is not None else 'CAD证据'}",
+            },
+        )
+    except (OSError, TypeError, ValueError, XlsxInputError) as exc:
+        return (
+            False,
+            0.0,
+            None,
+            f"缺图：{label}无法写入工作簿（{type(exc).__name__}: {exc}）",
+        )
+    if result != 0:
+        return False, 0.0, None, f"缺图：{label}无法写入工作簿（错误码 {result}）"
+    return True, float(image.height) * scale, scale, None
+
+
+def _write_evidence_sheet(
+    workbook: Any,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sheet = workbook.add_worksheet(_EVIDENCE_SHEET_NAME)
+    sheet.hide_gridlines(2)
+    sheet.freeze_panes(1, 0)
+    sheet.set_zoom(80)
+    _write_row(sheet, 0, _EVIDENCE_HEADERS, _subheader_format(workbook))
+    sheet.set_row(0, 30)
+
+    body = workbook.add_format(
+        {
+            "valign": "top",
+            "text_wrap": True,
+            "bottom": 1,
+            "bottom_color": "#D9E2F3",
+        }
+    )
+    centered = workbook.add_format(
+        {
+            "align": "center",
+            "valign": "top",
+            "text_wrap": True,
+            "bottom": 1,
+            "bottom_color": "#D9E2F3",
+        }
+    )
+    missing = workbook.add_format(
+        {
+            "bg_color": "#FCE8E6",
+            "font_color": "#C00000",
+            "bold": True,
+            "valign": "top",
+            "text_wrap": True,
+            "bottom": 1,
+            "bottom_color": "#D9E2F3",
+        }
+    )
+
+    image_count = 0
+    missing_rows: list[int] = []
+    missing_cells: list[str] = []
+    image_scales: list[float] = []
+    for index, record in enumerate(records):
+        row = index + 1
+        excel_row = row + 1
+        values = [
+            record["sequence"],
+            record["mt"],
+            record["component_id"],
+            record["stage"],
+            record["status"],
+            record["drawing_number"],
+            record["source_file"],
+            record["cad_bbox"],
+            record["entity_ids"],
+            record["dxf_handles"],
+        ]
+        for column, value in enumerate(values):
+            _write_cell(sheet, row, column, value, centered if column in {0, 1, 4, 5} else body)
+        _write_cell(sheet, row, 10, None, body)
+        _write_cell(sheet, row, 11, None, body)
+
+        row_image_height = 0.0
+        row_missing_reasons: list[str] = []
+        for column, key, label in (
+            (10, "location_image", "定位图"),
+            (11, "zoom_image", "放大图"),
+        ):
+            inserted, rendered_height, scale, reason = _insert_evidence_image(
+                sheet,
+                row,
+                column,
+                record[key],
+                record["base_dir"],
+                label,
+            )
+            if inserted:
+                image_count += 1
+                row_image_height = max(row_image_height, rendered_height)
+                if scale is not None:
+                    image_scales.append(scale)
+            else:
+                message = reason or f"缺图：{label}不可用"
+                _write_cell(sheet, row, column, message, missing)
+                row_missing_reasons.append(message)
+                missing_cells.append(f"{'K' if column == 10 else 'L'}{excel_row}")
+
+        if row_missing_reasons:
+            explicit_reason = record["missing_reason"]
+            reason_parts = []
+            if explicit_reason is not None and str(explicit_reason).strip():
+                reason_parts.append(str(explicit_reason).strip())
+            reason_parts.extend(row_missing_reasons)
+            combined_reason = "；".join(reason_parts)
+            _write_cell(sheet, row, 12, combined_reason, missing)
+            missing_rows.append(excel_row)
+        else:
+            _write_cell(sheet, row, 12, None, body)
+        row_height_px = max(
+            _EVIDENCE_ROW_MIN_HEIGHT_PX,
+            min(_EVIDENCE_IMAGE_MAX_HEIGHT_PX, row_image_height) + 12.0,
+        )
+        sheet.set_row(row, row_height_px * 0.75)
+
+    widths = [7, 12, 28, 14, 12, 16, 34, 28, 34, 24, 68, 68, 48]
+    for column, width in enumerate(widths):
+        sheet.set_column(column, column, width)
+    if records:
+        sheet.autofilter(0, 0, len(records), len(_EVIDENCE_HEADERS) - 1)
+    sheet.set_landscape()
+    sheet.fit_to_pages(1, 0)
+    sheet.repeat_rows(0)
+    sheet.set_margins(0.3, 0.3, 0.5, 0.5)
+    return {
+        "record_count": len(records),
+        "image_count": image_count,
+        "missing_rows": missing_rows,
+        "missing_cells": missing_cells,
+        "image_scales": image_scales,
+    }
+
+
 def _build_xlsx(
     destination: Path,
     items: list[TakeoffItem],
@@ -506,6 +871,7 @@ def _build_xlsx(
     issues: list[RunIssue],
     metadata: dict[str, Any],
     generated_at: str,
+    evidence_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     workbook = xlsxwriter.Workbook(
         str(destination),
@@ -520,9 +886,16 @@ def _build_xlsx(
         _write_trace_sheet(workbook, edges, measurements)
         pending_count = _write_pending_sheet(workbook, items, issues)
         _write_run_sheet(workbook, items, metadata, generated_at)
+        evidence_state = (
+            _write_evidence_sheet(workbook, evidence_records) if evidence_records else None
+        )
     finally:
         workbook.close()
-    return {**quote_state, "pending_count": pending_count}
+    return {
+        **quote_state,
+        "pending_count": pending_count,
+        "evidence": evidence_state,
+    }
 
 
 def _same_cached_value(actual: Any, expected: float | None) -> bool:
@@ -533,8 +906,19 @@ def _same_cached_value(actual: Any, expected: float | None) -> bool:
     return math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-9)
 
 
+def _has_red_font(cell: Any) -> bool:
+    color = cell.font.color
+    return bool(
+        color is not None
+        and color.type == "rgb"
+        and str(color.rgb).upper().endswith("C00000")
+    )
+
+
 def _validate_xlsx(path: Path, items: list[TakeoffItem], state: dict[str, Any]) -> dict[str, Any]:
-    formula_book = load_workbook(path, read_only=True, data_only=False)
+    evidence_state = state.get("evidence")
+    expected_sheets = [*_SHEET_NAMES, _EVIDENCE_SHEET_NAME] if evidence_state else _SHEET_NAMES
+    formula_book = load_workbook(path, read_only=False, data_only=False)
     try:
         actual_sheets = formula_book.sheetnames
         quote = formula_book["报价表"] if "报价表" in actual_sheets else None
@@ -565,6 +949,32 @@ def _validate_xlsx(path: Path, items: list[TakeoffItem], state: dict[str, Any]) 
                 max_col=len(QUOTE_HEADERS),
             ):
                 key_rows.append([cell.value for cell in cells])
+
+        evidence_headers: list[Any] = []
+        evidence_image_count = 0
+        evidence_missing_rows: list[int] = []
+        evidence_missing_cells: list[str] = []
+        evidence_missing_red = True
+        if evidence_state and _EVIDENCE_SHEET_NAME in actual_sheets:
+            evidence_sheet = formula_book[_EVIDENCE_SHEET_NAME]
+            evidence_headers = [cell.value for cell in evidence_sheet[1]]
+            evidence_image_count = len(getattr(evidence_sheet, "_images", ()))
+            for excel_row in range(2, evidence_state["record_count"] + 2):
+                if evidence_sheet.cell(row=excel_row, column=13).value not in (None, ""):
+                    evidence_missing_rows.append(excel_row)
+                for column_letter in ("K", "L"):
+                    cell = evidence_sheet[f"{column_letter}{excel_row}"]
+                    if isinstance(cell.value, str) and cell.value.startswith("缺图："):
+                        evidence_missing_cells.append(cell.coordinate)
+            red_coordinates = [
+                *evidence_state["missing_cells"],
+                *(f"M{row}" for row in evidence_state["missing_rows"]),
+            ]
+            evidence_missing_red = all(
+                formula_book[_EVIDENCE_SHEET_NAME][coordinate].value not in (None, "")
+                and _has_red_font(formula_book[_EVIDENCE_SHEET_NAME][coordinate])
+                for coordinate in red_coordinates
+            )
     finally:
         formula_book.close()
 
@@ -616,7 +1026,7 @@ def _validate_xlsx(path: Path, items: list[TakeoffItem], state: dict[str, Any]) 
         for actual, expected in zip(amount_values, state["amount_cache"], strict=True)
     )
     checks = {
-        "sheet_order": actual_sheets == _SHEET_NAMES,
+        "sheet_order": actual_sheets == expected_sheets,
         "quote_headers": actual_headers == QUOTE_HEADERS,
         "quantity_formulas": all(
             isinstance(value, str) and value.startswith("=IF(") for value in quantity_formulas
@@ -630,6 +1040,23 @@ def _validate_xlsx(path: Path, items: list[TakeoffItem], state: dict[str, Any]) 
         "total_cache": _same_cached_value(total_value, state["total_cache"]),
         "formula_errors": not formula_errors,
     }
+    if evidence_state:
+        checks.update(
+            {
+                "evidence_headers": evidence_headers == _EVIDENCE_HEADERS,
+                "evidence_image_count": (
+                    evidence_image_count == evidence_state["image_count"]
+                ),
+                "evidence_missing_rows": (
+                    evidence_missing_rows == evidence_state["missing_rows"]
+                    and evidence_missing_cells == evidence_state["missing_cells"]
+                ),
+                "evidence_missing_red": evidence_missing_red,
+                "evidence_image_scale": all(
+                    0 < value <= 1 for value in evidence_state["image_scales"]
+                ),
+            }
+        )
     report = {
         "backend": "XlsxWriter",
         "openpyxl_readable": True,
@@ -641,6 +1068,12 @@ def _validate_xlsx(path: Path, items: list[TakeoffItem], state: dict[str, Any]) 
         "formula_errors": formula_errors,
         "key_range": key_rows,
     }
+    if evidence_state:
+        report["evidence"] = {
+            "record_count": evidence_state["record_count"],
+            "image_count": evidence_image_count,
+            "missing_rows": evidence_missing_rows,
+        }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(f"XlsxWriter workbook validation failed: {', '.join(failed)}")
@@ -673,6 +1106,7 @@ def build_quote_workbook(
     measurements: list[MeasurementCandidate] | None = None,
     issues: list[RunIssue] | None = None,
     metadata: dict[str, Any] | None = None,
+    evidence_records: list[Any] | tuple[Any, ...] | None = None,
     preview_dir: str | Path | None = None,
     verification_report: str | Path | None = None,
 ) -> Path:
@@ -685,6 +1119,10 @@ def build_quote_workbook(
     measurement_rows = measurements or []
     issue_rows = issues or []
     run_metadata = metadata or {}
+    evidence_rows = [
+        _normalize_evidence_record(record, index)
+        for index, record in enumerate(evidence_records or (), start=1)
+    ]
 
     with tempfile.TemporaryDirectory(
         prefix=".cadquote-xlsxwriter-",
@@ -699,6 +1137,7 @@ def build_quote_workbook(
             issue_rows,
             run_metadata,
             generated_at,
+            evidence_rows,
         )
         report = _validate_xlsx(temporary_output, items, state)
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
@@ -717,6 +1156,7 @@ def build_quote_workbook(
             "edge_count": len(edge_rows),
             "measurement_count": len(measurement_rows),
             "pending_count": state["pending_count"],
+            "evidence_record_count": len(evidence_rows),
             "preview": preview,
         }
     )

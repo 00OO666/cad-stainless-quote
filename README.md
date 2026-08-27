@@ -23,12 +23,13 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Extracts bounded length, height, quantity, and unfolded-width candidates with unit and paper-space safeguards.
 - Revisits raw DXF polylines near leader targets to surface conservative repeated-instance quantity candidates; they remain `REVIEW` and never auto-fill the bill.
 - Rejects sheet-wide detail dimensions unless an explicit detail relation and a unique component-local material anchor exist.
-- Exports embedded workbook image evidence and can register screenshots to rendered CAD panels with an optional vision dependency.
+- Generates component-bound locator and close-up images directly from vector CAD for plan, elevation, and detail stages; missing images stay visible as review rows.
+- Preserves image aspect ratio, source/image hashes, CAD bounding boxes, entity IDs, DXF handles, and rendered pixel dimensions for audit.
 - Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
 - Applies audited reviewer confirmations and resumes without re-running immutable upstream stages.
 - Computes `m`, `m²`, piece, and set quantities deterministically.
 - Matches only approved, versioned, specification-compatible prices.
-- Exports a four-sheet Excel workbook: quotation, provenance, pending review, and run metadata.
+- Exports a five-sheet Excel workbook when evidence rendering is enabled: quotation, provenance, pending review, run metadata, and screenshot evidence. Debug runs with evidence disabled retain the legacy four-sheet layout.
 - Separates PASS precision from automation rate when evaluating against a reviewed gold set.
 
 ## Safety invariants
@@ -40,6 +41,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 5. A price requires an approved source, version, date, currency, tax basis, material, thickness, finish, process, unit, and pricing method.
 6. Human benchmark spreadsheets are imported as candidate truth and audited before use.
 7. Repeated linework is only a review candidate; a reviewer must prove that it represents independent billable components.
+8. A `PASS` item must have rendered locator and close-up images for the same sequence and `component_id` at plan, elevation, and detail stages; otherwise its amount is cleared and it returns to `REVIEW`.
 
 ## Requirements
 

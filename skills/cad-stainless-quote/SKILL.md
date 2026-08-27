@@ -39,9 +39,12 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 9. Treat PDFs and images as inventoried attachments unless a later verified parser explicitly extracts evidence from them.
 10. Never use an unscaled paper-space geometric dimension as millimetres, and never let non-PASS rows enter the confirmed quotation total.
 11. A repeated-vector group is only a quantity REVIEW candidate. Require one leader-anchored congruent group, independent handles, an untruncated source scan, and later semantic corroboration before a reviewer may accept it.
+12. Bind every workbook evidence bundle to `component_id`. Include a locator image and a readable close-up that together trace plan → elevation → detail/dimension, with drawing number, bbox, entity IDs, DXF handles, source/asset SHA-256, and original pixel dimensions.
+13. Preserve aspect ratio and original raster pixels; never upscale a screenshot. A missing required image is `MISSING`/REVIEW, and a candidate image must stay visibly `CANDIDATE` rather than masquerade as confirmed evidence. PASS and amount release require the complete confirmed chain.
+14. Never place customer drawings, workbooks, screenshots, customer paths, local absolute paths, or identifiable project statistics in a public repository.
 
 ## Outputs
 
-The pipeline produces a machine-readable manifest/index, material-code candidate list, read-only DOCX material-book mappings, unnumbered stainless-material mention diagnostics and candidate edges, raw-DXF repeated-vector quantity probes, evidence graph, review pack, takeoff JSON, quotation workbook, pending-confirmation list, and run diagnostics. A quotation with unresolved evidence or prices is a takeoff draft, not a completed commercial quote.
+The pipeline produces a machine-readable manifest/index, material-code candidate list, read-only DOCX material-book mappings, unnumbered stainless-material mention diagnostics and candidate edges, raw-DXF repeated-vector quantity probes, evidence graph, component-bound locator/close-up evidence, review pack, takeoff JSON, quotation workbook, pending-confirmation list, and run diagnostics. A quotation with unresolved evidence, missing images, or prices is a takeoff draft, not a completed commercial quote.
 
 This skill currently targets Windows because the supported launcher is PowerShell. DWG conversion is an external adapter (ODA File Converter, AutoCAD Core Console, or `dwg2dxf`) and is not distributed by this project.

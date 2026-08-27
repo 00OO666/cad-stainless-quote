@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import cadquote.pipeline as pipeline_module
 import ezdxf
 import pytest
 from cad_quote import build_parser
@@ -19,6 +20,7 @@ from cadquote.models import (
 from cadquote.pipeline import (
     ConfirmationBundle,
     _build_review_pack,
+    _gate_pass_items_by_excel_evidence,
     _load_manifest_confirmations,
     _overall_status,
     _price_evidence_edges,
@@ -266,6 +268,118 @@ def test_pipeline_single_dxf_produces_auditable_review_package(tmp_path: Path):
     template = review_pack["confirmation_template"]["components"][component_id]
     assert "reviewed_at" in template
     assert "timestamp" not in template
+
+
+def test_excel_evidence_gate_never_crosses_sequence_or_component_for_same_mt():
+    items = [
+        TakeoffItem(
+            sequence=1,
+            name="构件一",
+            mt_code="MT-01",
+            component_id="component:1",
+            amount=100,
+            status=ReviewStatus.PASS,
+        ),
+        TakeoffItem(
+            sequence=2,
+            name="构件二",
+            mt_code="MT-01",
+            component_id="component:2",
+            amount=200,
+            status=ReviewStatus.PASS,
+        ),
+    ]
+    records = [
+        {
+            "id": f"record:{sequence}:{component_id}:{stage}",
+            "sequence": sequence,
+            "component_id": component_id,
+            "mt_code": "MT-01",
+            "stage": stage,
+            "render_state": "RENDERED",
+            "context_image": "context.png",
+            "detail_image": "detail.png",
+        }
+        for sequence, component_id in ((1, "component:1"), (1, "component:2"), (2, "component:1"))
+        for stage in ("plan", "elevation", "detail")
+    ]
+
+    gated, issues = _gate_pass_items_by_excel_evidence(items, records)
+
+    assert gated[0].status == ReviewStatus.PASS
+    assert gated[0].amount == 100
+    assert gated[1].status == ReviewStatus.REVIEW
+    assert gated[1].amount is None
+    assert len(issues) == 1
+    assert issues[0].source_id == "component:2"
+
+
+def test_excel_evidence_render_exception_writes_three_explicit_failed_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    item = TakeoffItem(
+        sequence=1,
+        name="构件",
+        mt_code="MT-01",
+        component_id="component:1",
+        amount=100,
+        status=ReviewStatus.PASS,
+    )
+    takeoff = TakeoffBuildResult(
+        components=[ComponentInstance(id="component:1", mt_code="MT-01")]
+    )
+
+    def fail_render(*_args, **_kwargs):
+        raise RuntimeError("synthetic renderer failure")
+
+    monkeypatch.setattr(pipeline_module, "render_excel_evidence", fail_render)
+    issues: list[RunIssue] = []
+    payload, counts, index_path = pipeline_module._prepare_excel_evidence(
+        [item],
+        takeoff,
+        [],
+        [],
+        [],
+        {},
+        tmp_path / "excel_evidence",
+        issues,
+    )
+
+    assert {record["stage"] for record in payload} == {"plan", "elevation", "detail"}
+    assert all(record["render_state"] == "FAILED" for record in payload)
+    assert all(record["image_root"] == str(tmp_path / "excel_evidence") for record in payload)
+    assert counts == {
+        "excel_evidence_records": 3,
+        "excel_evidence_rendered": 0,
+        "excel_evidence_missing": 0,
+        "excel_evidence_failed": 3,
+    }
+    assert index_path.is_file()
+    assert "EXCEL_EVIDENCE_PIPELINE_FAILED" in {issue.code for issue in issues}
+
+
+def test_full_and_resume_export_excel_evidence_sheet(tmp_path: Path):
+    source = tmp_path / "evidence.dxf"
+    _write_minimal_dxf(source)
+
+    first = run_pipeline(source, tmp_path / "run")
+
+    assert Path(first.paths["excel_evidence"]).is_file()
+    assert first.counts["excel_evidence_records"] >= 3
+    assert (
+        first.counts["excel_evidence_rendered"]
+        + first.counts["excel_evidence_missing"]
+        + first.counts["excel_evidence_failed"]
+        == first.counts["excel_evidence_records"]
+    )
+    assert "截图证据" in load_workbook(first.quote_path).sheetnames
+
+    resumed = resume_pipeline(tmp_path / "run")
+
+    assert Path(resumed.paths["excel_evidence"]).is_file()
+    assert resumed.counts["excel_evidence_records"] >= 3
+    assert "截图证据" in load_workbook(resumed.quote_path).sheetnames
 
 
 def test_confirmation_parser_preserves_reviewer_audit(tmp_path: Path):

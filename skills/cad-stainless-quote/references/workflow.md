@@ -22,6 +22,30 @@ description, and retain the document hash and row/cell or paragraph locator. A u
 description is still REVIEW; an ambiguous or conflicting mapping is BLOCK. Neither case proves a
 physical quantity.
 
+## Excel screenshot evidence
+
+Build one evidence bundle per `component_id`; never bind screenshots only by Excel row number.
+The bundle must contain a locator image showing the room/component in context and a readable
+close-up of the MT leader, elevation, node, or governing dimensions. Together they must make the
+order plan → elevation → detail/dimension auditable.
+
+For every image retain the drawing number/layout, CAD bbox, related entity IDs, DXF handles,
+source-file and evidence-file SHA-256, and original pixel width/height. Preserve the original
+aspect ratio. Do not enlarge a raster beyond its natural pixels; re-render from vector CAD at a
+recorded scale/DPI when more detail is required.
+
+Use explicit evidence states:
+
+- `CANDIDATE`: plausible crop awaiting chain/role confirmation; it must be labelled as such in the workbook.
+- `CONFIRMED`: reviewed evidence bound to the accepted component and chain.
+- `MISSING`: a required plan, elevation, detail, or dimension image is absent; keep the item REVIEW/BLOCK and show `待确认`.
+
+A candidate crop cannot satisfy a confirmed chain merely because it looks similar to the human
+workbook. Release amount and include it in the confirmed total only after the component has a
+complete confirmed plan → elevation → detail/dimension chain and all required images. Keep all
+customer drawings, screenshots, workbook extracts, customer/local paths, and identifiable project
+statistics out of public repositories.
+
 ## Quantity evidence
 
 Prefer an explicit, component-bound quantity label. Split labels such as `QTY`, `=`, `2`

@@ -10,6 +10,31 @@ The canonical Pydantic definitions live in `scripts/cadquote/models.py`. JSON is
 - `MtOccurrence.id`, `ComponentInstance.id`, and `EvidenceEdge.id` must be deterministic for identical inputs.
 - Keep source-relative paths in outputs; absolute paths may appear only in local run diagnostics.
 
+## Component screenshot evidence contract
+
+Any quotation evidence manifest or workbook integration must group images by `component_id`, not
+by a mutable row number. Each component bundle requires at least a locator image and a close-up,
+with ordered stages sufficient to audit plan → elevation → detail/dimension.
+
+Each image record must preserve:
+
+- `component_id`, evidence role (`locator` or `closeup`), chain stage, and state
+  (`CANDIDATE`, `CONFIRMED`, or `MISSING`);
+- drawing number/layout, CAD `bbox`, related CAD entity IDs, and DXF handles;
+- source-file SHA-256, evidence-asset SHA-256, and a source-relative asset path;
+- original pixel width/height, aspect ratio, and any vector render scale/DPI.
+
+Raster assets must retain their original bytes/pixels and aspect ratio and must never be
+upscaled. A clearer image must be re-rendered from vector CAD, not interpolated from a smaller
+bitmap. `MISSING` at any required stage keeps the item REVIEW/BLOCK. `CANDIDATE` images are
+review material only and cannot satisfy PASS evidence. Amount is releasable only when the full
+component chain and required images are `CONFIRMED`; otherwise it stays outside the confirmed
+total.
+
+Customer assets and identifying metadata are private-run data. Customer drawings, workbooks,
+screenshots, names, paths, local absolute paths, hashes tied to a real delivery, and identifiable
+project statistics must never be committed to a public repository.
+
 ## Material-code compatibility
 
 - `mt_code` remains the normalized business-code field used by the existing pipeline and the

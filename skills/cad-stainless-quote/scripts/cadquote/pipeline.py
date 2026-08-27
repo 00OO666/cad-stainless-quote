@@ -14,6 +14,7 @@ from typing import Any
 from .cad_index import CadIndexBundle, index_dxf, write_index_sqlite
 from .calculation import calculate_item
 from .converter import ConversionAudit, convert_dwgs
+from .evidence_images import build_excel_evidence_targets, render_excel_evidence
 from .exporter import build_quote_workbook
 from .ingest import IngestLimits, IngestResult, ingest_input
 from .io import write_json_atomic
@@ -1672,6 +1673,269 @@ def _render_occurrences(
     return render_index
 
 
+_REQUIRED_EXCEL_EVIDENCE_STAGES = ("plan", "elevation", "detail")
+
+
+def _excel_evidence_missing_record(
+    item: TakeoffItem,
+    stage: str,
+    reason: str,
+    *,
+    render_state: str = "MISSING",
+) -> dict[str, Any]:
+    identity = json.dumps(
+        [item.sequence, item.component_id, stage, reason],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return {
+        "id": f"excel-evidence:{hashlib.sha256(identity.encode()).hexdigest()[:24]}",
+        "sequence": item.sequence,
+        "component_id": item.component_id,
+        "mt_code": item.mt_code,
+        "stage": stage,
+        "roles": [],
+        "source_file_id": None,
+        "sheet_id": None,
+        "drawing_number": None,
+        "sheet_title": None,
+        "layout": None,
+        "occurrence_ids": [],
+        "measurement_ids": [],
+        "entity_ids": [],
+        "entity_handles": [],
+        "anchor_points": [],
+        "focus_bbox": None,
+        "detail_bbox": None,
+        "context_bbox": None,
+        "status": item.status.value,
+        "state": "MISSING",
+        "evidence_state": "MISSING",
+        "reason": reason,
+        "render_state": render_state,
+        "source_sha256": None,
+        "context_image": None,
+        "detail_image": None,
+        "context_target_px": None,
+        "detail_target_px": None,
+        "context_pixel_size": None,
+        "detail_pixel_size": None,
+        "context_aspect_ratio": None,
+        "detail_aspect_ratio": None,
+        "context_sha256": None,
+        "detail_sha256": None,
+        "context_backend": None,
+        "detail_backend": None,
+        "render_reason": reason,
+    }
+
+
+def _ensure_required_excel_evidence_stages(
+    items: Sequence[TakeoffItem],
+    records: Sequence[Mapping[str, Any]],
+    *,
+    reason_prefix: str = "构件没有可绑定的截图目标",
+) -> list[dict[str, Any]]:
+    output = [dict(record) for record in records]
+    existing = {
+        (
+            record.get("sequence"),
+            record.get("component_id"),
+            str(record.get("stage") or ""),
+        )
+        for record in output
+    }
+    for item in items:
+        for stage in _REQUIRED_EXCEL_EVIDENCE_STAGES:
+            key = (item.sequence, item.component_id, stage)
+            if key in existing:
+                continue
+            output.append(
+                _excel_evidence_missing_record(
+                    item,
+                    stage,
+                    f"{reason_prefix}：{stage}",
+                )
+            )
+            existing.add(key)
+    return sorted(
+        output,
+        key=lambda record: (
+            int(record.get("sequence") or 0),
+            str(record.get("component_id") or ""),
+            str(record.get("stage") or ""),
+            str(record.get("id") or ""),
+        ),
+    )
+
+
+def _excel_evidence_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    state_counts = Counter(str(record.get("render_state") or "MISSING") for record in records)
+    return {
+        "excel_evidence_records": len(records),
+        "excel_evidence_rendered": state_counts["RENDERED"],
+        "excel_evidence_missing": state_counts["MISSING"],
+        "excel_evidence_failed": state_counts["FAILED"],
+    }
+
+
+def _prepare_excel_evidence(
+    items: Sequence[TakeoffItem],
+    takeoff: TakeoffBuildResult,
+    occurrences: Sequence[MtOccurrence],
+    sheets: Sequence[Sheet],
+    entities: Sequence[CadEntity],
+    source_dxfs: Mapping[str, Path],
+    output_dir: Path,
+    issues: list[RunIssue],
+) -> tuple[list[dict[str, Any]], dict[str, int], Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target_count = 0
+    try:
+        targets = build_excel_evidence_targets(
+            items,
+            takeoff.components,
+            occurrences,
+            takeoff.measurements,
+            takeoff.evidence_edges,
+            sheets,
+            entities,
+        )
+        target_count = len(targets)
+        rendered = render_excel_evidence(targets, source_dxfs, output_dir)
+        records = [record.model_dump(mode="json") for record in rendered]
+        records = _ensure_required_excel_evidence_stages(items, records)
+    except Exception as exc:
+        reason = f"Excel截图证据流水线失败：{type(exc).__name__}: {exc}"
+        records = [
+            _excel_evidence_missing_record(
+                item,
+                stage,
+                reason,
+                render_state="FAILED",
+            )
+            for item in items
+            for stage in _REQUIRED_EXCEL_EVIDENCE_STAGES
+        ]
+        issues.append(
+            _issue(
+                "render",
+                Severity.ERROR,
+                "EXCEL_EVIDENCE_PIPELINE_FAILED",
+                reason,
+                evidence=[item.component_id or f"sequence:{item.sequence}" for item in items[:24]],
+                action="检查DXF源路径、渲染依赖和构件锚点后重跑；不得用其他MT构件图片代替",
+            )
+        )
+
+    counts = _excel_evidence_counts(records)
+    index_path = output_dir / "index.json"
+    write_json_atomic(
+        index_path,
+        {
+            "schema_version": "1.0",
+            "target_count": target_count,
+            "record_count": counts["excel_evidence_records"],
+            "rendered_count": counts["excel_evidence_rendered"],
+            "missing_count": counts["excel_evidence_missing"],
+            "failed_count": counts["excel_evidence_failed"],
+            "records": records,
+        },
+    )
+    if counts["excel_evidence_missing"] or counts["excel_evidence_failed"]:
+        issues.append(
+            _issue(
+                "render",
+                Severity.WARNING,
+                "EXCEL_EVIDENCE_IMAGES_INCOMPLETE",
+                "Excel截图证据存在缺图或渲染失败："
+                f"缺图{counts['excel_evidence_missing']}，失败{counts['excel_evidence_failed']}。",
+                evidence=[str(index_path)],
+                action="在截图证据表逐行核对缺图原因，并补齐平面、立面、节点/大样证据",
+            )
+        )
+    payload = [{**record, "image_root": str(output_dir)} for record in records]
+    return payload, counts, index_path
+
+
+def _gate_pass_items_by_excel_evidence(
+    items: Sequence[TakeoffItem],
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[list[TakeoffItem], list[RunIssue]]:
+    records_by_item: dict[tuple[int, str | None], list[Mapping[str, Any]]] = defaultdict(list)
+    for record in records:
+        try:
+            sequence = int(record.get("sequence"))
+        except (TypeError, ValueError):
+            continue
+        component_id = record.get("component_id")
+        if component_id is not None and not isinstance(component_id, str):
+            continue
+        records_by_item[(sequence, component_id)].append(record)
+
+    gated: list[TakeoffItem] = []
+    gate_issues: list[RunIssue] = []
+    for item in items:
+        if item.status != ReviewStatus.PASS:
+            gated.append(item)
+            continue
+        bound_records = records_by_item.get((item.sequence, item.component_id), [])
+        rendered_stages = {
+            str(record.get("stage"))
+            for record in bound_records
+            if record.get("render_state") == "RENDERED"
+            and record.get("context_image")
+            and record.get("detail_image")
+        }
+        missing_stages = [
+            stage for stage in _REQUIRED_EXCEL_EVIDENCE_STAGES if stage not in rendered_stages
+        ]
+        if not missing_stages:
+            gated.append(item)
+            continue
+
+        stage_states: list[str] = []
+        for stage in missing_stages:
+            states = sorted(
+                {
+                    str(record.get("render_state") or "MISSING")
+                    for record in bound_records
+                    if record.get("stage") == stage
+                }
+            )
+            stage_states.append(f"{stage}={'/'.join(states) if states else 'MISSING'}")
+        reason = "Excel截图证据链不完整（" + "，".join(stage_states) + "）"
+        gated.append(
+            item.model_copy(
+                update={
+                    "status": ReviewStatus.REVIEW,
+                    "amount": None,
+                    "block_reason": "；".join(
+                        value for value in (item.block_reason, reason) if value
+                    ),
+                    "note": "；".join(value for value in (item.note, reason) if value),
+                }
+            )
+        )
+        gate_issues.append(
+            _issue(
+                "render",
+                Severity.WARNING,
+                "EXCEL_EVIDENCE_CHAIN_INCOMPLETE",
+                f"序号{item.sequence}、构件{item.component_id or '缺失'}的{reason}；"
+                "已从PASS降为REVIEW并清空金额。",
+                source_id=item.component_id,
+                evidence=[
+                    str(record.get("id"))
+                    for record in bound_records
+                    if record.get("id") is not None
+                ][:24],
+                action="补齐同一component_id和序号下的平面、立面、节点/大样双图后再确认",
+            )
+        )
+    return gated, gate_issues
+
+
 def run_pipeline(
     input_path: Path | str,
     run_dir: Path | str,
@@ -1948,6 +2212,36 @@ def run_pipeline(
     issues.extend(price_issues)
     takeoff.evidence_edges.extend(_price_evidence_edges(priced_items, price_metadata))
 
+    excel_evidence_records: list[dict[str, Any]] = []
+    excel_evidence_counts = _excel_evidence_counts(())
+    excel_evidence_index: Path | None = None
+    if render_evidence:
+        (
+            excel_evidence_records,
+            excel_evidence_counts,
+            excel_evidence_index,
+        ) = _prepare_excel_evidence(
+            priced_items,
+            takeoff,
+            occurrences,
+            sheets,
+            entities,
+            source_dxfs,
+            root / "excel_evidence",
+            issues,
+        )
+        priced_items, evidence_gate_issues = _gate_pass_items_by_excel_evidence(
+            priced_items,
+            excel_evidence_records,
+        )
+        issues.extend(evidence_gate_issues)
+        issues[:] = _dedupe_issues(issues)
+    excel_evidence_metadata = {
+        "enabled": render_evidence,
+        "index": str(excel_evidence_index) if excel_evidence_index is not None else None,
+        **excel_evidence_counts,
+    }
+
     review_pack_path = root / "review-pack.json"
     write_json_atomic(
         review_pack_path,
@@ -1968,19 +2262,12 @@ def run_pipeline(
             metadata={
                 "run_mode": "full",
                 "input_sha256": ingest.input_sha256,
+                "excel_evidence": excel_evidence_metadata,
                 **price_metadata,
             },
         ),
     )
 
-    if render_evidence and occurrences:
-        _render_occurrences(
-            occurrences,
-            sheets,
-            source_dxfs,
-            root / "evidence_images",
-            issues,
-        )
     quote_path = build_quote_workbook(
         priced_items,
         output_dir / "不锈钢算量报价.xlsx",
@@ -2005,8 +2292,14 @@ def run_pipeline(
             "confirmed_components": sum(
                 bool(value) for value in confirmation_bundle.selections.values()
             ),
+            "excel_evidence_enabled": render_evidence,
+            "excel_evidence_index": (
+                str(excel_evidence_index) if excel_evidence_index is not None else None
+            ),
+            **excel_evidence_counts,
             **price_metadata,
         },
+        evidence_records=excel_evidence_records if render_evidence else None,
     )
     write_json_atomic(
         output_dir / "takeoff.json",
@@ -2036,6 +2329,7 @@ def run_pipeline(
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmation_source": confirmation_bundle.source_path,
             "price": price_metadata,
+            "excel_evidence": excel_evidence_metadata,
             "material_code_families": {
                 "stainless": sorted(stainless_families),
                 "review": sorted(review_families),
@@ -2057,6 +2351,7 @@ def run_pipeline(
                 "vector_quantity_review_candidates": vector_review_count,
                 "components": len(takeoff.components),
                 "takeoff_items": len(priced_items),
+                **excel_evidence_counts,
             },
         },
     )
@@ -2085,6 +2380,8 @@ def run_pipeline(
         "review_pack": str(review_pack_path),
         "issues": str(root / "issues.json"),
     }
+    if excel_evidence_index is not None:
+        result.paths["excel_evidence"] = str(excel_evidence_index)
     write_json_atomic(root / "run.json", result.to_dict())
     return result
 
@@ -2311,7 +2608,41 @@ def resume_pipeline(
                 ],
             )
         )
+
+    source_dxfs = {
+        str(source.get("source_file_id")): Path(str(source.get("source_path")))
+        for source in index_sources
+        if source.get("source_file_id") and source.get("source_path")
+    }
+    excel_evidence_records: list[dict[str, Any]] = []
+    excel_evidence_counts = _excel_evidence_counts(())
+    excel_evidence_index: Path | None = None
+    if render_evidence:
+        (
+            excel_evidence_records,
+            excel_evidence_counts,
+            excel_evidence_index,
+        ) = _prepare_excel_evidence(
+            priced_items,
+            takeoff,
+            occurrences,
+            sheets,
+            entities,
+            source_dxfs,
+            root / "excel_evidence",
+            issues,
+        )
+        priced_items, evidence_gate_issues = _gate_pass_items_by_excel_evidence(
+            priced_items,
+            excel_evidence_records,
+        )
+        issues.extend(evidence_gate_issues)
     issues = _dedupe_issues(issues)
+    excel_evidence_metadata = {
+        "enabled": render_evidence,
+        "index": str(excel_evidence_index) if excel_evidence_index is not None else None,
+        **excel_evidence_counts,
+    }
 
     review_pack_path = root / "review-pack.json"
     write_json_atomic(
@@ -2335,25 +2666,11 @@ def resume_pipeline(
                 "resumed_at": resumed_at,
                 "reused_snapshots": [str(path) for path in required],
                 "pricing_context_audit": pricing_audit_event,
+                "excel_evidence": excel_evidence_metadata,
                 **price_metadata,
             },
         ),
     )
-
-    source_dxfs = {
-        str(source.get("source_file_id")): Path(str(source.get("source_path")))
-        for source in index_sources
-        if source.get("source_file_id") and source.get("source_path")
-    }
-    if render_evidence and occurrences:
-        _render_occurrences(
-            occurrences,
-            sheets,
-            source_dxfs,
-            root / "evidence_images",
-            issues,
-        )
-        issues = _dedupe_issues(issues)
 
     quote_path = build_quote_workbook(
         priced_items,
@@ -2379,8 +2696,14 @@ def resume_pipeline(
             "confirmed_components": sum(
                 bool(value) for value in confirmation_bundle.selections.values()
             ),
+            "excel_evidence_enabled": render_evidence,
+            "excel_evidence_index": (
+                str(excel_evidence_index) if excel_evidence_index is not None else None
+            ),
+            **excel_evidence_counts,
             **price_metadata,
         },
+        evidence_records=excel_evidence_records if render_evidence else None,
     )
     write_json_atomic(
         output_dir / "takeoff.json",
@@ -2420,6 +2743,7 @@ def resume_pipeline(
         ),
         "components": len(takeoff.components),
         "takeoff_items": len(priced_items),
+        **excel_evidence_counts,
     }
     previous_resume_count = int(previous_metadata.get("resume_count", 0) or 0)
     conversion_path = root / "conversion.json"
@@ -2453,6 +2777,7 @@ def resume_pipeline(
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmation_source": confirmation_bundle.source_path,
             "price": price_metadata,
+            "excel_evidence": excel_evidence_metadata,
             "pricing_context_audit": [
                 *(
                     previous_metadata.get("pricing_context_audit", [])
@@ -2492,5 +2817,7 @@ def resume_pipeline(
         result.paths["material_mentions"] = str(mentions_path)
     if vector_probe_path.is_file():
         result.paths["vector_quantity_probes"] = str(vector_probe_path)
+    if excel_evidence_index is not None:
+        result.paths["excel_evidence"] = str(excel_evidence_index)
     write_json_atomic(root / "run.json", result.to_dict())
     return result
