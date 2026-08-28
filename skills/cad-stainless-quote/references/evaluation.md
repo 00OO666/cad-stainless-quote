@@ -11,6 +11,19 @@ formula, and source evidence. Mark genuinely unknowable fields as unresolved rat
 fabricating a target. A human workbook imported by `gold-import` is candidate gold until its audit
 issues and row-to-drawing evidence have been adjudicated.
 
+During candidate-gold cleanup only, an engineering-quantity cell may resolve an omitted or default
+displayed quantity. Preserve the workbook value as `reported_quantity`; derive
+`effective_quantity` only when the row unit, displayed dimensions, and authoritative engineering
+quantity reduce through the standard unit formula to one unique positive integer. Record
+`quantity_source=derived_from_engineering_quantity` plus the exact derivation basis and retain the
+row for human audit. A non-integer, ambiguous-axis, custom billing-axis, non-positive, or otherwise
+inconsistent result remains unresolved.
+
+This normalization is not prediction evidence. It must run outside every target-free task pack,
+and neither blind evaluation nor production CAD takeoff may read a human engineering quantity to
+infer CAD quantity. A prediction must prove quantity independently from the selected component's
+CAD topology before scoring.
+
 ## Versioned acceptance policy
 
 `assets/evaluation-policy-template.json` is the conservative policy template. The validated policy

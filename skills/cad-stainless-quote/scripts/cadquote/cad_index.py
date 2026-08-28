@@ -298,26 +298,158 @@ def _dimension_geometry(entity: Any) -> tuple[float | None, str | None, dict[str
     return value, str(text_override) if text_override is not None else None, geometry
 
 
-def _leader_vertices(entity: Any) -> list[list[float]]:
-    vertices: list[list[float]] = []
+def _same_point(left: list[float], right: list[float], *, tolerance: float = 1e-9) -> bool:
+    return all(abs(a - b) <= tolerance for a, b in zip(left, right, strict=True))
+
+
+def _append_unique_point(points: list[list[float]], value: object) -> list[float] | None:
+    point = _point3(value)
+    if point is None:
+        return None
+    if not any(_same_point(point, existing) for existing in points):
+        points.append(point)
+    return point
+
+
+def _leader_geometry(entity: Any) -> dict[str, Any]:
+    """Preserve arrow, landing and text points for leader entities.
+
+    A real MULTILEADER commonly stores only the arrow-side point in
+    ``LeaderLine.vertices``. The landing is stored separately as
+    ``LeaderData.last_leader_point`` and the annotation position as
+    ``context.mtext.insert``. Flattening only ``line.vertices`` therefore
+    loses the physical target-to-label topology.
+
+    ``leader_target`` is emitted only for one unique arrow target. A
+    MULTILEADER with several targets stays explicit and must not be silently
+    collapsed to the first physical component.
+    """
+
     entity_type = entity.dxftype()
+    vertices: list[list[float]] = []
+    targets: list[list[float]] = []
+    landings: list[list[float]] = []
+    dogleg_ends: list[list[float]] = []
+    paths: list[dict[str, Any]] = []
+    label_point: list[float] | None = None
+
     try:
         if entity_type == "LEADER":
+            path_vertices: list[list[float]] = []
             for vertex in entity.vertices:
-                point = _point3(vertex)
-                if point is not None:
-                    vertices.append(point)
+                _append_unique_point(path_vertices, vertex)
+            vertices.extend(path_vertices)
+            if path_vertices:
+                _append_unique_point(targets, path_vertices[0])
+                label_point = path_vertices[-1]
+                paths.append(
+                    {"leader_index": 0, "line_index": 0, "vertices": path_vertices}
+                )
         else:
             context = entity.context
-            for leader in context.leaders:
-                for line in leader.lines:
+            mtext = getattr(context, "mtext", None)
+            if mtext is not None:
+                label_point = _point3(getattr(mtext, "insert", None))
+
+            for leader_index, leader in enumerate(context.leaders):
+                landing = _append_unique_point(
+                    landings, getattr(leader, "last_leader_point", None)
+                )
+                dogleg_end: list[float] | None = None
+                dogleg_vector = _point3(getattr(leader, "dogleg_vector", None))
+                dogleg_length = _finite(getattr(leader, "dogleg_length", None))
+                if landing is not None and dogleg_vector is not None and dogleg_length:
+                    dogleg_end = [
+                        landing[0] + dogleg_vector[0] * dogleg_length,
+                        landing[1] + dogleg_vector[1] * dogleg_length,
+                        landing[2] + dogleg_vector[2] * dogleg_length,
+                    ]
+                    _append_unique_point(dogleg_ends, dogleg_end)
+
+                for line_index, line in enumerate(leader.lines):
+                    path_vertices: list[list[float]] = []
                     for vertex in line.vertices:
-                        point = _point3(vertex)
-                        if point is not None:
-                            vertices.append(point)
+                        _append_unique_point(path_vertices, vertex)
+                    if path_vertices:
+                        _append_unique_point(targets, path_vertices[0])
+                    if landing is not None:
+                        _append_unique_point(path_vertices, landing)
+                    if dogleg_end is not None:
+                        _append_unique_point(path_vertices, dogleg_end)
+                    for point in path_vertices:
+                        _append_unique_point(vertices, point)
+                    paths.append(
+                        {
+                            "leader_index": leader_index,
+                            "line_index": line_index,
+                            "vertices": path_vertices,
+                        }
+                    )
     except Exception:
+        # CAD proxy entities and partially decoded vendor objects must not stop
+        # indexing; missing topology remains explicit in the resulting record.
         pass
-    return vertices
+
+    geometry: dict[str, Any] = {
+        "vertices": vertices,
+        "leader_targets": targets,
+        "landing_points": landings,
+        "dogleg_end_points": dogleg_ends,
+        "leader_paths": paths,
+    }
+    if len(targets) == 1:
+        geometry["leader_target"] = targets[0]
+    if len(landings) == 1:
+        geometry["landing_point"] = landings[0]
+    if label_point is not None:
+        geometry["label_point"] = label_point
+        geometry["text_location"] = label_point
+    return geometry
+
+
+def _leader_vertices(entity: Any) -> list[list[float]]:
+    return _leader_geometry(entity)["vertices"]
+
+
+def _leader_anchor_from_geometry(
+    geometry: Mapping[str, Any],
+) -> tuple[float, float] | None:
+    """Choose a label-side anchor without collapsing a multi-arrow leader.
+
+    A unique arrow remains the most useful physical anchor.  When several
+    arrows share one annotation, the annotation/landing is the only safe
+    entity-level anchor; choosing ``vertices[0]`` would silently bind the
+    annotation to the first physical target.
+    """
+
+    leader_target = geometry.get("leader_target")
+    if isinstance(leader_target, list) and len(leader_target) >= 2:
+        return (float(leader_target[0]), float(leader_target[1]))
+
+    raw_targets = geometry.get("leader_targets")
+    target_count = (
+        len(raw_targets)
+        if isinstance(raw_targets, Sequence) and not isinstance(raw_targets, (str, bytes))
+        else 0
+    )
+    for key in ("label_point", "text_location"):
+        point = _point(geometry.get(key))
+        if point is not None:
+            return point
+    if target_count > 1:
+        for key in ("landing_point",):
+            point = _point(geometry.get(key))
+            if point is not None:
+                return point
+        return None
+
+    vertices = geometry.get("vertices")
+    if isinstance(vertices, Sequence) and not isinstance(vertices, (str, bytes)):
+        for raw_point in vertices:
+            point = _point(raw_point)
+            if point is not None:
+                return point
+    return None
 
 
 def _viewport_geometry(entity: Any) -> dict[str, Any]:
@@ -385,15 +517,10 @@ def _record_entity(
         value, text_override, geometry_values = _dimension_geometry(entity)
         geometry.update(geometry_values)
     elif entity_type in {"LEADER", "MLEADER", "MULTILEADER"}:
-        vertices = _leader_vertices(entity)
-        geometry.update(
-            {
-                "vertices": vertices,
-                "annotation_handle": _dxf_get(entity, "annotation_handle"),
-            }
-        )
-        if vertices:
-            insert = (vertices[0][0], vertices[0][1])
+        leader_geometry = _leader_geometry(entity)
+        geometry.update(leader_geometry)
+        geometry["annotation_handle"] = _dxf_get(entity, "annotation_handle")
+        insert = _leader_anchor_from_geometry(leader_geometry)
     elif entity_type == "INSERT":
         geometry.update(_insert_geometry(entity))
     elif entity_type in {"ATTRIB", "ATTDEF"}:

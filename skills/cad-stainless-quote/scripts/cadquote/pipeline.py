@@ -25,6 +25,7 @@ from .ingest import IngestLimits, IngestResult, ingest_input
 from .io import write_json_atomic
 from .linking import rank_evidence_edges
 from .materials import (
+    DEFAULT_AUXILIARY_CODE_FAMILIES,
     DEFAULT_REVIEW_CODE_FAMILIES,
     DEFAULT_STAINLESS_CODE_FAMILIES,
     annotate_material_conflicts,
@@ -199,7 +200,10 @@ def _load_materials(
                 source_file_id=file.id,
                 expected_sha256=file.sha256,
                 stainless_families=stainless_code_families,
-                review_families=review_code_families,
+                review_families={
+                    *(review_code_families or DEFAULT_REVIEW_CODE_FAMILIES),
+                    *DEFAULT_AUXILIARY_CODE_FAMILIES,
+                },
             )
         except Exception as exc:
             issues.append(
@@ -294,6 +298,23 @@ _DETAIL_REQUIREMENT_KEYS = frozenset(
 _ENGINEERING_QUANTITY_KEYS = frozenset(
     {"kind", "expression", "basis", "evidence_ids"}
 )
+_COMPOSITE_ASSEMBLY_KEYS = frozenset(
+    {
+        "kind",
+        "assembly_type",
+        "billing_basis",
+        "required_material_roles",
+        "included_materials",
+        "basis",
+        "evidence_ids",
+        "projection_width_candidate_id",
+        "projection_length_candidate_id",
+        "projection_component_entity_id",
+        "projection_axis_basis",
+    }
+)
+_COMPONENT_MATERIAL_KEYS = frozenset({"role", "material_spec_id"})
+_COMPONENT_MATERIAL_ROLES = frozenset({"glass_infill", "included_other"})
 
 
 def _derived_measurement_selection(
@@ -469,6 +490,108 @@ def _engineering_quantity_selection(
     }
 
 
+def _composite_assembly_selection(
+    value: Mapping[str, Any], *, label: str
+) -> dict[str, Any]:
+    """Validate a reference-only composite assembly confirmation.
+
+    Material code and name are intentionally not accepted here.  A reviewer can
+    only select an existing MaterialSpec; takeoff resolves the commercial text
+    from the current project's evidence graph.
+    """
+
+    unknown = sorted(set(value) - _COMPOSITE_ASSEMBLY_KEYS)
+    if unknown:
+        raise ValueError(f"{label} has unsupported keys: {', '.join(unknown)}")
+    if value.get("kind") != "single_line_composite":
+        raise ValueError(f"{label}.kind must be 'single_line_composite'")
+    if value.get("assembly_type") != "screen_with_glass":
+        raise ValueError(f"{label}.assembly_type must be 'screen_with_glass'")
+    if value.get("billing_basis") != "whole_elevation_projection":
+        raise ValueError(
+            f"{label}.billing_basis must be 'whole_elevation_projection'"
+        )
+    basis = value.get("basis")
+    if not isinstance(basis, str) or not basis.strip():
+        raise ValueError(f"{label}.basis must be a non-empty explanation")
+
+    raw_required_roles = value.get("required_material_roles")
+    if not isinstance(raw_required_roles, list) or not raw_required_roles:
+        raise ValueError(f"{label}.required_material_roles must be a non-empty array")
+    required_roles: list[str] = []
+    for index, raw_role in enumerate(raw_required_roles):
+        if raw_role not in _COMPONENT_MATERIAL_ROLES:
+            raise ValueError(
+                f"{label}.required_material_roles[{index}] is not a supported role"
+            )
+        if raw_role not in required_roles:
+            required_roles.append(raw_role)
+    if "glass_infill" not in required_roles:
+        raise ValueError(
+            f"{label}.required_material_roles must include 'glass_infill'"
+        )
+
+    raw_materials = value.get("included_materials", [])
+    if not isinstance(raw_materials, list):
+        raise ValueError(f"{label}.included_materials must be an array")
+    included_materials: list[dict[str, str]] = []
+    seen_materials: set[tuple[str, str]] = set()
+    for index, raw_material in enumerate(raw_materials):
+        material_label = f"{label}.included_materials[{index}]"
+        if not isinstance(raw_material, Mapping):
+            raise ValueError(f"{material_label} must be an object")
+        material_unknown = sorted(set(raw_material) - _COMPONENT_MATERIAL_KEYS)
+        if material_unknown:
+            raise ValueError(
+                f"{material_label} has unsupported keys: {', '.join(material_unknown)}"
+            )
+        role = raw_material.get("role")
+        material_spec_id = raw_material.get("material_spec_id")
+        if role not in _COMPONENT_MATERIAL_ROLES:
+            raise ValueError(f"{material_label}.role is not supported")
+        if not isinstance(material_spec_id, str) or not material_spec_id.strip():
+            raise ValueError(f"{material_label}.material_spec_id must be a non-empty ID")
+        identity = (str(role), material_spec_id.strip())
+        if identity not in seen_materials:
+            included_materials.append(
+                {"role": str(role), "material_spec_id": material_spec_id.strip()}
+            )
+            seen_materials.add(identity)
+
+    raw_evidence_ids = value.get("evidence_ids")
+    if not isinstance(raw_evidence_ids, list) or not raw_evidence_ids:
+        raise ValueError(f"{label}.evidence_ids must be a non-empty array")
+    evidence_ids: list[str] = []
+    for index, raw_id in enumerate(raw_evidence_ids):
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise ValueError(f"{label}.evidence_ids[{index}] must be a non-empty CAD entity ID")
+        if raw_id.strip() not in evidence_ids:
+            evidence_ids.append(raw_id.strip())
+
+    projection_values: dict[str, str] = {}
+    for key in (
+        "projection_width_candidate_id",
+        "projection_length_candidate_id",
+        "projection_component_entity_id",
+        "projection_axis_basis",
+    ):
+        raw_projection_value = value.get(key)
+        if not isinstance(raw_projection_value, str) or not raw_projection_value.strip():
+            raise ValueError(f"{label}.{key} must be a non-empty audited value")
+        projection_values[key] = raw_projection_value.strip()
+
+    return {
+        "kind": "single_line_composite",
+        "assembly_type": "screen_with_glass",
+        "billing_basis": "whole_elevation_projection",
+        "required_material_roles": required_roles,
+        "included_materials": included_materials,
+        "basis": basis.strip(),
+        "evidence_ids": evidence_ids,
+        **projection_values,
+    }
+
+
 def _selected_candidates(value: Any, *, label: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be an object mapping roles to candidate IDs")
@@ -484,6 +607,12 @@ def _selected_candidates(value: Any, *, label: str) -> dict[str, Any]:
                 continue
             if normalized_role == "engineering_quantity":
                 result[normalized_role] = _engineering_quantity_selection(
+                    candidate,
+                    label=f"{label}[{role!r}]",
+                )
+                continue
+            if normalized_role == "composite_assembly":
+                result[normalized_role] = _composite_assembly_selection(
                     candidate,
                     label=f"{label}[{role!r}]",
                 )

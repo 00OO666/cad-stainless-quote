@@ -458,14 +458,25 @@ def _nearest_room(
 
 def _extract_leader_points(
     entity: CadEntity,
-) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None, bool]:
     geometry = entity.geometry
     target = None
     label = None
-    for key in ("leader_target", "target", "arrowhead", "arrow_point", "arrow", "tip"):
-        target = _point(geometry.get(key))
-        if target is not None:
-            break
+    raw_targets = geometry.get("leader_targets")
+    explicit_targets: list[tuple[float, float]] = []
+    if isinstance(raw_targets, Sequence) and not isinstance(raw_targets, (str, bytes)):
+        for raw_target in raw_targets:
+            parsed = _point(raw_target)
+            if parsed is not None and parsed not in explicit_targets:
+                explicit_targets.append(parsed)
+    target_is_ambiguous = len(explicit_targets) > 1
+    if len(explicit_targets) == 1:
+        target = explicit_targets[0]
+    elif not target_is_ambiguous:
+        for key in ("leader_target", "target", "arrowhead", "arrow_point", "arrow", "tip"):
+            target = _point(geometry.get(key))
+            if target is not None:
+                break
     for key in ("label_point", "landing", "landing_point", "text_location", "text_point"):
         label = _point(geometry.get(key))
         if label is not None:
@@ -479,13 +490,13 @@ def _extract_leader_points(
         if vertices:
             break
     if vertices:
-        if target is None:
+        if target is None and not target_is_ambiguous:
             target = vertices[0]
         if label is None:
             label = vertices[-1]
     elif label is None:
         label = entity_center(entity)
-    return label, target
+    return label, target, target_is_ambiguous
 
 
 def _bind_leader(
@@ -499,7 +510,7 @@ def _bind_leader(
     seed_ids = {entity.id for entity in seed_entities}
     candidates: list[tuple[float, str, CadEntity, tuple[float, float] | None]] = []
     for leader in leaders:
-        label, target = _extract_leader_points(leader)
+        label, target, target_is_ambiguous = _extract_leader_points(leader)
         own_annotation = leader.id in seed_ids or bool(
             seed_code
             in {
@@ -516,7 +527,12 @@ def _bind_leader(
             # For bare LEADER polylines, the endpoint nearest the annotation is
             # the landing; the opposite endpoint is the arrow target.
             vertices = leader.geometry.get("vertices") or leader.geometry.get("points")
-            if not own_annotation and isinstance(vertices, Sequence) and len(vertices) >= 2:
+            if (
+                not own_annotation
+                and not target_is_ambiguous
+                and isinstance(vertices, Sequence)
+                and len(vertices) >= 2
+            ):
                 points = [point for item in vertices if (point := _point(item)) is not None]
                 if len(points) >= 2 and anchor is not None:
                     target = max(points[0], points[-1], key=lambda point: _distance(anchor, point))

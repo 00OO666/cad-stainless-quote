@@ -313,8 +313,52 @@ def _effective_export_items(
 ) -> list[TakeoffItem]:
     """Recalculate rows and require portable proof for every custom formula."""
 
-    proved_targets: set[tuple[str, str, str, str]] = set()
+    material_evidence_rows: dict[str, set[int]] = {}
+    material_evidence_components: dict[str, set[str]] = {}
+    for row_index, source in enumerate(items):
+        assembly = source.composite_assembly
+        if assembly is None:
+            continue
+        owner = source.component_id or f"<missing-component:row-{row_index + 2}>"
+        for reference in assembly.included_materials:
+            for evidence_id in reference.evidence_ids:
+                normalized_id = evidence_id.strip()
+                if not normalized_id:
+                    continue
+                material_evidence_rows.setdefault(normalized_id, set()).add(row_index)
+                material_evidence_components.setdefault(normalized_id, set()).add(owner)
+
+    # Treat every component-to-material edge as an ownership declaration, not
+    # only PASS edges.  Otherwise a forged REVIEW/malformed proof edge could
+    # hide that the same CAD entity was claimed by another component.
     for edge in edges:
+        if edge.relation != "component_to_material":
+            continue
+        owner = edge.source_id.strip() or "<missing-edge-component>"
+        for value in edge.basis:
+            if not value.startswith("evidence:"):
+                continue
+            evidence_id = value.removeprefix("evidence:").strip()
+            if evidence_id:
+                material_evidence_components.setdefault(evidence_id, set()).add(owner)
+
+    duplicate_material_evidence: dict[int, set[str]] = {}
+    for evidence_id, row_indexes in material_evidence_rows.items():
+        component_owners = material_evidence_components.get(evidence_id, set())
+        if len(row_indexes) <= 1 and len(component_owners) <= 1:
+            continue
+        for row_index in row_indexes:
+            duplicate_material_evidence.setdefault(row_index, set()).add(evidence_id)
+
+    proved_targets: set[tuple[str, str, str, str]] = set()
+    proved_materials: dict[tuple[str, str, str, str], set[str]] = {}
+    proved_dimensions: set[tuple[str, str]] = set()
+    for edge in edges:
+        if (
+            edge.relation == "component_to_dimension"
+            and _enum_value(edge.status) == "PASS"
+        ):
+            proved_dimensions.add((edge.source_id, edge.target_id))
         if (
             edge.relation == "component_to_engineering_quantity_evidence"
             and _enum_value(edge.status) == "PASS"
@@ -333,9 +377,28 @@ def _effective_export_items(
                 proved_targets.add(
                     (edge.source_id, edge.target_id, expressions[0], bases[0])
                 )
+        if edge.relation == "component_to_material" and _enum_value(edge.status) == "PASS":
+            roles = [
+                value.removeprefix("role:")
+                for value in edge.basis
+                if value.startswith("role:")
+            ]
+            codes = [
+                value.removeprefix("material_code:")
+                for value in edge.basis
+                if value.startswith("material_code:")
+            ]
+            evidence_ids = {
+                value.removeprefix("evidence:")
+                for value in edge.basis
+                if value.startswith("evidence:")
+            }
+            if len(roles) == 1 and len(codes) == 1 and evidence_ids:
+                key = (edge.source_id, edge.target_id, roles[0], codes[0])
+                proved_materials.setdefault(key, set()).update(evidence_ids)
 
     effective: list[TakeoffItem] = []
-    for source in items:
+    for row_index, source in enumerate(items):
         item = calculate_item(source)
         if item.engineering_quantity_expression and _status_text(item) != "BLOCK":
             proof_identity = (
@@ -368,6 +431,88 @@ def _effective_export_items(
                         "amount": None,
                     }
                 )
+        assembly = item.composite_assembly
+        if assembly is not None:
+            duplicate_ids = sorted(duplicate_material_evidence.get(row_index, set()))
+            if duplicate_ids:
+                detail = "复合材料证据重复占用：" + "，".join(duplicate_ids)
+                existing_note = item.note or ""
+                item = item.model_copy(
+                    update={
+                        "status": (
+                            ReviewStatus.BLOCK
+                            if _status_text(item) == "BLOCK"
+                            else ReviewStatus.REVIEW
+                        ),
+                        "note": "；".join(
+                            value for value in (existing_note, detail) if value
+                        ),
+                        "unit_price": None,
+                        "price_entry_id": None,
+                        "amount": None,
+                    }
+                )
+            missing_material_proof: list[str] = []
+            for label, candidate_id in (
+                ("整樘投影宽轴", assembly.projection_width_candidate_id),
+                ("整樘投影长轴", assembly.projection_length_candidate_id),
+            ):
+                if (
+                    not item.component_id
+                    or not candidate_id
+                    or (item.component_id, candidate_id) not in proved_dimensions
+                ):
+                    missing_material_proof.append(label)
+            if (
+                not assembly.projection_axis_basis
+                or not assembly.projection_axis_evidence_ids
+                or not assembly.projection_component_entity_id
+                or assembly.projection_component_entity_id
+                not in assembly.projection_axis_evidence_ids
+            ):
+                missing_material_proof.append("整樘投影轴CAD依据")
+            if not any(
+                reference.role == "glass_infill"
+                for reference in assembly.included_materials
+            ):
+                missing_material_proof.append("glass_infill")
+            for reference in assembly.included_materials:
+                proof_key = (
+                    item.component_id or "",
+                    reference.material_spec_id,
+                    reference.role,
+                    reference.material_code,
+                )
+                proved_evidence = proved_materials.get(proof_key, set())
+                if (
+                    _enum_value(reference.status) != "PASS"
+                    or not reference.evidence_ids
+                    or not set(reference.evidence_ids).issubset(proved_evidence)
+                ):
+                    missing_material_proof.append(
+                        f"{reference.role}:{reference.material_code or reference.material_spec_id}"
+                    )
+            if not item.component_id or not assembly.included_materials:
+                missing_material_proof.append("复合材料构件绑定")
+            if missing_material_proof:
+                detail = "缺少PASS复合材料证据边：" + "，".join(
+                    sorted(set(missing_material_proof))
+                )
+                existing_note = item.note or ""
+                downgraded_status = (
+                    ReviewStatus.BLOCK
+                    if _status_text(item) == "BLOCK"
+                    else ReviewStatus.REVIEW
+                )
+                item = item.model_copy(
+                    update={
+                        "status": downgraded_status,
+                        "note": "；".join(value for value in (existing_note, detail) if value),
+                        "unit_price": None,
+                        "price_entry_id": None,
+                        "amount": None,
+                    }
+                )
         effective.append(item)
     return effective
 
@@ -394,13 +539,44 @@ def _quantity_formula(
 
 def _quote_note(item: TakeoffItem) -> str:
     notes = [f"[{_status_text(item)}]"]
-    reasons = list(dict.fromkeys(value for value in (item.note, item.block_reason) if value))
+    composite_note = None
+    if item.composite_assembly is not None:
+        glass_names = [
+            f"{reference.material_code}{reference.material_name}"
+            for reference in item.composite_assembly.included_materials
+            if reference.role == "glass_infill"
+        ]
+        included_glass = "、".join(glass_names) or "玻璃材料待确认"
+        composite_note = (
+            f"含{included_glass}；不锈钢框架与玻璃不拆分，整樘按立面投影面积计量"
+        )
+    reasons = list(
+        dict.fromkeys(
+            value for value in (composite_note, item.note, item.block_reason) if value
+        )
+    )
     if reasons:
         reason = "；".join(reasons)
         if len(reason) > 260:
             reason = f"{reason[:260]}…详见“待确认”表"
         notes.append(reason)
     return "；".join(notes)
+
+
+def _material_display(item: TakeoffItem) -> str | None:
+    if item.composite_assembly is None:
+        return item.material
+    primary = (
+        f"{item.mt_code}｜{item.material}"
+        if item.material
+        else item.mt_code
+    )
+    included = [
+        f"{reference.material_code}｜{reference.material_name}"
+        for reference in item.composite_assembly.included_materials
+        if reference.material_code or reference.material_name
+    ]
+    return "；".join([primary, *included])
 
 
 def _write_quote_sheet(workbook: Any, items: list[TakeoffItem]) -> dict[str, Any]:
@@ -509,7 +685,7 @@ def _write_quote_sheet(workbook: Any, items: list[TakeoffItem]) -> dict[str, Any
             item.sequence,
             item.name,
             item.mt_code,
-            item.material,
+            _material_display(item),
             item.plan_location,
             item.elevation,
             item.detail,

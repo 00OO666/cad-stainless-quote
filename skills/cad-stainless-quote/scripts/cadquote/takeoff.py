@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from itertools import groupby
 from typing import Any, TypeVar
 
 from .calculation import (
@@ -19,9 +20,12 @@ from .calculation import (
     evaluate_numeric_expression,
     infer_unit,
 )
+from .materials import DEFAULT_AUXILIARY_CODE_FAMILIES, find_material_codes, normalize_text
 from .models import (
     CadEntity,
     ComponentInstance,
+    ComponentMaterialRef,
+    CompositeAssembly,
     EvidenceEdge,
     MaterialSpec,
     MeasurementCandidate,
@@ -150,6 +154,35 @@ def _safe_dimension_value(entity: CadEntity) -> tuple[str, float] | None:
     return str(numeric_value), float(numeric_value)
 
 
+def _dimension_axis_and_endpoints(
+    entity: CadEntity,
+) -> tuple[str, tuple[float, float], tuple[float, float]] | None:
+    """Return an axis only for a native, nearly orthogonal dimension span."""
+
+    def point(value: Any) -> tuple[float, float] | None:
+        if (
+            not isinstance(value, Sequence)
+            or isinstance(value, (str, bytes))
+            or len(value) < 2
+        ):
+            return None
+        try:
+            x, y = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+        return (x, y) if math.isfinite(x) and math.isfinite(y) else None
+
+    first = point(entity.geometry.get("defpoint2"))
+    second = point(entity.geometry.get("defpoint3"))
+    if first is None or second is None:
+        return None
+    dx = abs(second[0] - first[0])
+    dy = abs(second[1] - first[1])
+    if max(dx, dy) <= 1e-9 or min(dx, dy) > max(dx, dy) * 0.02:
+        return None
+    return ("width" if dx > dy else "length", first, second)
+
+
 def _stable_id(prefix: str, *parts: object) -> str:
     canonical = json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
     return f"{prefix}:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:24]}"
@@ -237,6 +270,19 @@ class _MeasurementFact:
             self.entity.id,
             self.raw_value,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _RankedMeasurementFact:
+    """Lightweight component-local fact retained until the per-role top-k is known."""
+
+    fact: _MeasurementFact
+    sheet_id: str
+    distance: float | None
+    confidence: float
+    detail_anchor_ids: tuple[str, ...]
+    is_fallback: bool
+    is_structured_fallback: bool
 
 
 def _compact_annotation_token(text: str) -> str:
@@ -535,6 +581,26 @@ class _MeasurementIndex:
                         identity=(entity.id, role, raw_value),
                     )
                 )
+                axis = _dimension_axis_and_endpoints(entity)
+                if (
+                    sheet is not None
+                    and sheet.kind in {"elevation", "door"}
+                    and axis is not None
+                    and axis[0] == "width"
+                ):
+                    facts_by_sheet[sheet_id].append(
+                        _MeasurementFact(
+                            entity=entity,
+                            role="width",
+                            raw_value=raw_value,
+                            numeric_value=numeric_value,
+                            unit="mm",
+                            basis_label="cad_horizontal_dimension",
+                            confidence_base=0.64,
+                            identity=(entity.id, "width", raw_value),
+                            basis_details=("dimension_axis:horizontal",),
+                        )
+                    )
 
             for entity in text_by_sheet.get(sheet_id, ()):
                 text = entity.text or ""
@@ -1520,7 +1586,7 @@ def collect_measurement_candidates(
         points[sheet_id].extend(detail_points)
         detail_anchor_ids_by_sheet[sheet_id] = [value.id for value in detail_group]
     relevant_sheet_ids = set(elevation_sheet_ids) | set(detail_anchor_ids_by_sheet)
-    output: list[MeasurementCandidate] = []
+    rankable_facts: list[_RankedMeasurementFact] = []
 
     for sheet_id in sorted(relevant_sheet_ids):
         sheet = sheet_by_id.get(sheet_id)
@@ -1587,27 +1653,8 @@ def collect_measurement_candidates(
         for fact in selected_facts.values():
             entity = fact.entity
             distance = _proximity(entity, sheet_points)
-            evidence_entity_ids = fact.evidence_entity_ids or (entity.id,)
-            basis = [
-                *(f"entity:{entity_id}" for entity_id in evidence_entity_ids),
-                f"sheet:{sheet_id}",
-                *fact.basis_details,
-            ]
-            detail_anchor_ids = detail_anchor_ids_by_sheet.get(sheet_id, ())
-            if detail_anchor_ids:
-                basis.append("component_local_detail_anchor")
-                basis.extend(
-                    f"detail_occurrence:{occurrence_id}"
-                    for occurrence_id in detail_anchor_ids
-                )
-            if distance is not None:
-                basis.append(f"anchor_distance:{distance:.3f}")
             is_fallback = fact.identity in fallback_identities
-            if is_fallback:
-                basis.append("linked_sheet_labeled_fallback")
             is_structured_fallback = fact.identity in structured_fallback_identities
-            if is_structured_fallback:
-                basis.append("linked_sheet_structured_attribute_fallback")
             confidence = _candidate_confidence(
                 distance,
                 radius,
@@ -1617,52 +1664,100 @@ def collect_measurement_candidates(
                 confidence = min(confidence, 0.52)
             if is_structured_fallback:
                 confidence = min(confidence, 0.54)
-            output.append(
-                MeasurementCandidate(
-                    id=fact.candidate_id(component.id),
-                    component_id=component.id,
-                    role=fact.role,
-                    raw_value=fact.raw_value,
-                    numeric_value=fact.numeric_value,
-                    unit=fact.unit,
-                    source_file_id=entity.source_file_id,
+            rankable_facts.append(
+                _RankedMeasurementFact(
+                    fact=fact,
                     sheet_id=sheet_id,
-                    entity_ids=list(evidence_entity_ids),
                     distance=distance,
-                    basis=[*basis, fact.basis_label],
                     confidence=confidence,
-                    status=ReviewStatus.REVIEW,
+                    detail_anchor_ids=tuple(
+                        detail_anchor_ids_by_sheet.get(sheet_id, ())
+                    ),
+                    is_fallback=is_fallback,
+                    is_structured_fallback=is_structured_fallback,
                 )
             )
     # A linked sheet can contain hundreds or thousands of unrelated dimensions.
     # Keeping every one for every MT occurrence creates a quadratic review pack
     # and makes a human choice less reliable.  Preserve the nearest candidates
     # per role, mark truncation explicitly, and never auto-PASS a truncated set.
-    by_role: dict[str, list[MeasurementCandidate]] = defaultdict(list)
-    for candidate in output:
-        by_role[candidate.role].append(candidate)
+    by_role: dict[str, list[_RankedMeasurementFact]] = defaultdict(list)
+    for selection in rankable_facts:
+        by_role[selection.fact.role].append(selection)
     bounded: list[MeasurementCandidate] = []
     for role in sorted(by_role):
-        ranked = sorted(
-            by_role[role],
-            key=lambda value: (
+        def rank_prefix(value: _RankedMeasurementFact) -> tuple[bool, float, float]:
+            return (
                 value.distance is None,
                 value.distance if value.distance is not None else float("inf"),
                 -value.confidence,
-                value.id,
-            ),
-        )
+            )
+
+        candidate_id_cache: dict[int, str] = {}
+
+        def ranked_candidate_id(
+            value: _RankedMeasurementFact,
+            cache: dict[int, str] = candidate_id_cache,
+        ) -> str:
+            identity = id(value)
+            if identity not in cache:
+                cache[identity] = value.fact.candidate_id(component.id)
+            return cache[identity]
+
+        ranked: list[_RankedMeasurementFact] = []
+        prefix_ranked = sorted(by_role[role], key=rank_prefix)
+        for _, tied_values in groupby(prefix_ranked, key=rank_prefix):
+            tied_group = list(tied_values)
+            if len(tied_group) > 1:
+                tied_group.sort(key=ranked_candidate_id)
+            ranked.extend(tied_group)
         total = len(ranked)
-        for rank, candidate in enumerate(
+        for rank, selection in enumerate(
             ranked[:_MAX_MEASUREMENT_CANDIDATES_PER_ROLE],
             start=1,
         ):
-            basis = [*candidate.basis, f"candidate_rank:{rank}/{total}"]
+            fact = selection.fact
+            entity = fact.entity
+            evidence_entity_ids = fact.evidence_entity_ids or (entity.id,)
+            basis = [
+                *(f"entity:{entity_id}" for entity_id in evidence_entity_ids),
+                f"sheet:{selection.sheet_id}",
+                *fact.basis_details,
+            ]
+            if selection.detail_anchor_ids:
+                basis.append("component_local_detail_anchor")
+                basis.extend(
+                    f"detail_occurrence:{occurrence_id}"
+                    for occurrence_id in selection.detail_anchor_ids
+                )
+            if selection.distance is not None:
+                basis.append(f"anchor_distance:{selection.distance:.3f}")
+            if selection.is_fallback:
+                basis.append("linked_sheet_labeled_fallback")
+            if selection.is_structured_fallback:
+                basis.append("linked_sheet_structured_attribute_fallback")
+            basis.extend([fact.basis_label, f"candidate_rank:{rank}/{total}"])
             if total > _MAX_MEASUREMENT_CANDIDATES_PER_ROLE:
                 basis.append(
                     f"candidate_pool_truncated:{total}->{_MAX_MEASUREMENT_CANDIDATES_PER_ROLE}"
                 )
-            bounded.append(candidate.model_copy(update={"basis": basis}))
+            bounded.append(
+                MeasurementCandidate(
+                    id=ranked_candidate_id(selection),
+                    component_id=component.id,
+                    role=fact.role,
+                    raw_value=fact.raw_value,
+                    numeric_value=fact.numeric_value,
+                    unit=fact.unit,
+                    source_file_id=entity.source_file_id,
+                    sheet_id=selection.sheet_id,
+                    entity_ids=list(evidence_entity_ids),
+                    distance=selection.distance,
+                    basis=basis,
+                    confidence=selection.confidence,
+                    status=ReviewStatus.REVIEW,
+                )
+            )
     return sorted(bounded, key=lambda value: (value.role, -value.confidence, value.id))
 
 
@@ -2686,6 +2781,932 @@ def _material_for_component(
     return material, reasons
 
 
+def _component_evidence_points(
+    component: ComponentInstance,
+    *,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    entity_by_id: Mapping[str, CadEntity],
+    selected: Mapping[str, MeasurementCandidate | None] | None = None,
+) -> tuple[
+    dict[str, list[tuple[float, float]]],
+    set[tuple[str, ...]],
+]:
+    points = _component_points(component, occurrence_by_id)
+    parent_identities: set[tuple[str, ...]] = set()
+    entity_ids = {
+        entity_id
+        for occurrence_id in [
+            *component.plan_occurrence_ids,
+            *component.elevation_occurrence_ids,
+        ]
+        if occurrence_id in occurrence_by_id
+        for entity_id in occurrence_by_id[occurrence_id].entity_ids
+    }
+    if selected is not None:
+        entity_ids.update(
+            entity_id
+            for candidate in selected.values()
+            if candidate is not None
+            for entity_id in candidate.entity_ids
+        )
+    for entity_id in entity_ids:
+        entity = entity_by_id.get(entity_id)
+        if entity is None:
+            continue
+        parent_identity = _entity_parent_insert_identity(entity)
+        if parent_identity is not None:
+            parent_identities.add(parent_identity)
+        if entity.sheet_id and (point := _center(entity)) is not None:
+            points[entity.sheet_id].append(point)
+    return points, parent_identities
+
+
+def _entity_parent_insert_identity(entity: CadEntity) -> tuple[str, ...] | None:
+    parent_id = str(entity.geometry.get("parent_insert_id") or "").strip()
+    if parent_id:
+        return ("id", parent_id)
+    parent_handle = str(entity.geometry.get("parent_insert_handle") or "").strip()
+    if parent_handle:
+        return (
+            "handle",
+            entity.source_file_id,
+            entity.sheet_id or "",
+            parent_handle,
+        )
+    return None
+
+
+def _insert_self_identities(entity: CadEntity) -> set[tuple[str, ...]]:
+    if entity.entity_type != "INSERT":
+        return set()
+    identities: set[tuple[str, ...]] = {("id", entity.id)}
+    insert_handle = str(entity.handle or "").strip()
+    if insert_handle:
+        identities.add(
+            (
+                "handle",
+                entity.source_file_id,
+                entity.sheet_id or "",
+                insert_handle,
+            )
+        )
+    return identities
+
+
+def _component_bound_insert_entity_ids(
+    component: ComponentInstance,
+    *,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    entity_by_id: Mapping[str, CadEntity],
+    insert_ids_by_scoped_handle: Mapping[
+        tuple[str, str | None, str], Sequence[str]
+    ]
+    | None = None,
+) -> set[str]:
+    """Return INSERTs explicitly present in, or parenting, the MT occurrence evidence."""
+
+    direct_insert_ids: set[str] = set()
+    fallback_parent_identities: set[tuple[str, str | None, str]] = set()
+    for occurrence_id in [
+        *component.plan_occurrence_ids,
+        *component.elevation_occurrence_ids,
+    ]:
+        occurrence = occurrence_by_id.get(occurrence_id)
+        if occurrence is None:
+            continue
+        for entity_id in occurrence.entity_ids:
+            entity = entity_by_id.get(entity_id)
+            if entity is None:
+                continue
+            if entity.entity_type == "INSERT":
+                direct_insert_ids.add(entity.id)
+            parent_id = str(entity.geometry.get("parent_insert_id") or "").strip()
+            if parent_id:
+                parent_entity = entity_by_id.get(parent_id)
+                if parent_entity is not None and parent_entity.entity_type == "INSERT":
+                    direct_insert_ids.add(parent_id)
+                continue
+            parent_handle = str(
+                entity.geometry.get("parent_insert_handle") or ""
+            ).strip()
+            if parent_handle:
+                fallback_parent_identities.add(
+                    (entity.source_file_id, entity.sheet_id, parent_handle)
+                )
+    for source_file_id, sheet_id, handle in fallback_parent_identities:
+        matches = (
+            list(
+                insert_ids_by_scoped_handle.get(
+                    (source_file_id, sheet_id, handle), ()
+                )
+            )
+            if insert_ids_by_scoped_handle is not None
+            else [
+                entity.id
+                for entity in entity_by_id.values()
+                if entity.entity_type == "INSERT"
+                and entity.source_file_id == source_file_id
+                and entity.sheet_id == sheet_id
+                and str(entity.handle or "").strip() == handle
+            ]
+        )
+        if len(matches) == 1:
+            direct_insert_ids.add(matches[0])
+    return direct_insert_ids
+
+
+def _component_local_limit(sheet: Sheet | None) -> float:
+    if sheet is None or sheet.bbox is None:
+        return 500.0
+    width = max(sheet.bbox[2] - sheet.bbox[0], 1.0)
+    height = max(sheet.bbox[3] - sheet.bbox[1], 1.0)
+    return max(5.0, min(500.0, math.hypot(width, height) * 0.02))
+
+
+def _material_evidence_points(entity: CadEntity) -> list[tuple[float, float]]:
+    """Return the physical target of one material annotation.
+
+    A multi-arrow annotation is intentionally unusable as single-component
+    proof.  Its label centre may be readable, but it does not establish which
+    arrow owns the material.
+    """
+
+    raw_targets = entity.geometry.get("leader_targets")
+    if isinstance(raw_targets, Sequence) and not isinstance(raw_targets, (str, bytes)):
+        targets: list[tuple[float, float]] = []
+        for raw in raw_targets:
+            point = _center_from_value(raw)
+            if point is not None and point not in targets:
+                targets.append(point)
+        if len(targets) > 1:
+            return []
+        if len(targets) == 1:
+            return targets
+    leader_target = _center_from_value(entity.geometry.get("leader_target"))
+    if leader_target is not None:
+        return [leader_target]
+    center = _center(entity)
+    return [center] if center is not None else []
+
+
+def _component_material_evidence_score(
+    entity: CadEntity,
+    *,
+    points_by_sheet: Mapping[str, Sequence[tuple[float, float]]],
+    parent_handles: set[tuple[str, ...]],
+    sheet_by_id: Mapping[str, Sheet],
+) -> tuple[int, float] | None:
+    evidence_points = _material_evidence_points(entity)
+    if not evidence_points:
+        return None
+    parent_identity = _entity_parent_insert_identity(entity)
+    if parent_identity is not None and parent_identity in parent_handles:
+        return (0, 0.0)
+    if not entity.sheet_id:
+        return None
+    component_points = points_by_sheet.get(entity.sheet_id, ())
+    if not component_points:
+        return None
+    distance = min(
+        _distance(evidence_point, component_point)
+        for evidence_point in evidence_points
+        for component_point in component_points
+    )
+    if distance > _component_local_limit(sheet_by_id.get(entity.sheet_id)):
+        return None
+    return (1, distance)
+
+
+def _component_local_evidence(
+    entity: CadEntity,
+    *,
+    points_by_sheet: Mapping[str, Sequence[tuple[float, float]]],
+    parent_handles: set[tuple[str, ...]],
+    sheet_by_id: Mapping[str, Sheet],
+) -> bool:
+    return _component_material_evidence_score(
+        entity,
+        points_by_sheet=points_by_sheet,
+        parent_handles=parent_handles,
+        sheet_by_id=sheet_by_id,
+    ) is not None
+
+
+def _unique_material_evidence_owner(
+    entity: CadEntity,
+    *,
+    component_contexts: Mapping[
+        str,
+        tuple[
+            Mapping[str, Sequence[tuple[float, float]]],
+            set[tuple[str, ...]],
+        ],
+    ],
+    sheet_by_id: Mapping[str, Sheet],
+) -> str | None:
+    scores = [
+        (score, candidate_component_id)
+        for candidate_component_id, (points_by_sheet, parent_handles) in component_contexts.items()
+        if (
+            score := _component_material_evidence_score(
+                entity,
+                points_by_sheet=points_by_sheet,
+                parent_handles=parent_handles,
+                sheet_by_id=sheet_by_id,
+            )
+        )
+        is not None
+    ]
+    if not scores:
+        return None
+    best_rank = min(score[0] for score, _ in scores)
+    ranked = [
+        (score[1], candidate_component_id)
+        for score, candidate_component_id in scores
+        if score[0] == best_rank
+    ]
+    best_distance = min(distance for distance, _ in ranked)
+    epsilon = max(1e-6, abs(best_distance) * 1e-9)
+    owners = {
+        candidate_component_id
+        for distance, candidate_component_id in ranked
+        if abs(distance - best_distance) <= epsilon
+    }
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+class _MaterialEvidenceOwnerIndex:
+    """Resolve unique material owners through parent and per-sheet spatial indexes."""
+
+    __slots__ = (
+        "_component_points_by_sheet",
+        "_local_limits",
+        "_parent_components",
+        "_point_grids",
+    )
+
+    def __init__(
+        self,
+        *,
+        component_contexts: Mapping[
+            str,
+            tuple[
+                Mapping[str, Sequence[tuple[float, float]]],
+                set[tuple[str, ...]],
+            ],
+        ],
+        sheet_by_id: Mapping[str, Sheet],
+    ) -> None:
+        self._parent_components: dict[tuple[str, ...], set[str]] = defaultdict(set)
+        self._component_points_by_sheet: dict[
+            str, dict[str, list[tuple[float, float]]]
+        ] = defaultdict(lambda: defaultdict(list))
+        for component_id, (points_by_sheet, parent_identities) in (
+            component_contexts.items()
+        ):
+            for parent_identity in parent_identities:
+                self._parent_components[parent_identity].add(component_id)
+            for sheet_id, points in points_by_sheet.items():
+                self._component_points_by_sheet[sheet_id][component_id].extend(points)
+
+        self._local_limits = {
+            sheet_id: _component_local_limit(sheet_by_id.get(sheet_id))
+            for sheet_id in self._component_points_by_sheet
+        }
+        self._point_grids: dict[str, _PointGrid] = {}
+        for sheet_id, component_points in self._component_points_by_sheet.items():
+            grid = _PointGrid(self._local_limits[sheet_id])
+            for component_id, points in component_points.items():
+                for point in points:
+                    grid.add((component_id, point), point)
+            self._point_grids[sheet_id] = grid
+
+    def owner(self, entity: CadEntity) -> str | None:
+        evidence_points = _material_evidence_points(entity)
+        if not evidence_points:
+            return None
+        if entity.entity_type == "INSERT":
+            self_id_owners = self._parent_components.get(("id", entity.id), set())
+            if self_id_owners:
+                return (
+                    next(iter(self_id_owners)) if len(self_id_owners) == 1 else None
+                )
+            self_handle_identities = _insert_self_identities(entity) - {
+                ("id", entity.id)
+            }
+            self_handle_owners = {
+                component_id
+                for identity in self_handle_identities
+                for component_id in self._parent_components.get(identity, set())
+            }
+            if self_handle_owners:
+                return (
+                    next(iter(self_handle_owners))
+                    if len(self_handle_owners) == 1
+                    else None
+                )
+        parent_identity = _entity_parent_insert_identity(entity)
+        if parent_identity is not None:
+            parent_owners = self._parent_components.get(parent_identity, set())
+            if parent_owners:
+                return next(iter(parent_owners)) if len(parent_owners) == 1 else None
+        if not entity.sheet_id:
+            return None
+        grid = self._point_grids.get(entity.sheet_id)
+        local_limit = self._local_limits.get(entity.sheet_id)
+        if grid is None or local_limit is None:
+            return None
+
+        distances: dict[str, float] = {}
+        for evidence_point in evidence_points:
+            for component_id, component_point in grid.within(
+                evidence_point, local_limit
+            ):
+                distance = _distance(evidence_point, component_point)
+                previous = distances.get(component_id)
+                if previous is None or distance < previous:
+                    distances[component_id] = distance
+        if not distances:
+            return None
+        best_distance = min(distances.values())
+        epsilon = max(1e-6, abs(best_distance) * 1e-9)
+        owners = {
+            component_id
+            for component_id, distance in distances.items()
+            if abs(distance - best_distance) <= epsilon
+        }
+        return next(iter(owners)) if len(owners) == 1 else None
+
+
+def _component_has_unique_material_evidence_ownership(
+    entity: CadEntity,
+    *,
+    component_id: str,
+    component_contexts: Mapping[
+        str,
+        tuple[
+            Mapping[str, Sequence[tuple[float, float]]],
+            set[tuple[str, ...]],
+        ],
+    ],
+    sheet_by_id: Mapping[str, Sheet],
+) -> bool:
+    return (
+        _unique_material_evidence_owner(
+            entity,
+            component_contexts=component_contexts,
+            sheet_by_id=sheet_by_id,
+        )
+        == component_id
+    )
+
+
+def _center_from_value(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) < 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    return (x, y) if math.isfinite(x) and math.isfinite(y) else None
+
+
+def _evidence_matches_material(entity: CadEntity, material: MaterialSpec) -> bool:
+    text = entity.text or ""
+    material_family = (
+        material.material_code_family or material.mt_code.rsplit("-", 1)[0]
+    )
+    codes = {
+        match.normalized_code
+        for match in find_material_codes(
+            text,
+            stainless_families=(),
+            review_families={material_family},
+        )
+    }
+    selected_codes = find_material_codes(
+        material.mt_code,
+        stainless_families=(),
+        review_families={material_family},
+    )
+    selected_code = (
+        selected_codes[0].normalized_code if len(selected_codes) == 1 else ""
+    )
+    # One annotation that names several glass codes is a schedule/cross-note,
+    # not unambiguous proof that the selected code belongs to this physical
+    # component.  Require exactly one normalized auxiliary code.
+    if selected_code and codes == {selected_code}:
+        return True
+    # A generic name such as “艺术玻璃” can describe several different glass
+    # specifications.  The business rule requires the glass number as well as
+    # its name, so name-only evidence can raise a REVIEW candidate but can
+    # never prove one selected MaterialSpec.
+    return False
+
+
+def _potential_screen_glass_confirmation(
+    component: ComponentInstance,
+    *,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    entity_by_id: Mapping[str, CadEntity],
+    glass_materials: Sequence[MaterialSpec],
+    owned_auxiliary_entities: Mapping[tuple[str, str], Sequence[CadEntity]],
+    owned_unresolved_glass_entities: Mapping[str, Sequence[CadEntity]],
+) -> dict[str, Any] | None:
+    component_labels = [
+        component.name or "",
+        *(
+            occurrence_by_id[occurrence_id].component_hint or ""
+            for occurrence_id in [
+                *component.plan_occurrence_ids,
+                *component.elevation_occurrence_ids,
+            ]
+            if occurrence_id in occurrence_by_id
+        ),
+    ]
+    if not any(re.search(r"屏风|隔断", label) for label in component_labels):
+        return None
+    included_materials: list[dict[str, str]] = []
+    evidence_ids: list[str] = []
+    for material in sorted(glass_materials, key=lambda value: value.id):
+        local_entities = owned_auxiliary_entities.get(
+            (component.id, material.mt_code), ()
+        )
+        if not local_entities:
+            continue
+        included_materials.append(
+            {"role": "glass_infill", "material_spec_id": material.id}
+        )
+        evidence_ids.extend(entity.id for entity in local_entities)
+    unresolved_local_entities = owned_unresolved_glass_entities.get(component.id, ())
+    evidence_ids.extend(entity.id for entity in unresolved_local_entities)
+    if not included_materials and not unresolved_local_entities:
+        return None
+    return {
+        "kind": "single_line_composite",
+        "assembly_type": "screen_with_glass",
+        "billing_basis": "whole_elevation_projection",
+        "required_material_roles": ["glass_infill"],
+        "included_materials": included_materials,
+        "basis": "CAD发现构件局部玻璃材料证据，等待审核确认复合总成",
+        "evidence_ids": sorted(set(evidence_ids)),
+    }
+
+
+def _projection_candidate_covers_component_entity(
+    candidate: MeasurementCandidate | None,
+    *,
+    axis: str,
+    component_entity: CadEntity | None,
+    entity_by_id: Mapping[str, CadEntity],
+) -> bool:
+    """Prove a projected axis from native DIM endpoints over one reviewed INSERT bbox."""
+
+    if (
+        candidate is None
+        or candidate.numeric_value is None
+        or component_entity is None
+        or component_entity.entity_type != "INSERT"
+        or component_entity.bbox is None
+    ):
+        return False
+    bbox = component_entity.bbox
+    expected_span = (bbox[2] - bbox[0]) if axis == "width" else (bbox[3] - bbox[1])
+    if expected_span <= 0:
+        return False
+    tolerance = max(2.0, abs(expected_span) * 0.02)
+    if abs(candidate.numeric_value - expected_span) > tolerance:
+        return False
+    for entity_id in candidate.entity_ids:
+        entity = entity_by_id.get(entity_id)
+        if (
+            entity is None
+            or entity.entity_type not in _DIMENSION_TYPES
+            or entity.sheet_id != component_entity.sheet_id
+        ):
+            continue
+        axis_data = _dimension_axis_and_endpoints(entity)
+        if axis_data is None or axis_data[0] != axis:
+            continue
+        _, first, second = axis_data
+        if axis == "width":
+            endpoints_match = (
+                abs(min(first[0], second[0]) - bbox[0]) <= tolerance
+                and abs(max(first[0], second[0]) - bbox[2]) <= tolerance
+                and bbox[1] - tolerance
+                <= (first[1] + second[1]) / 2
+                <= bbox[3] + tolerance
+            )
+        else:
+            endpoints_match = (
+                abs(min(first[1], second[1]) - bbox[1]) <= tolerance
+                and abs(max(first[1], second[1]) - bbox[3]) <= tolerance
+                and bbox[0] - tolerance
+                <= (first[0] + second[0]) / 2
+                <= bbox[2] + tolerance
+            )
+        if endpoints_match:
+            return True
+    return False
+
+
+def _material_evidence_targets_projection_component(
+    entity: CadEntity,
+    component_entity: CadEntity | None,
+) -> bool:
+    """Require material proof to hit the reviewed screen boundary or its block.
+
+    Nearest-anchor ownership separates competing annotations, but proximity by
+    itself does not prove that a glass callout belongs inside the confirmed
+    physical screen.  A PASS therefore also needs either the exact parent
+    INSERT identity or a unique leader target/text point inside that INSERT's
+    bbox.  The small tolerance covers CAD rounding without admitting an
+    adjacent label just outside a compact component.
+    """
+
+    if (
+        component_entity is None
+        or component_entity.entity_type != "INSERT"
+        or component_entity.bbox is None
+        or entity.source_file_id != component_entity.source_file_id
+        or entity.sheet_id != component_entity.sheet_id
+    ):
+        return False
+    component_identities: set[tuple[str, ...]] = {("id", component_entity.id)}
+    component_handle = str(component_entity.handle or "").strip()
+    if component_handle:
+        component_identities.add(
+            (
+                "handle",
+                component_entity.source_file_id,
+                component_entity.sheet_id or "",
+                component_handle,
+            )
+        )
+    if _entity_parent_insert_identity(entity) in component_identities:
+        return True
+
+    bbox = component_entity.bbox
+    diagonal = math.hypot(bbox[2] - bbox[0], bbox[3] - bbox[1])
+    tolerance = max(1e-6, min(2.0, diagonal * 0.005))
+    return any(
+        bbox[0] - tolerance <= point[0] <= bbox[2] + tolerance
+        and bbox[1] - tolerance <= point[1] <= bbox[3] + tolerance
+        for point in _material_evidence_points(entity)
+    )
+
+
+def _composite_assembly_confirmation(
+    value: Any,
+    *,
+    component: ComponentInstance,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    materials_by_id: Mapping[str, MaterialSpec],
+    entity_by_id: Mapping[str, CadEntity],
+    sheet_by_id: Mapping[str, Sheet],
+    selected: Mapping[str, MeasurementCandidate | None],
+    chain_sheet_ids: set[str],
+    material_evidence_owner_by_id: Mapping[str, str | None],
+    bound_insert_ids_by_component: Mapping[str, set[str]],
+    bound_insert_owners_by_entity_id: Mapping[str, set[str]],
+) -> tuple[CompositeAssembly | None, list[str], list[str]]:
+    """Resolve an audited single-row assembly without accepting free material text."""
+
+    if value is None:
+        return None, [], []
+    if not isinstance(value, Mapping):
+        return None, [], ["composite_assembly confirmation must be an object"]
+    allowed = {
+        "kind",
+        "assembly_type",
+        "billing_basis",
+        "required_material_roles",
+        "included_materials",
+        "basis",
+        "evidence_ids",
+        "projection_width_candidate_id",
+        "projection_length_candidate_id",
+        "projection_component_entity_id",
+        "projection_axis_basis",
+    }
+    review_reasons: list[str] = []
+    block_reasons: list[str] = []
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        block_reasons.append(
+            "composite_assembly confirmation has unsupported keys: " + ", ".join(unknown)
+        )
+    if value.get("kind") != "single_line_composite":
+        block_reasons.append("composite_assembly kind must be single_line_composite")
+    if value.get("assembly_type") != "screen_with_glass":
+        block_reasons.append("composite_assembly type must be screen_with_glass")
+    if value.get("billing_basis") != "whole_elevation_projection":
+        block_reasons.append(
+            "composite_assembly billing_basis must be whole_elevation_projection"
+        )
+    raw_basis = value.get("basis")
+    basis = raw_basis.strip() if isinstance(raw_basis, str) else ""
+    if not basis:
+        block_reasons.append("composite_assembly basis is missing")
+
+    raw_projection_width_id = value.get("projection_width_candidate_id")
+    raw_projection_length_id = value.get("projection_length_candidate_id")
+    raw_projection_component_id = value.get("projection_component_entity_id")
+    raw_projection_axis_basis = value.get("projection_axis_basis")
+    projection_width_id = (
+        raw_projection_width_id.strip()
+        if isinstance(raw_projection_width_id, str)
+        else ""
+    )
+    projection_length_id = (
+        raw_projection_length_id.strip()
+        if isinstance(raw_projection_length_id, str)
+        else ""
+    )
+    projection_component_id = (
+        raw_projection_component_id.strip()
+        if isinstance(raw_projection_component_id, str)
+        else ""
+    )
+    projection_axis_basis = (
+        raw_projection_axis_basis.strip()
+        if isinstance(raw_projection_axis_basis, str)
+        else ""
+    )
+    if not projection_width_id:
+        block_reasons.append(
+            "screen_with_glass requires an audited whole-elevation projection width"
+        )
+    if not projection_length_id:
+        block_reasons.append(
+            "screen_with_glass requires an audited whole-elevation projection length"
+        )
+    if not projection_component_id:
+        block_reasons.append(
+            "screen_with_glass requires a reviewed physical component INSERT entity"
+        )
+    if not projection_axis_basis:
+        block_reasons.append(
+            "screen_with_glass projection_axis_basis must explain the whole-elevation span"
+        )
+    selected_width = selected.get("width")
+    selected_length = selected.get("length")
+    if selected_width is None or projection_width_id != selected_width.id:
+        block_reasons.append(
+            "projection_width_candidate_id must match the selected width candidate"
+        )
+    if selected_length is None or projection_length_id != selected_length.id:
+        block_reasons.append(
+            "projection_length_candidate_id must match the selected length candidate"
+        )
+    projection_component_entity = entity_by_id.get(projection_component_id)
+    bound_projection_entity_ids = bound_insert_ids_by_component.get(component.id, set())
+    if projection_component_id and projection_component_entity is None:
+        block_reasons.append(
+            "projection_component_entity_id does not exist: " + projection_component_id
+        )
+    elif projection_component_entity is not None:
+        if projection_component_entity.id not in bound_projection_entity_ids:
+            block_reasons.append(
+                "projection component INSERT is not bound to the MT occurrence evidence"
+            )
+        if (
+            projection_component_entity.entity_type != "INSERT"
+            or projection_component_entity.bbox is None
+        ):
+            block_reasons.append(
+                "projection component proof must be a bounded INSERT entity"
+            )
+        if (
+            not projection_component_entity.sheet_id
+            or projection_component_entity.sheet_id not in chain_sheet_ids
+        ):
+            block_reasons.append(
+                "projection component proof is outside the selected chain"
+            )
+        if bound_insert_owners_by_entity_id.get(projection_component_entity.id, set()) != {
+            component.id
+        }:
+            block_reasons.append(
+                "projection component INSERT is not uniquely owned by the current component"
+            )
+    if not _projection_candidate_covers_component_entity(
+        selected_width,
+        axis="width",
+        component_entity=projection_component_entity,
+        entity_by_id=entity_by_id,
+    ):
+        block_reasons.append(
+            "projection width is not a native DIMENSION spanning the reviewed component bbox"
+        )
+    if not _projection_candidate_covers_component_entity(
+        selected_length,
+        axis="length",
+        component_entity=projection_component_entity,
+        entity_by_id=entity_by_id,
+    ):
+        block_reasons.append(
+            "projection length is not a native DIMENSION spanning the reviewed component bbox"
+        )
+    projection_axis_evidence_ids = sorted(
+        {
+            entity_id
+            for candidate in (selected_width, selected_length)
+            if candidate is not None
+            for entity_id in candidate.entity_ids
+        }
+    )
+    if projection_component_id:
+        projection_axis_evidence_ids.append(projection_component_id)
+        projection_axis_evidence_ids = sorted(set(projection_axis_evidence_ids))
+    if not projection_axis_evidence_ids:
+        block_reasons.append(
+            "screen_with_glass projection axes lack CAD entity evidence"
+        )
+
+    allowed_roles = {"glass_infill", "included_other"}
+    raw_required_roles = value.get("required_material_roles")
+    required_roles: list[str] = []
+    if not isinstance(raw_required_roles, list) or not raw_required_roles:
+        block_reasons.append(
+            "composite_assembly required_material_roles must be a non-empty array"
+        )
+    else:
+        for raw_role in raw_required_roles:
+            if raw_role not in allowed_roles:
+                block_reasons.append(
+                    f"composite_assembly has unsupported required role: {raw_role!r}"
+                )
+            elif raw_role not in required_roles:
+                required_roles.append(raw_role)
+    if "glass_infill" not in required_roles:
+        block_reasons.append(
+            "screen_with_glass required_material_roles must include glass_infill"
+        )
+
+    raw_evidence_ids = value.get("evidence_ids")
+    evidence_ids: list[str] = []
+    if not isinstance(raw_evidence_ids, list) or not raw_evidence_ids:
+        block_reasons.append("composite_assembly evidence_ids must be a non-empty array")
+    else:
+        for raw_id in raw_evidence_ids:
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                block_reasons.append(
+                    "composite_assembly evidence_ids contain an invalid CAD entity ID"
+                )
+                continue
+            entity_id = raw_id.strip()
+            if entity_id in evidence_ids:
+                continue
+            evidence_ids.append(entity_id)
+            entity = entity_by_id.get(entity_id)
+            if entity is None:
+                block_reasons.append(
+                    f"composite_assembly evidence entity does not exist: {entity_id}"
+                )
+            elif not entity.sheet_id or entity.sheet_id not in chain_sheet_ids:
+                block_reasons.append(
+                    "composite_assembly evidence entity is outside selected chain: "
+                    f"{entity_id} ({entity.sheet_id})"
+                )
+
+    raw_materials = value.get("included_materials", [])
+    included_materials: list[ComponentMaterialRef] = []
+    points_by_sheet, parent_handles = _component_evidence_points(
+        component,
+        occurrence_by_id=occurrence_by_id,
+        entity_by_id=entity_by_id,
+        selected=selected,
+    )
+    for bound_insert_id in bound_insert_ids_by_component.get(component.id, set()):
+        bound_insert_entity = entity_by_id.get(bound_insert_id)
+        if bound_insert_entity is not None:
+            parent_handles.update(_insert_self_identities(bound_insert_entity))
+    if not isinstance(raw_materials, list):
+        block_reasons.append("composite_assembly included_materials must be an array")
+        raw_materials = []
+    seen_materials: set[tuple[str, str]] = set()
+    for raw_material in raw_materials:
+        if not isinstance(raw_material, Mapping):
+            block_reasons.append("composite_assembly included material must be an object")
+            continue
+        material_unknown = sorted(set(raw_material) - {"role", "material_spec_id"})
+        if material_unknown:
+            block_reasons.append(
+                "composite_assembly included material has unsupported keys: "
+                + ", ".join(material_unknown)
+            )
+        role = raw_material.get("role")
+        material_spec_id = raw_material.get("material_spec_id")
+        if role not in allowed_roles:
+            block_reasons.append(f"composite_assembly material role is invalid: {role!r}")
+            continue
+        if not isinstance(material_spec_id, str) or not material_spec_id.strip():
+            block_reasons.append("composite_assembly material_spec_id is missing")
+            continue
+        identity = (str(role), material_spec_id.strip())
+        if identity in seen_materials:
+            continue
+        seen_materials.add(identity)
+        material = materials_by_id.get(material_spec_id.strip())
+        if material is None:
+            block_reasons.append(
+                "confirmed composite material does not exist: " + material_spec_id.strip()
+            )
+            continue
+        material_status = ReviewStatus.PASS
+        if material.conflicts or material.status == ReviewStatus.BLOCK:
+            block_reasons.append(
+                f"confirmed composite material is conflicting or blocked: {material.id}"
+            )
+            material_status = ReviewStatus.REVIEW
+        if role == "glass_infill" and material.material_code_family != "GC-GL":
+            block_reasons.append(
+                f"confirmed glass_infill is not a GC-GL material: {material.mt_code}"
+            )
+            material_status = ReviewStatus.REVIEW
+        identity_evidence_ids = [
+            evidence_id
+            for evidence_id in evidence_ids
+            if evidence_id in entity_by_id
+            and _evidence_matches_material(entity_by_id[evidence_id], material)
+        ]
+        local_material_evidence_ids = [
+            evidence_id
+            for evidence_id in identity_evidence_ids
+            if _component_local_evidence(
+                entity_by_id[evidence_id],
+                points_by_sheet=points_by_sheet,
+                parent_handles=parent_handles,
+                sheet_by_id=sheet_by_id,
+            )
+            and material_evidence_owner_by_id.get(evidence_id) == component.id
+        ]
+        projection_material_evidence_ids = [
+            evidence_id
+            for evidence_id in local_material_evidence_ids
+            if _material_evidence_targets_projection_component(
+                entity_by_id[evidence_id],
+                projection_component_entity,
+            )
+        ]
+        if not identity_evidence_ids:
+            block_reasons.append(
+                f"composite evidence does not identify selected material: {material.id}"
+            )
+            material_status = ReviewStatus.REVIEW
+        elif not local_material_evidence_ids:
+            block_reasons.append(
+                f"composite material evidence is outside the physical component: {material.id}"
+            )
+            material_status = ReviewStatus.REVIEW
+        elif not projection_material_evidence_ids:
+            block_reasons.append(
+                "composite material evidence does not target the reviewed projection "
+                f"component: {material.id}"
+            )
+            material_status = ReviewStatus.REVIEW
+        if not (material.mt_code or "").strip() or not (material.name or "").strip():
+            review_reasons.append(
+                f"composite material lacks code or name: {material.id}"
+            )
+            material_status = ReviewStatus.REVIEW
+        if block_reasons:
+            material_status = ReviewStatus.REVIEW
+        included_materials.append(
+            ComponentMaterialRef(
+                role=role,
+                material_spec_id=material.id,
+                material_code=material.mt_code or "",
+                material_name=material.name or "",
+                evidence_ids=projection_material_evidence_ids,
+                status=material_status,
+            )
+        )
+
+    present_roles = {reference.role for reference in included_materials}
+    missing_roles = sorted(set(required_roles) - present_roles)
+    if missing_roles:
+        review_reasons.append(
+            "composite_assembly missing required material roles: "
+            + ", ".join(missing_roles)
+        )
+    assembly = CompositeAssembly(
+        assembly_type="screen_with_glass",
+        billing_basis="whole_elevation_projection",
+        required_material_roles=required_roles,
+        included_materials=included_materials,
+        basis=basis or "待确认复合构件计量依据",
+        evidence_ids=sorted({*evidence_ids, *projection_axis_evidence_ids}),
+        projection_width_candidate_id=projection_width_id or None,
+        projection_length_candidate_id=projection_length_id or None,
+        projection_component_entity_id=projection_component_id or None,
+        projection_axis_basis=projection_axis_basis or None,
+        projection_axis_evidence_ids=projection_axis_evidence_ids,
+    )
+    return assembly, review_reasons, block_reasons
+
+
 def build_takeoff(
     sheets: Sequence[Sheet],
     entities: Sequence[CadEntity],
@@ -2703,8 +3724,57 @@ def build_takeoff(
     entity_by_id = {entity.id: entity for entity in entity_values}
     occurrence_by_id = {occurrence.id: occurrence for occurrence in occurrences}
     materials_by_code: dict[str, list[MaterialSpec]] = defaultdict(list)
+    materials_by_id: dict[str, MaterialSpec] = {}
     for material in materials:
         materials_by_code[material.mt_code].append(material)
+        materials_by_id[material.id] = material
+    glass_materials = [
+        material
+        for material in materials
+        if material.material_code_family == "GC-GL"
+    ]
+    auxiliary_entities_by_code: dict[str, list[CadEntity]] = defaultdict(list)
+    unresolved_glass_entities: list[CadEntity] = []
+    glass_by_normalized_code = {
+        normalize_text(material.mt_code).casefold(): material.mt_code
+        for material in glass_materials
+        if material.mt_code
+    }
+    for entity in entity_by_id.values():
+        if not entity.text:
+            continue
+        matched_codes = {
+            match.normalized_code
+            for match in find_material_codes(
+                entity.text,
+                stainless_families=(),
+                review_families=DEFAULT_AUXILIARY_CODE_FAMILIES,
+            )
+        }
+        indexed_codes = {
+            glass_by_normalized_code[normalize_text(code).casefold()]
+            for code in matched_codes
+            if normalize_text(code).casefold() in glass_by_normalized_code
+        }
+        unmatched_glass_codes = {
+            code
+            for code in matched_codes
+            if normalize_text(code).casefold() not in glass_by_normalized_code
+        }
+        for code in indexed_codes:
+            auxiliary_entities_by_code[code].append(entity)
+        if (
+            unmatched_glass_codes
+            or (
+                re.search(
+                    r"玻璃|\bGLASS\b",
+                    normalize_text(entity.text),
+                    re.IGNORECASE,
+                )
+                and not indexed_codes
+            )
+        ):
+            unresolved_glass_entities.append(entity)
     base_components = build_component_instances(sheets, occurrences, relation_edges)
     occurrence_confirmation_errors: dict[str, list[str]] = {}
     explicitly_claimed_occurrences: set[str] = set()
@@ -2734,6 +3804,112 @@ def build_takeoff(
         elevation_resolved_components, confirmations
     )
     measurement_index = _MeasurementIndex.build(sheets, entity_values, occurrences)
+    component_evidence_contexts = {
+        component.id: _component_evidence_points(
+            component,
+            occurrence_by_id=occurrence_by_id,
+            entity_by_id=entity_by_id,
+        )
+        for component in components
+    }
+    insert_ids_by_scoped_handle: dict[
+        tuple[str, str | None, str], list[str]
+    ] = defaultdict(list)
+    for entity in entity_by_id.values():
+        insert_handle = str(entity.handle or "").strip()
+        if entity.entity_type == "INSERT" and insert_handle:
+            insert_ids_by_scoped_handle[
+                (entity.source_file_id, entity.sheet_id, insert_handle)
+            ].append(entity.id)
+    bound_insert_ids_by_component = {
+        component.id: _component_bound_insert_entity_ids(
+            component,
+            occurrence_by_id=occurrence_by_id,
+            entity_by_id=entity_by_id,
+            insert_ids_by_scoped_handle=insert_ids_by_scoped_handle,
+        )
+        for component in components
+    }
+    bound_insert_owners_by_entity_id: dict[str, set[str]] = defaultdict(set)
+    for component_id, insert_ids in bound_insert_ids_by_component.items():
+        for insert_id in insert_ids:
+            bound_insert_owners_by_entity_id[insert_id].add(component_id)
+            insert_entity = entity_by_id.get(insert_id)
+            if insert_entity is not None:
+                component_evidence_contexts[component_id][1].update(
+                    _insert_self_identities(insert_entity)
+                )
+    # Material ownership is a property of the CAD evidence entity, not of the
+    # component currently being evaluated.  Resolve it once for the run and
+    # index the uniquely owned evidence by component.  Besides keeping the
+    # ownership rule consistent for automatic and explicit confirmations, this
+    # avoids rescanning every component for every glass entity inside the main
+    # component loop (which previously became cubic on dense drawings).
+    glass_evidence_by_id = {
+        entity.id: entity
+        for code_entities in auxiliary_entities_by_code.values()
+        for entity in code_entities
+    }
+    glass_evidence_by_id.update(
+        {entity.id: entity for entity in unresolved_glass_entities}
+    )
+    # Explicit confirmations may also cite an auxiliary ``included_other``
+    # material that is not part of the automatic glass discovery pools.  Its
+    # evidence must go through the same one-owner calculation instead of being
+    # rejected merely because it was supplied by the reviewer.
+    explicit_material_evidence_ids: set[str] = set()
+    for raw_component_confirmation in confirmations.values():
+        if not isinstance(raw_component_confirmation, Mapping):
+            continue
+        raw_assembly = raw_component_confirmation.get("composite_assembly")
+        if not isinstance(raw_assembly, Mapping):
+            continue
+        raw_evidence_ids = raw_assembly.get("evidence_ids")
+        if not isinstance(raw_evidence_ids, list):
+            continue
+        explicit_material_evidence_ids.update(
+            evidence_id.strip()
+            for evidence_id in raw_evidence_ids
+            if isinstance(evidence_id, str) and evidence_id.strip()
+        )
+    glass_evidence_by_id.update(
+        {
+            entity_id: entity_by_id[entity_id]
+            for entity_id in explicit_material_evidence_ids
+            if entity_id in entity_by_id
+        }
+    )
+    material_owner_index = _MaterialEvidenceOwnerIndex(
+        component_contexts=component_evidence_contexts,
+        sheet_by_id=sheet_by_id,
+    )
+    material_evidence_owner_by_id = {
+        entity_id: material_owner_index.owner(entity)
+        for entity_id, entity in glass_evidence_by_id.items()
+    }
+    owned_auxiliary_entities: dict[
+        tuple[str, str], list[CadEntity]
+    ] = defaultdict(list)
+    owned_auxiliary_entity_ids: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for code, code_entities in auxiliary_entities_by_code.items():
+        for entity in code_entities:
+            owner_id = material_evidence_owner_by_id.get(entity.id)
+            key = (owner_id, code) if owner_id is not None else None
+            if key is None or entity.id in owned_auxiliary_entity_ids[key]:
+                continue
+            owned_auxiliary_entity_ids[key].add(entity.id)
+            owned_auxiliary_entities[key].append(entity)
+    owned_unresolved_glass_entities: dict[str, list[CadEntity]] = defaultdict(list)
+    owned_unresolved_glass_entity_ids: dict[str, set[str]] = defaultdict(set)
+    for entity in unresolved_glass_entities:
+        owner_id = material_evidence_owner_by_id.get(entity.id)
+        if (
+            owner_id is None
+            or entity.id in owned_unresolved_glass_entity_ids[owner_id]
+        ):
+            continue
+        owned_unresolved_glass_entity_ids[owner_id].add(entity.id)
+        owned_unresolved_glass_entities[owner_id].append(entity)
     result = TakeoffBuildResult(
         components=components,
         evidence_edges=[*relation_edges, *merge_evidence_edges],
@@ -2835,7 +4011,32 @@ def build_takeoff(
             component_confirmations
         )
         block_reasons.extend(commercial_reasons)
-        required_roles = _ROLES_BY_UNIT.get(unit, ())
+        potential_composite_confirmation = _potential_screen_glass_confirmation(
+            component,
+            occurrence_by_id=occurrence_by_id,
+            entity_by_id=entity_by_id,
+            glass_materials=glass_materials,
+            owned_auxiliary_entities=owned_auxiliary_entities,
+            owned_unresolved_glass_entities=owned_unresolved_glass_entities,
+        )
+        explicit_composite_confirmation = "composite_assembly" in component_confirmations
+        composite_requested = (
+            explicit_composite_confirmation
+            or potential_composite_confirmation is not None
+        )
+        if potential_composite_confirmation is not None and not explicit_composite_confirmation:
+            review_reasons.append(
+                "unconfirmed screen_with_glass composite candidate from local GC-GL evidence"
+            )
+        if composite_requested and unit != "㎡":
+            block_reasons.append(
+                "screen_with_glass composite assembly must use ㎡"
+            )
+        required_roles = (
+            ("width", "length", "quantity")
+            if composite_requested
+            else _ROLES_BY_UNIT.get(unit, ())
+        )
         roles_to_select = set(required_roles) | {
             role
             for role in ("unfolded_spec", "length", "quantity", "height", "width")
@@ -2873,6 +4074,14 @@ def build_takeoff(
         block_reasons.extend(chain_block)
         if plan_edge is not None and (detail_edge is not None or detail_not_applicable):
             expected_sheet_by_role = (
+                {
+                    "length": plan_edge.target_id,
+                    "height": plan_edge.target_id,
+                    "quantity": plan_edge.target_id,
+                    "width": plan_edge.target_id,
+                }
+                if composite_requested
+                else
                 {
                     "length": plan_edge.target_id,
                     "height": plan_edge.target_id,
@@ -2982,6 +4191,60 @@ def build_takeoff(
             detail_edge,
             selected,
         )
+        if potential_composite_confirmation is not None and not explicit_composite_confirmation:
+            potential_composite_confirmation = {
+                **potential_composite_confirmation,
+                "projection_width_candidate_id": (
+                    selected["width"].id if selected.get("width") is not None else ""
+                ),
+                "projection_length_candidate_id": (
+                    selected["length"].id if selected.get("length") is not None else ""
+                ),
+                "projection_axis_basis": (
+                    "CAD局部候选轴，尚未确认是否覆盖整樘立面外轮廓"
+                ),
+            }
+        (
+            composite_assembly,
+            composite_review_reasons,
+            composite_block_reasons,
+        ) = _composite_assembly_confirmation(
+            (
+                component_confirmations.get("composite_assembly")
+                if explicit_composite_confirmation
+                else potential_composite_confirmation
+            ),
+            component=component,
+            occurrence_by_id=occurrence_by_id,
+            materials_by_id=materials_by_id,
+            entity_by_id=entity_by_id,
+            sheet_by_id=sheet_by_id,
+            selected=selected,
+            chain_sheet_ids=chain_sheet_ids,
+            material_evidence_owner_by_id=material_evidence_owner_by_id,
+            bound_insert_ids_by_component=bound_insert_ids_by_component,
+            bound_insert_owners_by_entity_id=bound_insert_owners_by_entity_id,
+        )
+        if not explicit_composite_confirmation and composite_block_reasons:
+            composite_review_reasons = [
+                *composite_review_reasons,
+                *(
+                    "unconfirmed composite candidate: " + reason
+                    for reason in composite_block_reasons
+                ),
+            ]
+            composite_block_reasons = []
+        if composite_assembly is not None and not explicit_composite_confirmation:
+            composite_assembly = composite_assembly.model_copy(
+                update={
+                    "included_materials": [
+                        reference.model_copy(update={"status": ReviewStatus.REVIEW})
+                        for reference in composite_assembly.included_materials
+                    ]
+                }
+            )
+        review_reasons.extend(composite_review_reasons)
+        block_reasons.extend(composite_block_reasons)
         (
             engineering_expression,
             engineering_basis,
@@ -2993,6 +4256,28 @@ def build_takeoff(
             chain_sheet_ids=chain_sheet_ids,
         )
         block_reasons.extend(engineering_reasons)
+        if composite_assembly is not None and engineering_expression is not None:
+            normalized_expression = re.sub(
+                r"[\s()]",
+                "",
+                engineering_expression.replace("×", "*").replace("÷", "/"),
+            )
+            allowed_projection_expressions = {
+                f"{'*'.join(order)}/1000000"
+                for order in (
+                    ("width_mm", "length_mm", "quantity"),
+                    ("width_mm", "quantity", "length_mm"),
+                    ("length_mm", "width_mm", "quantity"),
+                    ("length_mm", "quantity", "width_mm"),
+                    ("quantity", "width_mm", "length_mm"),
+                    ("quantity", "length_mm", "width_mm"),
+                )
+            }
+            if normalized_expression not in allowed_projection_expressions:
+                block_reasons.append(
+                    "screen_with_glass engineering expression must be "
+                    "width_mm*length_mm*quantity/1000000"
+                )
         confirmed_roles = all(
             selected.get(role) is not None and selected[role].status == ReviewStatus.PASS
             for role in required_roles
@@ -3012,6 +4297,11 @@ def build_takeoff(
             {
                 *detail_requirement_evidence_ids,
                 *engineering_evidence_ids,
+                *(
+                    composite_assembly.evidence_ids
+                    if composite_assembly is not None
+                    else []
+                ),
                 *(
                     entity_id
                     for candidate in selected_candidates
@@ -3033,7 +4323,11 @@ def build_takeoff(
             unfolded_spec=unfolded.raw_value if unfolded else None,
             width_mm=(
                 width.numeric_value
-                if engineering_expression is not None and width is not None
+                if (
+                    engineering_expression is not None
+                    or composite_assembly is not None
+                )
+                and width is not None
                 else unfolded.numeric_value if unfolded else None
             ),
             length_mm=length.numeric_value if length else None,
@@ -3044,6 +4338,7 @@ def build_takeoff(
             unit=unit,
             pricing_method=pricing_method,
             note="；".join(reasons) or None,
+            composite_assembly=composite_assembly,
             component_id=component.id,
             evidence_ids=evidence_ids,
             status=status,
@@ -3058,6 +4353,58 @@ def build_takeoff(
                 }
             )
         result.items.append(calculated)
+        if composite_assembly is not None:
+            for reference in composite_assembly.included_materials:
+                material_edge_status = (
+                    ReviewStatus.PASS
+                    if (
+                        reference.status == ReviewStatus.PASS
+                        and not composite_review_reasons
+                        and not composite_block_reasons
+                        and chain_pass
+                        and calculated.status == ReviewStatus.PASS
+                    )
+                    else ReviewStatus.REVIEW
+                )
+                material_basis = [
+                    "assembly_type:screen_with_glass",
+                    "billing_basis:whole_elevation_projection",
+                    f"role:{reference.role}",
+                    f"material_code:{reference.material_code}",
+                    f"basis:{composite_assembly.basis}",
+                    *(f"evidence:{value}" for value in reference.evidence_ids),
+                ]
+                for evidence_id in reference.evidence_ids:
+                    entity = entity_by_id.get(evidence_id)
+                    if entity is None:
+                        continue
+                    material_basis.extend(
+                        [
+                            f"source_file:{entity.source_file_id}",
+                            f"sheet:{entity.sheet_id or ''}",
+                            f"handle:{entity.handle or ''}",
+                            f"bbox:{entity.bbox or ''}",
+                        ]
+                    )
+                result.evidence_edges.append(
+                    EvidenceEdge(
+                        id=_stable_id(
+                            "edge",
+                            component.id,
+                            "material",
+                            reference.material_spec_id,
+                            reference.role,
+                        ),
+                        relation="component_to_material",
+                        source_id=component.id,
+                        target_id=reference.material_spec_id,
+                        basis=material_basis,
+                        confidence=(
+                            1.0 if material_edge_status == ReviewStatus.PASS else 0.5
+                        ),
+                        status=material_edge_status,
+                    )
+                )
         engineering_edge_status = (
             ReviewStatus.PASS
             if (
@@ -3138,4 +4485,119 @@ def build_takeoff(
             else edge
             for edge in result.evidence_edges
         ]
+    evidence_components: dict[str, set[str]] = defaultdict(set)
+    component_ids = {component.id for component in components}
+    # Count the reviewer's raw declarations before looking at the resolved
+    # ComponentMaterialRef objects.  A losing/invalid claimant intentionally
+    # has no PASS material reference or evidence edge; omitting its original
+    # declaration here would let the geometrically preferred claimant remain
+    # PASS even though two physical rows explicitly claimed the same entity.
+    for component_id, raw_component_confirmation in confirmations.items():
+        if component_id not in component_ids or not isinstance(
+            raw_component_confirmation, Mapping
+        ):
+            continue
+        raw_assembly = raw_component_confirmation.get("composite_assembly")
+        if not isinstance(raw_assembly, Mapping):
+            continue
+        raw_evidence_ids = raw_assembly.get("evidence_ids")
+        if not isinstance(raw_evidence_ids, list):
+            continue
+        for raw_evidence_id in raw_evidence_ids:
+            if not isinstance(raw_evidence_id, str):
+                continue
+            evidence_id = raw_evidence_id.strip()
+            if evidence_id:
+                evidence_components[evidence_id].add(component_id)
+    for item in result.items:
+        if item.composite_assembly is None or not item.component_id:
+            continue
+        for reference in item.composite_assembly.included_materials:
+            for evidence_id in reference.evidence_ids:
+                evidence_components[evidence_id].add(item.component_id)
+    # Every material edge is also an ownership declaration, including REVIEW
+    # or malformed/forged input edges.  Counting only emitted item references
+    # would let another component silently pre-claim the same CAD evidence and
+    # make JSON status disagree with the workbook's exporter-side gate.
+    for edge in result.evidence_edges:
+        if edge.relation != "component_to_material":
+            continue
+        for value in edge.basis:
+            if not value.startswith("evidence:"):
+                continue
+            evidence_id = value.removeprefix("evidence:").strip()
+            if evidence_id:
+                evidence_components[evidence_id].add(edge.source_id)
+    reused_evidence_ids = {
+        evidence_id
+        for evidence_id, component_ids in evidence_components.items()
+        if len(component_ids) > 1
+    }
+    if reused_evidence_ids:
+        affected_components = {
+            component_id
+            for evidence_id in reused_evidence_ids
+            for component_id in evidence_components[evidence_id]
+        }
+        detail = (
+            "复合材料证据被多个物理构件重复占用："
+            + "，".join(sorted(reused_evidence_ids))
+        )
+        updated_items: list[TakeoffItem] = []
+        for item in result.items:
+            if item.component_id not in affected_components:
+                updated_items.append(item)
+                continue
+            assembly = item.composite_assembly
+            if assembly is not None:
+                assembly = assembly.model_copy(
+                    update={
+                        "included_materials": [
+                            reference.model_copy(update={"status": ReviewStatus.REVIEW})
+                            for reference in assembly.included_materials
+                        ]
+                    }
+                )
+            updated_items.append(
+                item.model_copy(
+                    update={
+                        "status": ReviewStatus.BLOCK,
+                        "block_reason": "；".join(
+                            value for value in (item.block_reason, detail) if value
+                        ),
+                        "note": "；".join(
+                            value for value in (item.note, detail) if value
+                        ),
+                        "composite_assembly": assembly,
+                        "unit_price": None,
+                        "price_entry_id": None,
+                        "amount": None,
+                    }
+                )
+            )
+        result.items = updated_items
+        result.evidence_edges = [
+            edge.model_copy(
+                update={"status": ReviewStatus.BLOCK, "confidence": 0.0}
+            )
+            if edge.relation == "component_to_material"
+            and edge.source_id in affected_components
+            and any(
+                value == f"evidence:{evidence_id}"
+                for value in edge.basis
+                for evidence_id in reused_evidence_ids
+            )
+            else edge
+            for edge in result.evidence_edges
+        ]
+        result.issues.append(
+            RunIssue(
+                stage="takeoff",
+                severity=Severity.BLOCK,
+                code="COMPOSITE_MATERIAL_EVIDENCE_REUSED",
+                message=detail,
+                evidence=sorted(reused_evidence_ids),
+                suggested_action="为每个物理构件选择唯一、局部关联的玻璃材料证据",
+            )
+        )
     return result

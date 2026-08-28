@@ -1,6 +1,7 @@
 import pytest
 from cadquote.models import (
     CadEntity,
+    ComponentInstance,
     EvidenceEdge,
     MaterialSpec,
     MeasurementCandidate,
@@ -9,7 +10,13 @@ from cadquote.models import (
     Sheet,
 )
 from cadquote.takeoff import (
+    _component_bound_insert_entity_ids,
+    _component_evidence_points,
+    _component_has_unique_material_evidence_ownership,
+    _component_local_evidence,
     _engineering_chain_sheet_ids,
+    _insert_self_identities,
+    _MaterialEvidenceOwnerIndex,
     build_component_instances,
     build_takeoff,
 )
@@ -1174,6 +1181,1233 @@ def _confirmed_measurements(draft, unit: str, pricing_method: str):
         if candidate.role in required
     }
     return {**values, "unit": unit, "pricing_method": pricing_method}
+
+
+def _composite_screen_case():
+    sheets, occurrences, edges, entities = _fixture()
+    occurrences = [
+        value.model_copy(
+            update={
+                "component_hint": "屏风",
+                "entity_ids": (
+                    [*value.entity_ids, "screen-frame"]
+                    if value.sheet_id == "elevation"
+                    else value.entity_ids
+                ),
+            }
+        )
+        if value.sheet_id in {"plan", "elevation"}
+        else value
+        for value in occurrences
+    ]
+    entities = [
+            value.model_copy(
+                update={
+                    "value": 2000,
+                    "geometry": {
+                        **value.geometry,
+                        "units": "millimeters",
+                        "defpoint2": [50, -950, 0],
+                        "defpoint3": [50, 1050, 0],
+                    },
+                }
+            )
+        if value.id == "length-dim"
+        else value.model_copy(update={"text": "×3"})
+        if value.id == "quantity-text"
+        else value
+        for value in entities
+    ]
+    entities.extend(
+        [
+            CadEntity(
+                id="width-dimension",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="DIMENSION",
+                space="model",
+                value=1200,
+                insert=(50, 50),
+                bbox=(-550, 49, 650, 51),
+                geometry={
+                    "units": "millimeters",
+                    "defpoint2": [-550, 50, 0],
+                    "defpoint3": [650, 50, 0],
+                },
+            ),
+            CadEntity(
+                id="screen-frame",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="INSERT",
+                space="model",
+                insert=(50, 50),
+                bbox=(-550, -950, 650, 1050),
+                geometry={"name": "SCREEN_ASSEMBLY"},
+            ),
+            CadEntity(
+                id="glass-callout",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="TEXT",
+                space="model",
+                text="GC-GL-01 艺术玻璃",
+                insert=(48, 50),
+                bbox=(45, 48, 58, 52),
+            ),
+            CadEntity(
+                id="other-glass-callout",
+                source_file_id="f",
+                sheet_id="other",
+                entity_type="TEXT",
+                space="model",
+                text="GC-GL-01 艺术玻璃",
+                insert=(48, 50),
+            ),
+            CadEntity(
+                id="far-glass-callout",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="TEXT",
+                space="model",
+                text="GC-GL-01 艺术玻璃",
+                insert=(95, 95),
+                bbox=(92, 93, 99, 97),
+            ),
+        ]
+    )
+    glass = MaterialSpec(
+        id="material-glass-01",
+        mt_code="GC-GL-01",
+        raw_material_code="GC-GL-01",
+        material_code_family="GC-GL",
+        name="艺术玻璃",
+    )
+    materials = [_material(), glass]
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=materials)
+    component = draft.components[0]
+    component_measurements = [
+        candidate
+        for candidate in draft.measurements
+        if candidate.component_id == component.id
+    ]
+    by_role = {
+        "width": next(
+            candidate
+            for candidate in component_measurements
+            if candidate.role == "width" and candidate.numeric_value == 1200
+        ),
+        "length": next(
+            candidate
+            for candidate in component_measurements
+            if candidate.role == "length" and candidate.numeric_value == 2000
+        ),
+        "quantity": next(
+            candidate
+            for candidate in component_measurements
+            if candidate.role == "quantity"
+        ),
+    }
+    confirmation = {
+        "unit": "㎡",
+        "pricing_method": "按立面投影面积计算",
+        "width": by_role["width"].id,
+        "length": by_role["length"].id,
+        "quantity": by_role["quantity"].id,
+        "composite_assembly": {
+            "kind": "single_line_composite",
+            "assembly_type": "screen_with_glass",
+            "billing_basis": "whole_elevation_projection",
+            "required_material_roles": ["glass_infill"],
+            "included_materials": [
+                {
+                    "role": "glass_infill",
+                    "material_spec_id": glass.id,
+                }
+            ],
+            "basis": "屏风框架和玻璃属于同一成品总成",
+            "evidence_ids": ["glass-callout"],
+            "projection_width_candidate_id": by_role["width"].id,
+            "projection_length_candidate_id": by_role["length"].id,
+            "projection_component_entity_id": "screen-frame",
+            "projection_axis_basis": "已核对整樘立面左右及上下边界",
+        },
+    }
+    return sheets, occurrences, edges, entities, materials, component, confirmation
+
+
+def test_composite_screen_builds_one_projected_area_row_with_material_edge() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: confirmation},
+    )
+
+    assert len(final.items) == 1
+    row = final.items[0]
+    assert row.status == ReviewStatus.PASS, row.note
+    assert row.width_mm == 1200
+    assert row.length_mm == 2000
+    assert row.quantity == 3
+    assert row.engineering_quantity == pytest.approx(7.2)
+    assert row.unfolded_spec is None
+    assert row.composite_assembly is not None
+    assert row.composite_assembly.included_materials[0].material_code == "GC-GL-01"
+    material_edges = [
+        edge for edge in final.evidence_edges if edge.relation == "component_to_material"
+    ]
+    assert len(material_edges) == 1
+    assert material_edges[0].status == ReviewStatus.PASS
+    assert "evidence:glass-callout" in material_edges[0].basis
+
+    missing_glass = {
+        **confirmation,
+        "composite_assembly": {
+            **confirmation["composite_assembly"],
+            "included_materials": [],
+        },
+    }
+    pending = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: missing_glass},
+    )
+    assert pending.items[0].status == ReviewStatus.REVIEW
+    assert "missing required material roles" in (pending.items[0].note or "")
+
+    cross_chain = {
+        **confirmation,
+        "composite_assembly": {
+            **confirmation["composite_assembly"],
+            "evidence_ids": ["other-glass-callout"],
+        },
+    }
+    rejected = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: cross_chain},
+    )
+    assert rejected.items[0].status == ReviewStatus.BLOCK
+    assert "outside selected chain" in (rejected.items[0].block_reason or "")
+
+
+def test_composite_confirmation_rejects_same_name_wrong_glass_code() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    wrong_glass = MaterialSpec(
+        id="material-glass-02",
+        mt_code="GC-GL-02",
+        raw_material_code="GC-GL-02",
+        material_code_family="GC-GL",
+        name="艺术玻璃",
+    )
+    wrong_confirmation = {
+        **confirmation,
+        "composite_assembly": {
+            **confirmation["composite_assembly"],
+            "included_materials": [
+                {
+                    "role": "glass_infill",
+                    "material_spec_id": wrong_glass.id,
+                }
+            ],
+        },
+    }
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[*materials, wrong_glass],
+        confirmations={component.id: wrong_confirmation},
+    )
+
+    row = result.items[0]
+    assert row.status == ReviewStatus.BLOCK
+    assert row.unit_price is None
+    assert row.price_entry_id is None
+    assert row.amount is None
+    assert "does not identify selected material" in (row.block_reason or "")
+    assert not any(
+        edge.relation == "component_to_material"
+        and edge.target_id == wrong_glass.id
+        and edge.status == ReviewStatus.PASS
+        for edge in result.evidence_edges
+    )
+
+
+def test_composite_projection_rejects_70mm_when_1200mm_width_competes() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    entities.append(
+        CadEntity(
+            id="wrong-width",
+            source_file_id="f",
+            sheet_id="elevation",
+            entity_type="ATTRIB",
+            space="model",
+            text="70",
+            insert=(50, 50),
+            bbox=(49, 49, 51, 51),
+            geometry={"tag": "WD"},
+        )
+    )
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=materials)
+    wrong_width = next(
+        candidate
+        for candidate in draft.measurements
+        if candidate.component_id == component.id
+        and candidate.role == "width"
+        and candidate.numeric_value == 70
+    )
+    wrong_confirmation = {
+        **confirmation,
+        "width": wrong_width.id,
+        "composite_assembly": {
+            **confirmation["composite_assembly"],
+            "projection_width_candidate_id": wrong_width.id,
+            "projection_axis_basis": "误把70mm构造深度声明成投影宽度",
+        },
+    }
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: wrong_confirmation},
+    )
+
+    row = result.items[0]
+    assert row.status == ReviewStatus.BLOCK
+    assert row.width_mm == 70
+    assert row.engineering_quantity == pytest.approx(0.42)
+    assert "not a native DIMENSION spanning the reviewed component bbox" in (
+        row.block_reason or ""
+    )
+    assert row.unit_price is None
+    assert row.amount is None
+
+
+def test_composite_projection_rejects_unbound_room_insert_and_5000mm_dimension() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    entities.extend(
+        [
+            CadEntity(
+                id="wrong-room",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="INSERT",
+                space="model",
+                insert=(50, 50),
+                bbox=(-2450, -950, 2550, 1050),
+                geometry={"name": "ROOM_OR_FURNITURE"},
+            ),
+            CadEntity(
+                id="wrong-room-width",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="DIMENSION",
+                space="model",
+                value=5000,
+                insert=(50, 50),
+                bbox=(-2450, 49, 2550, 51),
+                geometry={
+                    "units": "millimeters",
+                    "defpoint2": [-2450, 50, 0],
+                    "defpoint3": [2550, 50, 0],
+                },
+            ),
+        ]
+    )
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=materials)
+    wrong_width = next(
+        candidate
+        for candidate in draft.measurements
+        if candidate.component_id == component.id
+        and candidate.role == "width"
+        and candidate.numeric_value == 5000
+    )
+    wrong_confirmation = {
+        **confirmation,
+        "width": wrong_width.id,
+        "composite_assembly": {
+            **confirmation["composite_assembly"],
+            "projection_width_candidate_id": wrong_width.id,
+            "projection_component_entity_id": "wrong-room",
+            "projection_axis_basis": "错误地把房间或家具外框声明成屏风外框",
+        },
+    }
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: wrong_confirmation},
+    )
+
+    row = result.items[0]
+    assert row.status == ReviewStatus.BLOCK
+    assert "not bound to the MT occurrence evidence" in (row.block_reason or "")
+    assert row.unit_price is None
+    assert row.amount is None
+
+
+def test_composite_projection_accepts_bound_1200mm_span_despite_larger_attribute() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    entities.append(
+        CadEntity(
+            id="unrelated-larger-width",
+            source_file_id="f",
+            sheet_id="elevation",
+            entity_type="ATTRIB",
+            space="model",
+            text="1500",
+            insert=(50, 50),
+            geometry={"tag": "WD"},
+        )
+    )
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: confirmation},
+    )
+
+    assert result.items[0].status == ReviewStatus.PASS, result.items[0].note
+    assert result.items[0].width_mm == 1200
+    assert result.items[0].engineering_quantity == pytest.approx(7.2)
+
+
+def test_nearby_glass_outside_reviewed_screen_bbox_cannot_pass() -> None:
+    sheets, occurrences, edges, entities, materials, _, _ = _composite_screen_case()
+    sheets = [
+        sheet.model_copy(update={"bbox": (0, 0, 1000, 1000)})
+        for sheet in sheets
+    ]
+    occurrences = [
+        occurrence.model_copy(
+            update={
+                "anchor": (80, 50),
+                "leader_target": (
+                    (80, 50) if occurrence.leader_target is not None else None
+                ),
+            }
+        )
+        for occurrence in occurrences
+    ]
+    revised_entities: list[CadEntity] = []
+    for entity in entities:
+        if entity.id == "length-dim":
+            revised_entities.append(
+                entity.model_copy(
+                    update={
+                        "value": 20,
+                        "insert": (90, 50),
+                        "bbox": (89, 40, 91, 60),
+                        "geometry": {
+                            "units": "millimeters",
+                            "defpoint2": [90, 40, 0],
+                            "defpoint3": [90, 60, 0],
+                        },
+                    }
+                )
+            )
+        elif entity.id == "width-dimension":
+            revised_entities.append(
+                entity.model_copy(
+                    update={
+                        "value": 10,
+                        "insert": (90, 50),
+                        "bbox": (85, 49, 95, 51),
+                        "geometry": {
+                            "units": "millimeters",
+                            "defpoint2": [85, 50, 0],
+                            "defpoint3": [95, 50, 0],
+                        },
+                    }
+                )
+            )
+        elif entity.id == "screen-frame":
+            revised_entities.append(
+                entity.model_copy(
+                    update={
+                        "insert": (90, 50),
+                        "bbox": (85, 40, 95, 60),
+                    }
+                )
+            )
+        elif entity.id == "glass-callout":
+            revised_entities.append(
+                entity.model_copy(
+                    update={
+                        "insert": (83.5, 50),
+                        "bbox": (83, 49, 84, 51),
+                    }
+                )
+            )
+        elif entity.id == "quantity-text":
+            revised_entities.append(
+                entity.model_copy(update={"insert": (80, 50), "text": "×1"})
+            )
+        elif entity.id == "unfold-text":
+            revised_entities.append(entity.model_copy(update={"insert": (80, 50)}))
+        else:
+            revised_entities.append(entity)
+    entities = revised_entities
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=materials)
+    component = next(
+        value for value in draft.components if "plan-mt" in value.plan_occurrence_ids
+    )
+    component_measurements = [
+        candidate
+        for candidate in draft.measurements
+        if candidate.component_id == component.id
+    ]
+    width = next(
+        candidate
+        for candidate in component_measurements
+        if candidate.role == "width" and candidate.numeric_value == 10
+    )
+    length = next(
+        candidate
+        for candidate in component_measurements
+        if candidate.role == "length" and candidate.numeric_value == 20
+    )
+    quantity = next(
+        candidate
+        for candidate in component_measurements
+        if candidate.role == "quantity" and candidate.numeric_value == 1
+    )
+    confirmation = {
+        "unit": "㎡",
+        "pricing_method": "按立面投影面积计算",
+        "width": width.id,
+        "length": length.id,
+        "quantity": quantity.id,
+        "composite_assembly": {
+            "kind": "single_line_composite",
+            "assembly_type": "screen_with_glass",
+            "billing_basis": "whole_elevation_projection",
+            "required_material_roles": ["glass_infill"],
+            "included_materials": [
+                {
+                    "role": "glass_infill",
+                    "material_spec_id": "material-glass-01",
+                }
+            ],
+            "basis": "按已绑定屏风外框审定整樘投影",
+            "evidence_ids": ["glass-callout"],
+            "projection_width_candidate_id": width.id,
+            "projection_length_candidate_id": length.id,
+            "projection_component_entity_id": "screen-frame",
+            "projection_axis_basis": "原生水平和垂直尺寸覆盖屏风外框",
+        },
+    }
+
+    rejected = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: confirmation},
+    )
+    assert rejected.items[0].status == ReviewStatus.BLOCK
+    assert "does not target the reviewed projection component" in (
+        rejected.items[0].block_reason or ""
+    )
+
+    inside_entities = [
+        entity.model_copy(update={"insert": (86, 50), "bbox": (85.5, 49, 86.5, 51)})
+        if entity.id == "glass-callout"
+        else entity
+        for entity in entities
+    ]
+    accepted = build_takeoff(
+        sheets,
+        inside_entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: confirmation},
+    )
+    assert accepted.items[0].status == ReviewStatus.PASS, accepted.items[0].block_reason
+
+
+def test_forged_material_edge_blocks_takeoff_json_before_export() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    forged = EvidenceEdge(
+        id="forged-material-owner",
+        relation="component_to_material",
+        source_id="component:other",
+        target_id="material-glass-01",
+        basis=[
+            "role:glass_infill",
+            "material_code:GC-GL-01",
+            "evidence:glass-callout",
+        ],
+        status=ReviewStatus.REVIEW,
+    )
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        [*edges, forged],
+        materials=materials,
+        confirmations={component.id: confirmation},
+    )
+
+    assert result.items[0].status == ReviewStatus.BLOCK
+    assert result.items[0].unit_price is None
+    assert result.items[0].amount is None
+    assert any(
+        issue.code == "COMPOSITE_MATERIAL_EVIDENCE_REUSED"
+        for issue in result.issues
+    )
+
+
+def test_raw_composite_confirmations_competing_for_glass_block_all_claimants() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        owner_component,
+        owner_confirmation,
+    ) = _composite_screen_case()
+    occurrences.append(
+        MtOccurrence(
+            id="competing-plan-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="plan",
+            anchor=(80, 80),
+            room="另一区域",
+            component_hint="屏风B",
+        )
+    )
+    draft = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+    )
+    competing_component = next(
+        component
+        for component in draft.components
+        if "competing-plan-mt" in component.plan_occurrence_ids
+    )
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={
+            owner_component.id: owner_confirmation,
+            competing_component.id: owner_confirmation,
+        },
+    )
+
+    rows = {item.component_id: item for item in result.items}
+    assert rows[owner_component.id].status == ReviewStatus.BLOCK
+    assert rows[owner_component.id].unit_price is None
+    assert rows[owner_component.id].amount is None
+    assert rows[competing_component.id].status == ReviewStatus.BLOCK
+    assert any(
+        issue.code == "COMPOSITE_MATERIAL_EVIDENCE_REUSED"
+        and issue.evidence == ["glass-callout"]
+        for issue in result.issues
+    )
+
+
+def test_composite_confirmation_rejects_far_glass_evidence_on_same_sheet() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    far_same_sheet = {
+        **confirmation,
+        "composite_assembly": {
+            **confirmation["composite_assembly"],
+            "evidence_ids": ["far-glass-callout"],
+        },
+    }
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: far_same_sheet},
+    )
+
+    assert result.items[0].status == ReviewStatus.BLOCK
+    assert "outside the physical component" in (result.items[0].block_reason or "")
+
+
+def test_adjacent_component_cannot_borrow_nearer_glass_evidence() -> None:
+    sheet = Sheet(
+        id="elevation",
+        source_file_id="f",
+        kind="elevation",
+        bbox=(0, 0, 100, 100),
+    )
+    owner_occurrence = MtOccurrence(
+        id="owner-occurrence",
+        mt_code="MT-01",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        anchor=(50, 50),
+    )
+    adjacent_occurrence = owner_occurrence.model_copy(
+        update={"id": "adjacent-occurrence", "anchor": (54, 50)}
+    )
+    owner = ComponentInstance(
+        id="component:owner",
+        mt_code="MT-01",
+        name="屏风A",
+        elevation_occurrence_ids=[owner_occurrence.id],
+    )
+    adjacent = ComponentInstance(
+        id="component:adjacent",
+        mt_code="MT-01",
+        name="屏风B",
+        elevation_occurrence_ids=[adjacent_occurrence.id],
+    )
+    occurrence_by_id = {
+        owner_occurrence.id: owner_occurrence,
+        adjacent_occurrence.id: adjacent_occurrence,
+    }
+    evidence = CadEntity(
+        id="glass-evidence",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        entity_type="TEXT",
+        space="model",
+        text="GC-GL-01 艺术玻璃",
+        insert=(50, 50),
+    )
+    contexts = {
+        component.id: _component_evidence_points(
+            component,
+            occurrence_by_id=occurrence_by_id,
+            entity_by_id={evidence.id: evidence},
+        )
+        for component in (owner, adjacent)
+    }
+    adjacent_points, adjacent_parents = contexts[adjacent.id]
+
+    assert _component_local_evidence(
+        evidence,
+        points_by_sheet=adjacent_points,
+        parent_handles=adjacent_parents,
+        sheet_by_id={sheet.id: sheet},
+    )
+    assert _component_has_unique_material_evidence_ownership(
+        evidence,
+        component_id=owner.id,
+        component_contexts=contexts,
+        sheet_by_id={sheet.id: sheet},
+    )
+    assert not _component_has_unique_material_evidence_ownership(
+        evidence,
+        component_id=adjacent.id,
+        component_contexts=contexts,
+        sheet_by_id={sheet.id: sheet},
+    )
+
+
+def test_parent_insert_handles_are_scoped_by_source_and_sheet() -> None:
+    sheets = {
+        "sheet-a": Sheet(
+            id="sheet-a", source_file_id="file-a", kind="elevation", bbox=(0, 0, 100, 100)
+        ),
+        "sheet-b": Sheet(
+            id="sheet-b", source_file_id="file-b", kind="elevation", bbox=(0, 0, 100, 100)
+        ),
+    }
+    entities = {
+        "seed-a": CadEntity(
+            id="seed-a",
+            source_file_id="file-a",
+            sheet_id="sheet-a",
+            entity_type="ATTRIB",
+            space="model",
+            insert=(50, 50),
+            geometry={"parent_insert_handle": "H"},
+        ),
+        "seed-b": CadEntity(
+            id="seed-b",
+            source_file_id="file-b",
+            sheet_id="sheet-b",
+            entity_type="ATTRIB",
+            space="model",
+            insert=(50, 50),
+            geometry={"parent_insert_handle": "H"},
+        ),
+    }
+    occurrences = {
+        "occ-a": MtOccurrence(
+            id="occ-a",
+            mt_code="MT-01",
+            source_file_id="file-a",
+            sheet_id="sheet-a",
+            entity_ids=["seed-a"],
+            anchor=(50, 50),
+        ),
+        "occ-b": MtOccurrence(
+            id="occ-b",
+            mt_code="MT-01",
+            source_file_id="file-b",
+            sheet_id="sheet-b",
+            entity_ids=["seed-b"],
+            anchor=(50, 50),
+        ),
+    }
+    components = [
+        ComponentInstance(
+            id="component:a", mt_code="MT-01", elevation_occurrence_ids=["occ-a"]
+        ),
+        ComponentInstance(
+            id="component:b", mt_code="MT-01", elevation_occurrence_ids=["occ-b"]
+        ),
+    ]
+    contexts = {
+        component.id: _component_evidence_points(
+            component,
+            occurrence_by_id=occurrences,
+            entity_by_id=entities,
+        )
+        for component in components
+    }
+    evidence = CadEntity(
+        id="glass-b",
+        source_file_id="file-b",
+        sheet_id="sheet-b",
+        entity_type="TEXT",
+        space="model",
+        text="GC-GL-01 艺术玻璃",
+        insert=(50, 50),
+        geometry={"parent_insert_handle": "H"},
+    )
+
+    assert not _component_has_unique_material_evidence_ownership(
+        evidence,
+        component_id="component:a",
+        component_contexts=contexts,
+        sheet_by_id=sheets,
+    )
+    assert _component_has_unique_material_evidence_ownership(
+        evidence,
+        component_id="component:b",
+        component_contexts=contexts,
+        sheet_by_id=sheets,
+    )
+
+
+def test_virtual_parent_insert_id_excludes_other_instances_and_outer_chain() -> None:
+    inserts = {
+        "insert-correct": CadEntity(
+            id="insert-correct",
+            source_file_id="f",
+            sheet_id="elevation",
+            handle="H",
+            entity_type="INSERT",
+            space="model",
+            insert=(50, 50),
+        ),
+        "insert-other-instance": CadEntity(
+            id="insert-other-instance",
+            source_file_id="f",
+            sheet_id="elevation",
+            handle="H",
+            entity_type="INSERT",
+            space="model",
+            insert=(80, 50),
+        ),
+        "insert-outer-room": CadEntity(
+            id="insert-outer-room",
+            source_file_id="f",
+            sheet_id="elevation",
+            handle="OUT",
+            entity_type="INSERT",
+            space="model",
+            insert=(50, 50),
+        ),
+    }
+    seed = CadEntity(
+        id="virtual-mt-seed",
+        source_file_id="f",
+        sheet_id="elevation",
+        entity_type="ATTRIB",
+        space="model",
+        text="MT-01",
+        insert=(50, 50),
+        geometry={
+            "parent_insert_id": "insert-correct",
+            "parent_insert_handle": "H",
+            "parent_insert_chain": ["OUT", "H"],
+        },
+    )
+    entities = {**inserts, seed.id: seed}
+    occurrence = MtOccurrence(
+        id="occurrence",
+        mt_code="MT-01",
+        source_file_id="f",
+        sheet_id="elevation",
+        entity_ids=[seed.id],
+        anchor=(50, 50),
+    )
+    component = ComponentInstance(
+        id="component",
+        mt_code="MT-01",
+        elevation_occurrence_ids=[occurrence.id],
+    )
+
+    assert _component_bound_insert_entity_ids(
+        component,
+        occurrence_by_id={occurrence.id: occurrence},
+        entity_by_id=entities,
+    ) == {"insert-correct"}
+
+
+@pytest.mark.parametrize("binding_mode", ["parent_seed", "direct_insert"])
+def test_bound_insert_identity_outranks_a_neighbouring_component_anchor(
+    binding_mode: str,
+) -> None:
+    sheet = Sheet(
+        id="elevation",
+        source_file_id="f",
+        kind="elevation",
+        bbox=(0, 0, 100, 100),
+    )
+    insert = CadEntity(
+        id="insert-b",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        handle="HB",
+        entity_type="INSERT",
+        space="model",
+        insert=(50, 50),
+        bbox=(0, 0, 100, 100),
+    )
+    seed = CadEntity(
+        id="seed-b",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        entity_type="ATTRIB",
+        space="model",
+        text="MT-01",
+        insert=(0, 50),
+        geometry={"parent_insert_id": insert.id, "parent_insert_handle": "HB"},
+    )
+    neighbour_occurrence = MtOccurrence(
+        id="occ-a",
+        mt_code="MT-02",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        anchor=(50, 50),
+    )
+    bound_occurrence = MtOccurrence(
+        id="occ-b",
+        mt_code="MT-01",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        anchor=(0, 50),
+        entity_ids=[seed.id] if binding_mode == "parent_seed" else [insert.id],
+    )
+    occurrences = {
+        neighbour_occurrence.id: neighbour_occurrence,
+        bound_occurrence.id: bound_occurrence,
+    }
+    components = [
+        ComponentInstance(
+            id="component-a",
+            mt_code="MT-02",
+            elevation_occurrence_ids=[neighbour_occurrence.id],
+        ),
+        ComponentInstance(
+            id="component-b",
+            mt_code="MT-01",
+            elevation_occurrence_ids=[bound_occurrence.id],
+        ),
+    ]
+    entities = {insert.id: insert, seed.id: seed}
+    contexts = {
+        component.id: _component_evidence_points(
+            component,
+            occurrence_by_id=occurrences,
+            entity_by_id=entities,
+        )
+        for component in components
+    }
+    bound_ids = _component_bound_insert_entity_ids(
+        components[1],
+        occurrence_by_id=occurrences,
+        entity_by_id=entities,
+    )
+    assert bound_ids == {insert.id}
+    contexts["component-b"][1].update(_insert_self_identities(insert))
+    owner_index = _MaterialEvidenceOwnerIndex(
+        component_contexts=contexts,
+        sheet_by_id={sheet.id: sheet},
+    )
+    child_evidence = CadEntity(
+        id="glass-child",
+        source_file_id="f",
+        sheet_id=sheet.id,
+        entity_type="ATTRIB",
+        space="model",
+        text="GC-GL-01 艺术玻璃",
+        insert=(50, 50),
+        geometry={"parent_insert_id": insert.id, "parent_insert_handle": "HB"},
+    )
+
+    assert owner_index.owner(insert) == "component-b"
+    assert owner_index.owner(child_evidence) == "component-b"
+
+
+def test_local_glass_signal_without_confirmation_creates_review_composite_candidate() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    ordinary_area_confirmation = {
+        key: value
+        for key, value in confirmation.items()
+        if key != "composite_assembly"
+    }
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=materials)
+    unfolded = next(
+        candidate
+        for candidate in draft.measurements
+        if candidate.component_id == component.id and candidate.role == "unfolded_spec"
+    )
+    ordinary_area_confirmation["unfolded_spec"] = unfolded.id
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: ordinary_area_confirmation},
+    )
+
+    row = result.items[0]
+    assert row.composite_assembly is not None
+    assert row.composite_assembly.assembly_type == "screen_with_glass"
+    assert row.status in {ReviewStatus.REVIEW, ReviewStatus.BLOCK}
+
+
+def test_unregistered_gc_gl_code_still_creates_review_composite_candidate() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        _,
+        component,
+        _,
+    ) = _composite_screen_case()
+    entities = [
+        entity.model_copy(update={"text": "GC-GL-99"})
+        if entity.id == "glass-callout"
+        else entity
+        for entity in entities
+    ]
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+    )
+
+    row = next(item for item in result.items if item.component_id == component.id)
+    assert row.composite_assembly is not None
+    assert row.composite_assembly.assembly_type == "screen_with_glass"
+    assert row.status in {ReviewStatus.REVIEW, ReviewStatus.BLOCK}
+    assert row.unit_price is None
+    assert row.amount is None
+
+
+def test_multi_code_glass_note_cannot_prove_one_selected_material() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    entities = [
+        entity.model_copy(update={"text": "GC-GL-01 / GC-GL-02 艺术玻璃"})
+        if entity.id == "glass-callout"
+        else entity
+        for entity in entities
+    ]
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=materials,
+        confirmations={component.id: confirmation},
+    )
+
+    row = result.items[0]
+    assert row.status == ReviewStatus.BLOCK
+    assert "does not identify selected material" in (row.block_reason or "")
+    assert row.unit_price is None
+    assert row.amount is None
+
+
+def test_included_other_uses_its_selected_material_family_for_exact_code_proof() -> None:
+    (
+        sheets,
+        occurrences,
+        edges,
+        entities,
+        materials,
+        component,
+        confirmation,
+    ) = _composite_screen_case()
+    other_material = MaterialSpec(
+        id="material-other-99",
+        mt_code="GC-MR-99",
+        raw_material_code="GC-MR-99",
+        material_code_family="GC-MR",
+        name="其他嵌件",
+    )
+    entities.append(
+        CadEntity(
+            id="other-material-callout",
+            source_file_id="f",
+            sheet_id="elevation",
+            entity_type="TEXT",
+            space="model",
+            text="GC-MR-99 其他嵌件",
+            insert=(49, 50),
+        )
+    )
+    assembly = confirmation["composite_assembly"]
+    enriched_confirmation = {
+        **confirmation,
+        "composite_assembly": {
+            **assembly,
+            "required_material_roles": ["glass_infill", "included_other"],
+            "included_materials": [
+                *assembly["included_materials"],
+                {
+                    "role": "included_other",
+                    "material_spec_id": other_material.id,
+                },
+            ],
+            "evidence_ids": [*assembly["evidence_ids"], "other-material-callout"],
+        },
+    }
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[*materials, other_material],
+        confirmations={component.id: enriched_confirmation},
+    )
+
+    row = result.items[0]
+    assert row.status == ReviewStatus.PASS, row.block_reason
+    assert row.composite_assembly is not None
+    assert {
+        (reference.role, reference.material_code)
+        for reference in row.composite_assembly.included_materials
+    } == {("glass_infill", "GC-GL-01"), ("included_other", "GC-MR-99")}
 
 
 @pytest.mark.parametrize(

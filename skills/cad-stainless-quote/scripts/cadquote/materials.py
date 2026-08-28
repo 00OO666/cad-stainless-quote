@@ -56,7 +56,7 @@ _FINISH_TERMS = (
 )
 _PROCESS_TERMS = ("折弯", "刨槽", "雕花", "蚀刻", "满焊", "点焊", "焊接", "激光")
 _CAD_MATERIAL_RE = re.compile(
-    r"不锈钢|钢板|金属|铝板|铝合金|铜板|铁板|钛金|玫瑰金|镜面|拉丝|喷砂|"
+    r"不锈钢|钢板|金属|铝板|铝合金|铜板|铁板|玻璃|钛金|玫瑰金|镜面|拉丝|喷砂|"
     r"苹果砂|古铜|烤漆|镀色|雕花|蚀刻"
 )
 _DOCX_NON_DESCRIPTION_RE = re.compile(
@@ -75,6 +75,10 @@ _DOCX_MAX_XML_COMPRESSION_RATIO = 1_000.0
 
 DEFAULT_STAINLESS_CODE_FAMILIES = frozenset({"MT", "GC-SS"})
 DEFAULT_REVIEW_CODE_FAMILIES = frozenset({"GC-MT"})
+# Auxiliary families are parsed from material schedules so they can be bound to
+# a composite assembly.  They remain absent from the default occurrence policy,
+# therefore a glass code never creates an independent stainless quotation row.
+DEFAULT_AUXILIARY_CODE_FAMILIES = frozenset({"GC-GL"})
 
 
 @dataclass(frozen=True)
@@ -543,6 +547,9 @@ def parse_cad_material_specs(entities: Iterable[CadEntity]) -> list[MaterialSpec
     contain different MT definitions.
     """
 
+    material_review_families = (
+        DEFAULT_REVIEW_CODE_FAMILIES | DEFAULT_AUXILIARY_CODE_FAMILIES
+    )
     grouped: dict[tuple[str, str | None, str], list[CadEntity]] = {}
     for entity in entities:
         if not entity.text or _entity_center(entity) is None:
@@ -560,7 +567,10 @@ def parse_cad_material_specs(entities: Iterable[CadEntity]) -> list[MaterialSpec
         ]
         typical_height = sorted(heights)[len(heights) // 2] if heights else 1.0
         for seed in sorted(values, key=lambda value: value.id):
-            codes = find_material_codes(seed.text)
+            codes = find_material_codes(
+                seed.text,
+                review_families=material_review_families,
+            )
             if len(codes) != 1:
                 continue
             code_match = codes[0]
@@ -582,7 +592,10 @@ def parse_cad_material_specs(entities: Iterable[CadEntity]) -> list[MaterialSpec
                 if candidate.id == seed.id or not candidate.text:
                     continue
                 text = normalize_text(candidate.text)
-                if not text or find_material_codes(text):
+                if not text or find_material_codes(
+                    text,
+                    review_families=material_review_families,
+                ):
                     continue
                 point = _entity_center(candidate)
                 if point is None:
@@ -653,14 +666,23 @@ def parse_material_rows(
         return []
 
     specs: list[MaterialSpec] = []
+    material_review_families = (
+        DEFAULT_REVIEW_CODE_FAMILIES | DEFAULT_AUXILIARY_CODE_FAMILIES
+    )
 
     # Dictionary rows already carry their own headers.
     if all(isinstance(row, Mapping) for row in materialized):
         for offset, row in enumerate(materialized):
             assert isinstance(row, Mapping)
             raw = _mapping_record(row)
-            codes = find_material_codes_in_cells(list(row.values()))
-            explicit_matches = find_material_codes(raw.get("mt_code"))
+            codes = find_material_codes_in_cells(
+                list(row.values()),
+                review_families=material_review_families,
+            )
+            explicit_matches = find_material_codes(
+                raw.get("mt_code"),
+                review_families=material_review_families,
+            )
             code_match = (
                 explicit_matches[0] if explicit_matches else (codes[0][0] if codes else None)
             )
@@ -703,7 +725,10 @@ def parse_material_rows(
             for index, field in active_header.items()
             if index < len(cells) and _clean_value(cells[index]) is not None
         }
-        code_matches = find_material_codes(raw.get("mt_code"))
+        code_matches = find_material_codes(
+            raw.get("mt_code"),
+            review_families=material_review_families,
+        )
         code_match = code_matches[0] if code_matches else None
         if code_match:
             location = f"{sheet_name}!row={start_row + offset}"
@@ -727,14 +752,21 @@ def parse_material_rows(
     for offset, cells in enumerate(table):
         if offset in consumed_rows:
             continue
-        codes = find_material_codes_in_cells(cells)
+        codes = find_material_codes_in_cells(
+            cells,
+            review_families=material_review_families,
+        )
         if not codes:
             continue
         primary = _choose_primary_code(cells, codes)
         # Cross references inside a free-text description must not start a card.
         has_number_label = any(_field_for_label(cell) == "mt_code" for cell in cells)
         has_code_cell = any(
-            find_material_codes(cell) and _MATERIAL_CODE_RE.fullmatch(normalize_text(cell))
+            find_material_codes(
+                cell,
+                review_families=material_review_families,
+            )
+            and _MATERIAL_CODE_RE.fullmatch(normalize_text(cell))
             for cell in cells
         )
         if has_number_label or has_code_cell:
@@ -748,8 +780,15 @@ def parse_material_rows(
         if not raw.get("name"):
             for cell in block[0]:
                 text = normalize_text(cell)
-                if text and not find_material_codes(text) and _field_for_label(text) is None:
-                    if re.search(r"不锈钢|金属|铝板|钢板|铜|铁", text):
+                if (
+                    text
+                    and not find_material_codes(
+                        text,
+                        review_families=material_review_families,
+                    )
+                    and _field_for_label(text) is None
+                ):
+                    if re.search(r"不锈钢|金属|铝板|钢板|玻璃|铜|铁", text):
                         raw["name"] = cell
                         break
         location = f"{sheet_name}!rows={start_row + offset}:{start_row + end - 1}"
@@ -996,7 +1035,12 @@ def load_docx_material_specs(
     payload, document_sha256 = _read_docx_document_xml(document_path)
     if expected_sha256 and document_sha256.casefold() != expected_sha256.casefold():
         raise ValueError("DOCX SHA-256 does not match the ingested source manifest")
-    stainless, review = _family_sets(stainless_families, review_families)
+    effective_review_families = (
+        DEFAULT_REVIEW_CODE_FAMILIES | DEFAULT_AUXILIARY_CODE_FAMILIES
+        if review_families is None
+        else review_families
+    )
+    stainless, review = _family_sets(stainless_families, effective_review_families)
     try:
         root = ElementTree.fromstring(payload)
     except ElementTree.ParseError as exc:

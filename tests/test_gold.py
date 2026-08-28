@@ -161,20 +161,26 @@ def test_import_canonical_xlsx_preserves_evidence_and_never_passes(tmp_path: Pat
     assert result.sheets[0].max_column == 17
     assert result.summary.mt_distribution == {"MT-01": 1, "MT-02": 1}
     assert result.summary.pass_count == 0
-    assert result.summary.review_count == 1
-    assert result.summary.block_count == 1
-    assert result.summary.quantity_mismatch_count == 1
+    assert result.summary.review_count == 2
+    assert result.summary.block_count == 0
+    assert result.summary.quantity_mismatch_count == 0
+    assert result.summary.quantity_derived_from_engineering_count == 1
     assert result.rows[0].quantity_audit == "MATCH"
     assert result.rows[0].item.status.value == "REVIEW"
     assert result.rows[0].field_cells["mt_code"] == ["C2"]
     assert len(result.rows[0].raw_cells) == 17
     assert result.rows[0].raw_cells[15].coordinate == "P2"
     assert result.rows[0].raw_cells[15].formula == "=L2*O2"
-    assert result.rows[1].recalculated_engineering_quantity == 4
+    assert result.rows[1].recalculated_engineering_quantity == 2
     assert result.rows[1].reported_engineering_quantity == 2
+    assert result.rows[1].reported_quantity == 2
+    assert result.rows[1].effective_quantity == 1
+    assert result.rows[1].item.quantity == 1
+    assert result.rows[1].quantity_audit == "DERIVED"
+    assert result.rows[1].quantity_source == "derived_from_engineering_quantity"
     assert {issue.code for issue in result.issues} == {
         "AMOUNT_NOT_CALCULABLE",
-        "QUANTITY_FORMULA_MISMATCH",
+        "QUANTITY_DERIVED_FROM_ENGINEERING",
     }
 
     payload = json.loads(result.to_json())
@@ -286,6 +292,50 @@ def test_abnormal_unit_and_negative_engineering_quantity_are_audited(
         "UNRECOGNIZED_UNIT",
         "QUANTITY_NOT_CALCULABLE",
     }
+
+
+def test_engineering_authority_repairs_default_quantity_but_not_billing_axis(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "engineering-authority.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "序号",
+            "名称",
+            "MT编号",
+            "宽",
+            "长度",
+            "数量",
+            "工程量",
+            "单位",
+        ]
+    )
+    sheet.append([1, "造型线条", "MT-01", 70, 4200, 1, 8.40, "m"])
+    sheet.append([2, "接待台", "MT-01", 3840, 1050, 1, 3.84, "m"])
+    sheet["G2"].number_format = sheet["G3"].number_format = "0.00"
+    workbook.save(source)
+
+    result = import_gold_workbook(source)
+
+    line, counter = result.rows
+    assert line.reported_quantity == 1
+    assert line.effective_quantity == 2
+    assert line.item.quantity == 2
+    assert line.quantity_audit == "DERIVED"
+    assert line.recalculated_engineering_quantity == pytest.approx(8.4)
+    assert line.quantity_derivation_basis == "工程量÷显示长度（m）得到有效数量"
+
+    # 3.84 m comes from the displayed width axis, not an integer quantity on
+    # the length axis. Keep it blocked for an audited billing-axis expression
+    # instead of inventing quantity 3.657... or silently changing the row.
+    assert counter.item.quantity == 1
+    assert counter.quantity_audit == "MISMATCH"
+    assert counter.quantity_source == "reported"
+    assert counter.item.status.value == "BLOCK"
+    assert result.summary.quantity_derived_from_engineering_count == 1
+    assert result.summary.quantity_mismatch_count == 1
 
 
 def test_rejects_non_excel_file(tmp_path: Path) -> None:

@@ -181,8 +181,10 @@ or promotes an image registration to `MATCH`.
 - `MaterialSpec`, `MtOccurrence`, and `ComponentInstance` add optional
   `raw_material_code` and `material_code_family` fields. Older JSON without these fields remains
   valid.
-- The default detector treats `MT` and `GC-SS` as stainless candidates, retains `GC-MT` only as a
-  lower-confidence review family, and excludes unconfigured families such as `GC-GL`/`GC-MR`.
+- The default stainless-occurrence detector treats `MT` and `GC-SS` as stainless candidates and
+  retains `GC-MT` only as a lower-confidence review family. An auxiliary family such as `GC-GL`
+  may be retained as a `MaterialSpec` for a composite assembly, but it must not seed an independent
+  stainless `MtOccurrence`; other unconfigured families remain excluded.
 - Unnumbered text that explicitly describes stainless steel is written to
   `analysis/material_mentions.json` as a low-confidence `MaterialMention`. This diagnostic model
   has no `mt_code` field and must never be promoted by inventing a code.
@@ -239,6 +241,59 @@ or trusts a stale cached engineering quantity.
 
 This field is not a target-value override. Without the audited structure the standard unit formula
 remains authoritative, and unresolved billing semantics remain REVIEW/BLOCK.
+
+## Single-line composite assembly contract
+
+`TakeoffItem.composite_assembly` describes multiple materials that belong to one physical billable
+assembly. For a stainless screen with artistic-glass infill it uses:
+
+- `kind=single_line_composite` and `assembly_type=screen_with_glass`;
+- `billing_basis=whole_elevation_projection`;
+- `required_material_roles` including `glass_infill`;
+- `included_materials`, where every `ComponentMaterialRef` records `role`,
+  `material_spec_id`, explicit `material_code`, `material_name`, `evidence_ids`, and review status;
+- `projection_width_candidate_id` and `projection_length_candidate_id`, both backed by native
+  orthogonal DIMENSION endpoints;
+- `projection_component_entity_id`, an occurrence-bound bounded INSERT whose bbox those dimensions
+  span, plus a non-empty `projection_axis_basis` and recorded axis evidence IDs;
+- non-empty assembly `basis` and `evidence_ids` tied to the same `component_id`.
+
+The assembly emits one quotation row. Its engineering quantity is
+`width_mm*length_mm*quantity/1000000`, with two elevation-projection axes and an independently
+proved quantity. A third axis or construction depth is retained only in the readable specification
+and never participates in this area formula.
+
+A generic attribute, nearest/largest dimension, or arbitrary nearby INSERT is insufficient for
+commercial PASS. The INSERT must be directly present in the MT occurrence evidence or resolved from
+its source/sheet-scoped parent insert chain; the horizontal and vertical native DIMENSION endpoints
+must cover its bbox. Handle strings are never compared across source files or sheets.
+
+A local screen anchor plus an associated auxiliary glass material signal creates a composite
+candidate independently of reviewer confirmation. Until `composite_assembly` is confirmed and its
+evidence validates, the candidate remains at least REVIEW (or BLOCK when other hard evidence is
+missing) with `unit_price`, `price_entry_id`, and `amount` unset. Candidate generation must not
+replace it with an apparently complete stainless-only item. An unregistered `GC-GL-*` signal also
+creates an unresolved candidate; an evidence entity containing several glass codes proves none of
+them individually. Name-only discovery is REVIEW; a reviewer confirmation that falsely promotes
+that signal as proof of one exact code is invalid and BLOCK.
+
+Each included material requires a `component_to_material` evidence edge. A portable commercial
+PASS requires the edge and material reference to agree on component, material specification, role,
+and underlying CAD evidence. Missing code/name, missing or cross-component evidence, or a required
+role without one unambiguous material keeps the item REVIEW and clears price and amount.
+Nearest-anchor ownership alone is not sufficient: the evidence must have the reviewed projection
+INSERT as its direct parent or expose one unique target/point inside that INSERT bbox under a small
+rounding tolerance. An adjacent code just outside the boundary cannot become PASS.
+
+`component_to_material` ownership is one-to-one for a glass evidence entity at quotation-row level.
+The same glass entity ID must not support different component IDs or rows. Duplicate claims are an
+explicit REVIEW/BLOCK conflict; no claimant may become commercial PASS until a unique owner is
+proved.
+
+The workbook material cell combines the primary stainless material with every included material;
+the note states that glass is included and that the assembly is not split. `PriceEntry` may declare
+`included_material_codes` and `composite_billing_basis`. Composite price matching requires the
+included-code set and basis to match exactly; a price entry for stainless alone is ineligible.
 
 ## Estimator convention profile and candidate output
 
@@ -308,6 +363,13 @@ an explicit MT came from the MT, material-code, or material-description cell.
 categories, and `DISPIMG` references. `GoldCellEvidence` retains cached values together
 with normal/array formula metadata. These records are candidate evidence only and do
 not satisfy CAD plan → elevation → detail PASS requirements by themselves.
+
+`GoldRow.reported_quantity` preserves the workbook's displayed quantity. Candidate-gold audit may
+also write `effective_quantity`, `quantity_source=derived_from_engineering_quantity`, and a
+`quantity_derivation_basis` when the standard unit formula, displayed dimensions, and authoritative
+engineering quantity yield exactly one positive integer multiplier. This provenance-bearing repair
+normalizes human gold only. It is never available to a blind prediction or production takeoff, and
+ambiguous/custom-axis rows remain unresolved rather than being reverse-engineered.
 
 ## Gold image asset manifest
 

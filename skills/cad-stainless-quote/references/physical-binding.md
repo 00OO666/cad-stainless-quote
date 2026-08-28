@@ -89,7 +89,53 @@ Use explicit QTY text first, then independent repeated leaders/congruent compone
 audited component topology. A single visible assembly does not prove `1`. If an internal repeat is
 already present in H or J, do not multiply it again in K.
 
-## 6. Evidence images
+## 6. Bind a stainless-and-glass screen as one physical assembly
+
+When a screen's selected CAD chain proves that the stainless frame and artistic-glass infill form
+one fabricated screen, classify it as `single_line_composite` with
+`assembly_type=screen_with_glass`. The billable atom is the complete screen, so emit one row rather
+than one stainless row plus one glass row.
+
+Candidate discovery is conservative but not confirmation-dependent. If a bounded screen region
+contains a stainless screen anchor and a locally associated auxiliary glass code/leader, emit one
+`screen_with_glass` composite candidate even when no reviewer confirmation exists yet. Keep it
+at least REVIEW (or BLOCK when other hard evidence is missing), leave unit price and amount blank,
+and expose the missing confirmation/evidence as an issue; do not silently downgrade it to a normal
+stainless-only item or discard the glass signal.
+
+Use the whole elevation projection: `width_mm*length_mm*quantity/1000000`. Both projected axes and
+the quantity must belong to the same confirmed component chain. A third size in a displayed
+width×height×depth envelope is construction depth only and must not enter the projected-area
+formula or be reinterpreted as quantity.
+
+Generic `WD`/`HT` attributes, proximity, or “largest value on the view” do not prove a whole-screen
+axis. Commercial PASS additionally requires an occurrence-bound, bounded `INSERT` for the physical
+screen and native horizontal/vertical `DIMENSION` endpoints that span that INSERT bbox within the
+documented tolerance. If that topology is unavailable, retain the axis as a REVIEW candidate; do
+not substitute a construction depth, room width, or neighbouring component dimension.
+
+Bind the primary stainless specification and the glass infill specification to the same
+`component_id`. The glass reference must retain its explicit material code, name, and CAD evidence;
+proximity to a steel note is not enough. Commercial PASS requires either the exact reviewed screen
+INSERT as the evidence entity's direct parent, or one unique leader target/evidence point inside
+that INSERT bbox with only a small CAD-rounding tolerance. Missing or conflicting glass identity,
+a cross-component glass reference, or incomplete material evidence keeps the assembly REVIEW. The
+quotation material display must contain both identities, and its note must say that glass is
+included.
+
+Material identity is exact-code evidence: a note for `GC-GL-01` cannot prove a different glass
+specification merely because both specifications share the same display name. Name-only glass text
+may raise a REVIEW candidate but cannot release price. An unregistered `GC-GL-*` code still raises
+an unresolved composite candidate, while one entity containing several glass codes cannot prove any
+single selected code.
+
+Glass evidence ownership is exclusive. One glass material entity/leader target may bind to only one
+`component_id` and one quotation row. Resolve competing candidates with physical boundaries,
+leader targets, and view references; if ownership is not unique, keep every affected candidate
+REVIEW or BLOCK. Never copy the same glass evidence into multiple composite rows to complete their
+material chains.
+
+## 7. Evidence images
 
 Generate images only after choosing a component candidate. Retain:
 
@@ -102,7 +148,7 @@ Do not use a photo/rendering as a CAD detail, infer image meaning from its Excel
 crop for distinct stages, or enlarge a low-resolution raster. A missing stage remains visible as
 MISSING/REVIEW.
 
-## 7. Freeze and score
+## 8. Freeze and score
 
 For development or acceptance tests:
 

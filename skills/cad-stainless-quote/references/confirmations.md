@@ -93,6 +93,68 @@
 - 数量确认的 `basis` 必须说明乘数语义：整件重复、左右门梃、包框边数或重复面板等。一个材料引线、一个 MT 文本或一个可见总成均不能自动证明数量为 1；内部边/面乘数若已写进表达式，不得再作为外层数量重复相乘；
 - 组合结果会生成新的稳定 measurement ID，保存源候选 ID、图纸 ID、实体 ID、公式、审核原因，并进入 `component_to_dimension` 证据边。
 
+## 不锈钢屏风与艺术玻璃按一条复合构件确认
+
+当已选平面→立面→节点链证明不锈钢框架与艺术玻璃是同一樘屏风时，在 `selected` 中加入
+`composite_assembly`。确认文件只引用 review-pack 已存在的材料规格和 CAD 实体，不手填
+玻璃编号或名称：
+
+如果局部构件区域已经同时发现屏风不锈钢标注与关联玻璃编号/引线，系统即使尚未收到
+本段确认，也必须保留一条 `screen_with_glass` 复合候选。该候选至少为 REVIEW，单价和
+金额为空；若同时缺少材料、图链或尺寸等硬证据，整行可以进一步 BLOCK。确认的作用是
+审定同构件归属与材料证据，不能以“未确认”为由把候选降成纯不锈钢项目或忽略玻璃。
+
+```json
+{
+  "composite_assembly": {
+    "kind": "single_line_composite",
+    "assembly_type": "screen_with_glass",
+    "billing_basis": "whole_elevation_projection",
+    "required_material_roles": ["glass_infill"],
+    "included_materials": [
+      {
+        "role": "glass_infill",
+        "material_spec_id": "material:REPLACE_WITH_REVIEW_PACK_ID"
+      }
+    ],
+    "basis": "不锈钢框架与玻璃属于同一物理屏风，整樘按立面投影面积计量",
+    "projection_width_candidate_id": "measurement:REPLACE_WITH_NATIVE_HORIZONTAL_DIMENSION_ID",
+    "projection_length_candidate_id": "measurement:REPLACE_WITH_NATIVE_VERTICAL_DIMENSION_ID",
+    "projection_component_entity_id": "entity:REPLACE_WITH_MT_BOUND_SCREEN_INSERT_ID",
+    "projection_axis_basis": "原生水平/垂直DIMENSION端点覆盖已绑定屏风INSERT外框",
+    "evidence_ids": [
+      "entity:REPLACE_WITH_SAME_COMPONENT_GLASS_EVIDENCE_ID"
+    ]
+  }
+}
+```
+
+恢复运行会从所选 `MaterialSpec` 解析玻璃编号和名称，并生成
+`component_to_material` 证据边。必须同时满足：
+
+- 输出只有一条复合屏风记录，不再生成独立玻璃报价行；
+- `unit=㎡`，工程量固定为 `width_mm*length_mm*quantity/1000000`，宽、高和数量均绑定
+  当前构件；
+- 整樘宽、高不能只凭 `WD/HT` 属性或“取同页最大值”放行。`projection_component_entity_id`
+  必须是当前 MT occurrence 直接包含或父块链指向的有界 `INSERT`；宽、高候选必须来自原生
+  `DIMENSION`，且 `defpoint2/defpoint3` 分别覆盖该 INSERT 外框的水平/垂直跨度。任一证明
+  缺失时保持 REVIEW/BLOCK，价格和金额为空；
+- 规格中的第三轴/构造深度只用于说明构造，不参与立面投影面积，也不能当成数量；
+- 材料栏同时列出主不锈钢与玻璃编号/名称，备注注明含玻璃且不拆分；
+- 玻璃材料编号、名称或同构件证据缺失/冲突时保持 REVIEW，单价和金额为空；
+- 玻璃材料证据还必须与已审定的屏风 `INSERT` 物理边界一致：证据属于该 INSERT 的直接
+  父块，或唯一引线目标/证据点落入该 INSERT 外框的小公差范围；仅仅离 MT 锚点更近
+  不能成为 PASS 依据；
+- 玻璃证据必须精确含有所选 `GC-GL-*` 编号；“艺术玻璃”等同名文字只能触发 REVIEW
+  候选，不能证明某个具体玻璃编号；一个实体同时出现多个玻璃编号同样不构成唯一材料
+  证明；即使图纸里的 `GC-GL-*` 尚未出现在材料表，也必须保留未解析复合候选。自动
+  name-only 信号保持 REVIEW；若确认文件把它显式声明为某个编号的证明，该无效确认必须
+  BLOCK；
+- 一个玻璃证据实体只能被一个 `component_id`/报价行认领。确认文件若让同一实体出现在
+  不同构件的 `included_materials` 或 `evidence_ids` 中，相关确认必须阻断或退回复核；
+- 只有包含材料编号集合及 `whole_elevation_projection` 口径完全一致的复合价格条目才能
+  匹配，纯不锈钢价格不能匹配。
+
 ## 显示列与实际计价拓扑不一致
 
 默认工程量只使用固定公式：面积为 `width_mm*length_mm*quantity/1000000`，延米为 `length_mm*quantity/1000`，件/套等于 `quantity`。但有些经 CAD 证实的物理构造会出现以下情况：报价表仍显示一个构件，实际包含两条独立计价线；或延米应取“宽”列所示的平面长边，而不是“长度”列。此时不能篡改显示数量来凑结果，也不能把人工工程量直接复制为答案，可在该构件的 `selected` 中增加：

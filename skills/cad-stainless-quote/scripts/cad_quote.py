@@ -39,6 +39,7 @@ from cadquote.ingest import ingest_input
 from cadquote.io import sha256_file, write_json_atomic
 from cadquote.linking import rank_evidence_edges
 from cadquote.materials import (
+    DEFAULT_AUXILIARY_CODE_FAMILIES,
     DEFAULT_REVIEW_CODE_FAMILIES,
     DEFAULT_STAINLESS_CODE_FAMILIES,
     load_docx_material_specs,
@@ -555,7 +556,10 @@ def command_materials(args: argparse.Namespace) -> int:
         load_docx_material_specs(
             args.workbook,
             stainless_families=stainless_families,
-            review_families=review_families,
+            review_families={
+                *review_families,
+                *DEFAULT_AUXILIARY_CODE_FAMILIES,
+            },
         )
         if args.workbook.suffix.lower() == ".docx"
         else load_material_specs(args.workbook)

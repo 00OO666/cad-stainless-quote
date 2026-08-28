@@ -20,7 +20,29 @@
         "entity:REPLACE_WITH_SELECTED_CHAIN_ENTITY_ID"
       ]
     },
-    "note": "Only copy merge_component_ids into selected when a reviewer explicitly confirms that the source rows are one physical component."
+    "composite_assembly_when_screen_and_glass_are_one_component": {
+      "kind": "single_line_composite",
+      "assembly_type": "screen_with_glass",
+      "billing_basis": "whole_elevation_projection",
+      "required_material_roles": [
+        "glass_infill"
+      ],
+      "included_materials": [
+        {
+          "role": "glass_infill",
+          "material_spec_id": "material:REPLACE_WITH_REVIEW_PACK_ID"
+        }
+      ],
+      "basis": "REPLACE_WITH_SAME_COMPONENT_SCREEN_AND_GLASS_BASIS",
+      "projection_width_candidate_id": "measurement:REPLACE_WITH_NATIVE_HORIZONTAL_DIMENSION_ID",
+      "projection_length_candidate_id": "measurement:REPLACE_WITH_NATIVE_VERTICAL_DIMENSION_ID",
+      "projection_component_entity_id": "entity:REPLACE_WITH_MT_BOUND_SCREEN_INSERT_ID",
+      "projection_axis_basis": "REPLACE_WITH_WHOLE_SCREEN_BBOX_AND_DIMENSION_ENDPOINT_REVIEW",
+      "evidence_ids": [
+        "entity:REPLACE_WITH_SAME_COMPONENT_GLASS_EVIDENCE_ID"
+      ]
+    },
+    "note": "Copy an optional example into selected only after a reviewer confirms its CAD evidence. A screen-with-glass composite is one row billed by whole elevation projection. Projection axes require native DIMENSION endpoints spanning an MT-bound screen INSERT bbox; generic WD/HT attributes are candidates only. Do not type free material codes or names."
   },
   "components": {
     "component:REPLACE_WITH_REVIEW_PACK_ID": {

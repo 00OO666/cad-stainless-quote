@@ -72,6 +72,7 @@ def test_docx_material_book_parses_tables_paragraphs_and_deduplicates(
                 ["材料编号", "材料描述", "使用部位"],
                 ["MT-01", "虚构黑砂不锈钢", "虚构门套"],
                 ["GC-SS-102", "虚构镜面不锈钢", "虚构窗套"],
+                ["GC-GL-201", "虚构艺术玻璃", "虚构屏风"],
                 ["PO-88", "普通采购编号", "忽略"],
                 ["MT-04", "999.00", "不是材料描述"],
             ]
@@ -86,7 +87,12 @@ def test_docx_material_book_parses_tables_paragraphs_and_deduplicates(
 
     specs = load_docx_material_specs(source, source_file_id="file:synthetic")
 
-    assert [value.mt_code for value in specs] == ["MT-01", "GC-SS-102", "MT-03"]
+    assert [value.mt_code for value in specs] == [
+        "MT-01",
+        "GC-SS-102",
+        "GC-GL-201",
+        "MT-03",
+    ]
     assert all(value.status == ReviewStatus.REVIEW for value in specs)
     assert all(value.source_type == "docx_material_book" for value in specs)
     assert all(value.source_sha256 == source_sha256 for value in specs)
@@ -184,7 +190,13 @@ def test_pipeline_surfaces_docx_material_and_unnumbered_match_counts(
     source.mkdir()
     _write_docx(
         source / "project-material-book.docx",
-        tables=[[["编号", "描述"], ["MT-01", "虚构黑砂不锈钢"]]],
+        tables=[
+            [
+                ["编号", "描述"],
+                ["MT-01", "虚构黑砂不锈钢"],
+                ["GC-GL-201", "虚构艺术玻璃"],
+            ]
+        ],
     )
     drawing = ezdxf.new("R2018")
     modelspace = drawing.modelspace()
@@ -197,7 +209,7 @@ def test_pipeline_surfaces_docx_material_and_unnumbered_match_counts(
 
     result = run_pipeline(source, tmp_path / "run", render_evidence=False)
 
-    assert result.counts["docx_materials"] == 1
+    assert result.counts["docx_materials"] == 2
     assert result.counts["material_mentions"] == 1
     assert result.counts["material_mention_match_candidates"] == 1
     assert result.counts["material_mention_unique_matches"] == 1
@@ -206,7 +218,7 @@ def test_pipeline_surfaces_docx_material_and_unnumbered_match_counts(
     assert occurrences[0]["mt_code"] == "MT-01"
     assert occurrences[0]["status"] == "REVIEW"
     review_pack = json.loads(Path(result.paths["review_pack"]).read_text(encoding="utf-8"))
-    assert review_pack["summary"]["docx_material_count"] == 1
+    assert review_pack["summary"]["docx_material_count"] == 2
     assert review_pack["summary"]["material_mention_match_candidate_count"] == 1
     assert (
         review_pack["material_evidence"]["mention_to_material_candidates"][0]["status"] == "REVIEW"

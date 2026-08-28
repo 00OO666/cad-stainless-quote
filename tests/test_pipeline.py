@@ -493,6 +493,80 @@ def test_confirmation_parser_preserves_audited_engineering_quantity_expression(
     }
 
 
+def test_confirmation_parser_preserves_reference_only_composite_assembly(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "composite-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "unit": "㎡",
+                            "composite_assembly": {
+                                "kind": "single_line_composite",
+                                "assembly_type": "screen_with_glass",
+                                "billing_basis": "whole_elevation_projection",
+                                "required_material_roles": ["glass_infill"],
+                                "included_materials": [
+                                    {
+                                        "role": "glass_infill",
+                                        "material_spec_id": " material:glass ",
+                                    }
+                                ],
+                                "basis": "框架与玻璃属于同一成品总成",
+                                "evidence_ids": [" entity:glass ", "entity:glass"],
+                                "projection_width_candidate_id": " measurement:width ",
+                                "projection_length_candidate_id": " measurement:length ",
+                                "projection_component_entity_id": " entity:screen-frame ",
+                                "projection_axis_basis": " 已核对整樘立面外轮廓 ",
+                            },
+                        },
+                        "reviewer": "张工",
+                        "reviewed_at": "2026-08-26T03:00:00+08:00",
+                        "reason": "核对屏风立面和玻璃标注",
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = load_confirmation_bundle(path)
+    assembly = bundle.selections["component:1"]["composite_assembly"]
+    assert assembly["included_materials"] == [
+        {"role": "glass_infill", "material_spec_id": "material:glass"}
+    ]
+    assert assembly["evidence_ids"] == ["entity:glass"]
+    assert assembly["projection_width_candidate_id"] == "measurement:width"
+    assert assembly["projection_length_candidate_id"] == "measurement:length"
+    assert assembly["projection_component_entity_id"] == "entity:screen-frame"
+    assert assembly["projection_axis_basis"] == "已核对整樘立面外轮廓"
+
+    invalid_roles = tmp_path / "invalid-composite-roles.json"
+    invalid_roles_payload = json.loads(path.read_text(encoding="utf-8"))
+    invalid_roles_payload["components"]["component:1"]["selected"][
+        "composite_assembly"
+    ]["required_material_roles"] = ["included_other"]
+    invalid_roles.write_text(
+        json.dumps(invalid_roles_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="must include 'glass_infill'"):
+        load_confirmation_bundle(invalid_roles)
+
+    assembly["included_materials"][0]["material_code"] = "GC-GL-01"
+    invalid = tmp_path / "invalid-composite-confirmations.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["components"]["component:1"]["selected"]["composite_assembly"] = assembly
+    invalid.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported keys"):
+        load_confirmation_bundle(invalid)
+
+
 def test_confirmation_parser_rejects_target_value_engineering_quantity(
     tmp_path: Path,
 ):

@@ -12,8 +12,10 @@ from cadquote.calculation import (
     evaluate_numeric_expression,
 )
 from cadquote.evaluation import evaluate_takeoff
-from cadquote.exporter import QUOTE_HEADERS, build_quote_workbook
+from cadquote.exporter import QUOTE_HEADERS, _effective_export_items, build_quote_workbook
 from cadquote.models import (
+    ComponentMaterialRef,
+    CompositeAssembly,
     EvidenceEdge,
     MaterialSpec,
     MeasurementCandidate,
@@ -42,6 +44,39 @@ def item(**updates):
     }
     values.update(updates)
     return TakeoffItem(**values)
+
+
+def composite_assembly(
+    *,
+    material_status: ReviewStatus = ReviewStatus.PASS,
+    evidence_id: str = "entity:glass-callout",
+):
+    return CompositeAssembly(
+        assembly_type="screen_with_glass",
+        billing_basis="whole_elevation_projection",
+        required_material_roles=["glass_infill"],
+        included_materials=[
+            ComponentMaterialRef(
+                role="glass_infill",
+                material_spec_id="material:glass",
+                material_code="GC-GL-01",
+                material_name="艺术玻璃",
+                evidence_ids=[evidence_id],
+                status=material_status,
+            )
+        ],
+        basis="不锈钢屏风与玻璃为同一成品总成",
+        evidence_ids=[evidence_id],
+        projection_width_candidate_id="measurement:projection-width",
+        projection_length_candidate_id="measurement:projection-length",
+        projection_component_entity_id="entity:projection-component",
+        projection_axis_basis="已审核整樘立面左右及上下边界",
+        projection_axis_evidence_ids=[
+            "entity:projection-width",
+            "entity:projection-length",
+            "entity:projection-component",
+        ],
+    )
 
 
 def _write_test_png(path: Path, width: int = 600, height: int = 300) -> None:
@@ -218,6 +253,25 @@ def test_area_engineering_quantity_expression_enforces_dimension_and_scale():
     assert "dimension" in (invalid.block_reason or "")
 
 
+def test_composite_screen_uses_whole_projection_and_ignores_third_axis() -> None:
+    calculated = calculate_item(
+        item(
+            name="屏风",
+            material="304不锈钢",
+            unfolded_spec="70",
+            width_mm=1200,
+            length_mm=2000,
+            quantity=3,
+            unit="㎡",
+            composite_assembly=composite_assembly(),
+        )
+    )
+
+    assert calculated.width_mm == 1200
+    assert calculated.quantity == 3
+    assert calculated.engineering_quantity == pytest.approx(7.2)
+
+
 def test_engineering_quantity_expression_excel_compiler_is_fixed_grammar():
     assert (
         engineering_quantity_expression_to_excel(
@@ -266,6 +320,108 @@ def test_exact_approved_price_match():
     assert calculate_item(priced).amount == 2000
 
 
+def test_composite_price_requires_exact_included_material_and_basis() -> None:
+    material = MaterialSpec(
+        id="material:steel",
+        mt_code="MT-01",
+        name="古铜色不锈钢",
+        grade="304",
+        thickness_mm=1.2,
+        finish="PVD",
+        process="折弯",
+    )
+    pure = PriceEntry(
+        id="price:pure",
+        version="v1",
+        approved=True,
+        mt_code="MT-01",
+        material="古铜色不锈钢",
+        grade="304",
+        thickness_mm=1.2,
+        finish="PVD",
+        process="折弯",
+        pricing_method="按立面投影面积计算",
+        unit="㎡",
+        unit_price=500,
+        tax_included=True,
+        source="approved.xlsx",
+    )
+    composite = pure.model_copy(
+        update={
+            "id": "price:composite",
+            "unit_price": 800,
+            "included_material_codes": ["GC-GL-01"],
+            "composite_billing_basis": "whole_elevation_projection",
+        }
+    )
+    source = item(
+        name="屏风",
+        material="古铜色不锈钢",
+        width_mm=1200,
+        length_mm=2000,
+        quantity=3,
+        pricing_method="按立面投影面积计算",
+        composite_assembly=composite_assembly(),
+    )
+
+    pure_only = PriceBook(version="v1", approved=True, source="p", entries=[pure])
+    priced, issues = apply_price(source, material, pure_only)
+    assert priced.unit_price is None
+    assert issues
+
+    exact = PriceBook(
+        version="v1",
+        approved=True,
+        source="p",
+        entries=[pure, composite],
+    )
+    priced, issues = apply_price(source, material, exact)
+    assert not issues
+    assert priced.price_entry_id == "price:composite"
+    assert priced.unit_price == 800
+
+    unproved = source.model_copy(
+        update={"composite_assembly": composite_assembly(material_status=ReviewStatus.REVIEW)}
+    )
+    priced, issues = apply_price(unproved, material, exact)
+    assert priced.unit_price is None
+    assert any("缺少已确认" in issue for issue in issues)
+
+    fake_other = CompositeAssembly(
+        assembly_type="screen_with_glass",
+        billing_basis="whole_elevation_projection",
+        required_material_roles=["included_other"],
+        included_materials=[
+            ComponentMaterialRef(
+                role="included_other",
+                material_spec_id="material:not-glass",
+                material_code="GC-XX-99",
+                material_name="其他材料",
+                evidence_ids=["entity:other"],
+                status=ReviewStatus.PASS,
+            )
+        ],
+        basis="错误地把玻璃角色换成其他材料",
+        evidence_ids=["entity:other"],
+    )
+    fake_price = composite.model_copy(
+        update={"included_material_codes": ["GC-XX-99"]}
+    )
+    fake_book = PriceBook(
+        version="v1",
+        approved=True,
+        source="p",
+        entries=[fake_price],
+    )
+    priced, issues = apply_price(
+        source.model_copy(update={"composite_assembly": fake_other}),
+        material,
+        fake_book,
+    )
+    assert priced.unit_price is None
+    assert any("glass_infill" in issue for issue in issues)
+
+
 def test_expired_or_incomplete_price_never_matches():
     material = MaterialSpec(
         id="m1",
@@ -304,6 +460,27 @@ def test_expired_or_incomplete_price_never_matches():
     assert any("材料证据缺少" in issue for issue in issues)
 
 
+def test_failed_price_match_clears_stale_commercial_values() -> None:
+    material = MaterialSpec(
+        id="m-stale",
+        mt_code="MT-01",
+        name="古铜色不锈钢",
+        grade="304",
+        thickness_mm=1.2,
+        finish="PVD",
+        process="折弯",
+    )
+    stale = item(unit_price=999, price_entry_id="price:old", amount=999)
+    empty_book = PriceBook(version="v1", approved=True, source="p", entries=[])
+
+    cleared, issues = apply_price(stale, material, empty_book)
+
+    assert issues
+    assert cleared.unit_price is None
+    assert cleared.price_entry_id is None
+    assert cleared.amount is None
+
+
 def test_portable_quote_workbook(tmp_path: Path):
     calculated = calculate_item(item(unit_price=500, status=ReviewStatus.PASS))
     output = build_quote_workbook([calculated], tmp_path / "quote.xlsx")
@@ -315,6 +492,206 @@ def test_portable_quote_workbook(tmp_path: Path):
     calculated_values = load_workbook(output, data_only=True)
     assert calculated_values["报价表"]["L2"].value == 4
     assert calculated_values["报价表"]["P2"].value == 2000
+
+
+def test_composite_quote_is_one_row_and_requires_portable_material_proof(
+    tmp_path: Path,
+) -> None:
+    source = calculate_item(
+        item(
+            name="屏风",
+            material="古铜色不锈钢",
+            unfolded_spec="70",
+            width_mm=1200,
+            length_mm=2000,
+            quantity=3,
+            unit="㎡",
+            pricing_method="按立面投影面积计算",
+            unit_price=800,
+            component_id="component:screen",
+            composite_assembly=composite_assembly(),
+            status=ReviewStatus.PASS,
+        )
+    )
+    material_edge = EvidenceEdge(
+        id="edge:screen-glass",
+        relation="component_to_material",
+        source_id="component:screen",
+        target_id="material:glass",
+        basis=[
+            "assembly_type:screen_with_glass",
+            "billing_basis:whole_elevation_projection",
+            "role:glass_infill",
+            "material_code:GC-GL-01",
+            "evidence:entity:glass-callout",
+        ],
+        confidence=1,
+        status=ReviewStatus.PASS,
+    )
+    projection_edges = [
+        EvidenceEdge(
+            id=f"edge:screen-{role}",
+            relation="component_to_dimension",
+            source_id="component:screen",
+            target_id=f"measurement:projection-{role}",
+            basis=[f"whole_elevation_projection_{role}"],
+            confidence=1,
+            status=ReviewStatus.PASS,
+        )
+        for role in ("width", "length")
+    ]
+    output = build_quote_workbook(
+        [source],
+        tmp_path / "composite-proof.xlsx",
+        edges=[material_edge, *projection_edges],
+    )
+    formulas = load_workbook(output, data_only=False)["报价表"]
+    values = load_workbook(output, data_only=True)["报价表"]
+    assert formulas.max_row == 3
+    assert formulas["D2"].value == "MT-01｜古铜色不锈钢；GC-GL-01｜艺术玻璃"
+    assert "不拆分" in formulas["Q2"].value
+    assert "整樘按立面投影面积计量" in formulas["Q2"].value
+    assert values["L2"].value == pytest.approx(7.2)
+    assert values["P2"].value == pytest.approx(5760)
+
+    blocked_output = build_quote_workbook(
+        [source],
+        tmp_path / "composite-missing-proof.xlsx",
+    )
+    blocked_formulas = load_workbook(blocked_output, data_only=False)["报价表"]
+    blocked_values = load_workbook(blocked_output, data_only=True)["报价表"]
+    assert blocked_formulas["Q2"].value.startswith("[REVIEW]")
+    assert "缺少PASS复合材料证据边" in blocked_formulas["Q2"].value
+    assert blocked_values["O2"].value is None
+    assert blocked_values["P2"].value is None
+
+
+def test_composite_material_evidence_is_exclusive_across_quote_rows(
+    tmp_path: Path,
+) -> None:
+    shared_evidence = "entity:shared-glass-callout"
+    sources = [
+        calculate_item(
+            item(
+                sequence=index,
+                name=f"屏风-{index}",
+                material="古铜色不锈钢",
+                width_mm=1200,
+                length_mm=2000,
+                quantity=1,
+                unit="㎡",
+                pricing_method="按立面投影面积计算",
+                unit_price=800,
+                price_entry_id=f"price:screen-{index}",
+                component_id=f"component:screen-{index}",
+                composite_assembly=composite_assembly(evidence_id=shared_evidence),
+                status=ReviewStatus.PASS,
+            )
+        )
+        for index in (1, 2)
+    ]
+    material_edges = [
+        EvidenceEdge(
+            id=f"edge:screen-{index}-glass",
+            relation="component_to_material",
+            source_id=f"component:screen-{index}",
+            target_id="material:glass",
+            basis=[
+                "role:glass_infill",
+                "material_code:GC-GL-01",
+                f"evidence:{shared_evidence}",
+            ],
+            confidence=1,
+            status=ReviewStatus.PASS,
+        )
+        for index in (1, 2)
+    ]
+
+    effective = _effective_export_items(sources, material_edges)
+    assert [value.status for value in effective] == [
+        ReviewStatus.REVIEW,
+        ReviewStatus.REVIEW,
+    ]
+    for value in effective:
+        assert "复合材料证据重复占用" in (value.note or "")
+        assert shared_evidence in (value.note or "")
+        assert value.unit_price is None
+        assert value.price_entry_id is None
+        assert value.amount is None
+
+    output = build_quote_workbook(
+        sources,
+        tmp_path / "composite-duplicate-material-evidence.xlsx",
+        edges=material_edges,
+    )
+    formulas = load_workbook(output, data_only=False)["报价表"]
+    values = load_workbook(output, data_only=True)["报价表"]
+    for row in (2, 3):
+        assert formulas[f"Q{row}"].value.startswith("[REVIEW]")
+        assert "复合材料证据重复占用" in formulas[f"Q{row}"].value
+        assert values[f"O{row}"].value is None
+        assert values[f"P{row}"].value is None
+
+
+def test_forged_material_edge_cannot_reassign_composite_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence_id = "entity:screen-glass-callout"
+    source = calculate_item(
+        item(
+            name="屏风",
+            material="古铜色不锈钢",
+            width_mm=1200,
+            length_mm=2000,
+            quantity=1,
+            unit="㎡",
+            pricing_method="按立面投影面积计算",
+            unit_price=800,
+            price_entry_id="price:screen",
+            component_id="component:screen",
+            composite_assembly=composite_assembly(evidence_id=evidence_id),
+            status=ReviewStatus.PASS,
+        )
+    )
+    valid_edge = EvidenceEdge(
+        id="edge:screen-glass",
+        relation="component_to_material",
+        source_id="component:screen",
+        target_id="material:glass",
+        basis=[
+            "role:glass_infill",
+            "material_code:GC-GL-01",
+            f"evidence:{evidence_id}",
+        ],
+        confidence=1,
+        status=ReviewStatus.PASS,
+    )
+    forged_edge = valid_edge.model_copy(
+        update={
+            "id": "edge:forged-other-component",
+            "source_id": "component:other-screen",
+            "status": ReviewStatus.REVIEW,
+        }
+    )
+
+    effective = _effective_export_items([source], [valid_edge, forged_edge])
+    assert effective[0].status == ReviewStatus.REVIEW
+    assert "复合材料证据重复占用" in (effective[0].note or "")
+    assert effective[0].unit_price is None
+    assert effective[0].price_entry_id is None
+    assert effective[0].amount is None
+
+    output = build_quote_workbook(
+        [source],
+        tmp_path / "composite-forged-material-edge.xlsx",
+        edges=[valid_edge, forged_edge],
+    )
+    formulas = load_workbook(output, data_only=False)["报价表"]
+    values = load_workbook(output, data_only=True)["报价表"]
+    assert formulas["Q2"].value.startswith("[REVIEW]")
+    assert "复合材料证据重复占用" in formulas["Q2"].value
+    assert values["O2"].value is None
+    assert values["P2"].value is None
 
 
 def test_quote_uses_audited_engineering_expression_formula_and_cache(tmp_path: Path):

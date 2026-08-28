@@ -36,6 +36,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
 - Applies audited reviewer confirmations and resumes without re-running immutable upstream stages.
 - Computes `m`, `m²`, piece, and set quantities deterministically.
+- Treats a stainless screen with artistic-glass infill as one auditable composite row: whole-elevation projected area, both exact material identities, exclusive evidence ownership, and composite-only price matching. Construction depth is never substituted for a projection axis or quantity.
 - Supports a strictly parsed, CAD-evidence-bound engineering-quantity expression when a proven billing axis or internal topology multiplier cannot be represented by the visible width/length/quantity columns; the standard formula remains the default.
 - Matches only approved, versioned, specification-compatible prices.
 - Exports a five-sheet Excel workbook when evidence rendering is enabled: quotation, provenance, pending review, run metadata, and screenshot evidence. Debug runs with evidence disabled retain the legacy four-sheet layout.
@@ -52,6 +53,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 7. Repeated linework is only a review candidate; a reviewer must prove that it represents independent billable components.
 8. A `PASS` item must have rendered locator and close-up images for the same sequence and `component_id` at plan, elevation, and detail stages. The sole exception is an audited `detail=NOT_APPLICABLE` negative search covering the selected elevation; missing detail candidates never qualify automatically.
 9. Different component names cannot reuse one occurrence image, and one image cannot stand in for multiple evidence stages.
+10. A composite screen cannot become commercial `PASS` from proximity alone: its glass code must target the reviewed screen INSERT boundary, one glass evidence entity cannot support multiple physical rows, and a stainless-only price is ineligible.
 
 ## Requirements
 

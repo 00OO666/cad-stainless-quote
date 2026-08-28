@@ -124,7 +124,7 @@ def test_general_material_code_families_preserve_identity_and_scope() -> None:
     assert normalize_mt_code("GC-SS-101") is None
 
 
-def test_material_rows_keep_gc_ss_raw_code_and_ignore_unconfigured_families() -> None:
+def test_material_rows_keep_auxiliary_glass_without_quoting_unconfigured_families() -> None:
     rows = [
         ["材料编号", "名称"],
         ["ＧＣ－ＳＳ－１０１", "黑色哑光不锈钢"],
@@ -135,9 +135,31 @@ def test_material_rows_keep_gc_ss_raw_code_and_ignore_unconfigured_families() ->
 
     specs = parse_material_rows(rows, source_file_id="file:fixture", sheet_name="材料表")
 
-    assert [value.mt_code for value in specs] == ["GC-SS-101", "GC-MT-105"]
-    assert [value.material_code_family for value in specs] == ["GC-SS", "GC-MT"]
+    assert [value.mt_code for value in specs] == [
+        "GC-SS-101",
+        "GC-MT-105",
+        "GC-GL-201",
+    ]
+    assert [value.material_code_family for value in specs] == [
+        "GC-SS",
+        "GC-MT",
+        "GC-GL",
+    ]
     assert specs[0].raw_material_code == "ＧＣ－ＳＳ－１０１"
+
+
+def test_cad_material_table_parses_glass_as_auxiliary_spec() -> None:
+    specs = parse_cad_material_specs(
+        [
+            entity("entity:glass-code", "GC-GL-201", 0, 0, sheet_id="sheet:material"),
+            entity("entity:glass-name", "艺术玻璃", 30, 0, sheet_id="sheet:material"),
+        ]
+    )
+
+    assert len(specs) == 1
+    assert specs[0].mt_code == "GC-GL-201"
+    assert specs[0].name == "艺术玻璃"
+    assert specs[0].source_evidence == ["entity:glass-code", "entity:glass-name"]
 
 
 def test_detects_gc_ss_and_reviews_gc_mt_without_absorbing_gl_or_mr() -> None:
@@ -318,6 +340,29 @@ def test_detects_detached_mt_keywords_room_and_leader_without_counting_labels() 
         "entity:n1",
         "entity:material1",
     }
+
+
+def test_multileader_with_multiple_arrows_never_selects_the_first_target() -> None:
+    detected = detect_mt_occurrences(
+        [
+            entity(
+                "entity:multi",
+                "MT-01 不锈钢屏风",
+                20,
+                20,
+                entity_type="MULTILEADER",
+                geometry={
+                    "leader_targets": [[1, 1, 0], [9, 9, 0]],
+                    "label_point": [20, 20, 0],
+                    "vertices": [[1, 1, 0], [20, 20, 0], [9, 9, 0]],
+                },
+            )
+        ]
+    )
+
+    assert len(detected) == 1
+    assert detected[0].leader_entity_id == "entity:multi"
+    assert detected[0].leader_target is None
 
 
 def test_material_name_only_detection_requires_unique_registry_match() -> None:

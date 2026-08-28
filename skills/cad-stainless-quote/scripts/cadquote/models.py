@@ -250,6 +250,7 @@ class EvidenceEdge(StrictModel):
         "material_mention_to_material",
         "occurrence_to_component",
         "component_to_dimension",
+        "component_to_material",
         "component_to_engineering_quantity_evidence",
         "component_to_price",
     ]
@@ -280,6 +281,34 @@ class MeasurementCandidate(StrictModel):
     status: ReviewStatus = ReviewStatus.REVIEW
 
 
+class ComponentMaterialRef(StrictModel):
+    """An included material that belongs to the same physical billable assembly."""
+
+    role: Literal["glass_infill", "included_other"]
+    material_spec_id: str
+    material_code: str
+    material_name: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    status: ReviewStatus = ReviewStatus.REVIEW
+
+
+class CompositeAssembly(StrictModel):
+    """A multi-material physical assembly emitted as exactly one quotation row."""
+
+    kind: Literal["single_line_composite"] = "single_line_composite"
+    assembly_type: Literal["screen_with_glass"]
+    billing_basis: Literal["whole_elevation_projection"]
+    required_material_roles: list[Literal["glass_infill", "included_other"]]
+    included_materials: list[ComponentMaterialRef] = Field(default_factory=list)
+    basis: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    projection_width_candidate_id: str | None = None
+    projection_length_candidate_id: str | None = None
+    projection_component_entity_id: str | None = None
+    projection_axis_basis: str | None = None
+    projection_axis_evidence_ids: list[str] = Field(default_factory=list)
+
+
 class PriceEntry(StrictModel):
     id: str
     version: str
@@ -299,6 +328,8 @@ class PriceEntry(StrictModel):
     valid_to: str | None = None
     source: str
     note: str | None = None
+    included_material_codes: list[str] = Field(default_factory=list)
+    composite_billing_basis: Literal["whole_elevation_projection"] | None = None
 
 
 class PriceBook(StrictModel):
@@ -330,6 +361,7 @@ class TakeoffItem(StrictModel):
     price_entry_id: str | None = None
     amount: float | None = Field(default=None, ge=0)
     note: str | None = None
+    composite_assembly: CompositeAssembly | None = None
     component_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     status: ReviewStatus = ReviewStatus.REVIEW

@@ -13,7 +13,7 @@ import json
 import re
 from collections import Counter
 from datetime import date, datetime, time
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 
@@ -198,6 +198,7 @@ class GoldAuditIssue(_StrictModel):
         "QUANTITY_FORMULA_MISMATCH",
         "QUANTITY_ROUNDING_DEVIATION",
         "QUANTITY_NOT_CALCULABLE",
+        "QUANTITY_DERIVED_FROM_ENGINEERING",
         "AMOUNT_FORMULA_MISMATCH",
         "AMOUNT_NOT_CALCULABLE",
         "MISSING_REQUIRED_FIELD",
@@ -229,9 +230,15 @@ class GoldRow(_StrictModel):
     image_evidence: list[GoldImageEvidence] = Field(default_factory=list)
     recalculated_engineering_quantity: float | None = None
     reported_engineering_quantity: float | None = None
+    reported_quantity: float | None = None
+    effective_quantity: float | None = None
+    quantity_source: Literal["reported", "derived_from_engineering_quantity", "missing"] = (
+        "reported"
+    )
+    quantity_derivation_basis: str | None = None
     quantity_difference: float | None = None
     quantity_tolerance: float | None = None
-    quantity_audit: Literal["MATCH", "MISMATCH", "NOT_CALCULABLE"]
+    quantity_audit: Literal["MATCH", "MISMATCH", "DERIVED", "NOT_CALCULABLE"]
     audit_issue_ids: list[str] = Field(default_factory=list)
 
 
@@ -245,6 +252,7 @@ class GoldImportSummary(_StrictModel):
     quantity_material_mismatch_count: int = Field(ge=0)
     quantity_rounding_deviation_count: int = Field(ge=0)
     quantity_not_calculable_count: int = Field(ge=0)
+    quantity_derived_from_engineering_count: int = Field(ge=0)
     amount_mismatch_count: int = Field(ge=0)
     amount_not_calculable_count: int = Field(ge=0)
     pass_count: int = Field(ge=0)
@@ -667,6 +675,58 @@ def _formula_quantity(
     return None, ["单位"]
 
 
+def _quantity_from_authoritative_engineering(
+    *,
+    unit: str | None,
+    width: Decimal | None,
+    length: Decimal | None,
+    reported_engineering: Decimal | None,
+    unfolded_spec: Any,
+    display_tolerance: Decimal,
+) -> tuple[Decimal | None, str | None]:
+    """Derive a missing/default quantity from an authoritative human total.
+
+    This is a *candidate-gold repair* rule, not a production CAD inference.
+    It applies only when the reported engineering quantity resolves to one
+    positive integer multiplier under the standard unit formula. Production
+    takeoff must still prove that multiplier from physical CAD topology.
+
+    For linear pricing only the displayed length axis is considered here. A
+    workbook that bills the width axis is an audited billing-axis convention,
+    not evidence that the quantity field should be changed.
+    """
+
+    if reported_engineering is None or reported_engineering <= 0:
+        return None, None
+    base: Decimal | None = None
+    basis: str | None = None
+    if unit == "m" and length is not None and length > 0:
+        base = length / Decimal("1000")
+        basis = "工程量÷显示长度（m）得到有效数量"
+    elif unit == "㎡":
+        if width is None:
+            inferred = infer_unfolded_width(_value_repr(unfolded_spec))
+            width = Decimal(str(inferred)) if inferred is not None else None
+        if width is not None and width > 0 and length is not None and length > 0:
+            base = width * length / Decimal("1000000")
+            basis = "工程量÷单件展开面积得到有效数量"
+    elif unit in {"件", "套"}:
+        base = Decimal(1)
+        basis = "工程量即有效件数/套数"
+    if base is None or base <= 0:
+        return None, None
+
+    ratio = reported_engineering / base
+    integer = ratio.to_integral_value(rounding=ROUND_HALF_UP)
+    if integer <= 0 or integer > Decimal("100000"):
+        return None, None
+    reconstructed = base * integer
+    tolerance = max(display_tolerance, abs(reported_engineering) * Decimal("0.0001"))
+    if abs(reconstructed - reported_engineering) > tolerance:
+        return None, None
+    return integer, basis
+
+
 def _header_field(header: str) -> str | None:
     field = _HEADER_ALIASES.get(header)
     if field:
@@ -993,6 +1053,30 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
             reported_for_item = reported if reported is None or reported >= 0 else None
             unit_price_for_item = unit_price if unit_price is None or unit_price >= 0 else None
             amount_for_item = amount if amount is None or amount >= 0 else None
+            engineering_cell = sheet.cell(row_number, mapping.get("engineering_quantity", 0))
+            tolerance = _format_quantum(
+                engineering_cell.number_format if engineering_cell else None
+            )
+            derived_quantity: Decimal | None = None
+            quantity_derivation_basis: str | None = None
+            if quantity is None or quantity >= 0:
+                derived_quantity, quantity_derivation_basis = (
+                    _quantity_from_authoritative_engineering(
+                        unit=unit,
+                        width=width_for_calculation,
+                        length=length_for_calculation,
+                        reported_engineering=reported_for_item,
+                        unfolded_spec=values["unfolded_spec"],
+                        display_tolerance=tolerance,
+                    )
+                )
+            quantity_was_derived = (
+                derived_quantity is not None and derived_quantity != quantity_for_calculation
+            )
+            if quantity_was_derived:
+                quantity_for_calculation = derived_quantity
+            else:
+                quantity_derivation_basis = None
             recalculated, missing = _formula_quantity(
                 unit=unit,
                 width=width_for_calculation,
@@ -1002,9 +1086,15 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
             )
             issue_ids: list[str] = []
             row_status = ReviewStatus.REVIEW
-            quantity_audit: Literal["MATCH", "MISMATCH", "NOT_CALCULABLE"] = "MATCH"
+            quantity_audit: Literal[
+                "MATCH", "MISMATCH", "DERIVED", "NOT_CALCULABLE"
+            ] = "MATCH"
             difference: Decimal | None = None
-            tolerance: Decimal | None = None
+            quantity_source: Literal[
+                "reported", "derived_from_engineering_quantity", "missing"
+            ] = "missing" if quantity is None else "reported"
+            if quantity_was_derived:
+                quantity_source = "derived_from_engineering_quantity"
 
             if invalid_numeric_fields:
                 code = "INVALID_NUMERIC_VALUE"
@@ -1040,6 +1130,38 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                 issues.append(issue)
                 issue_ids.append(issue.id)
                 row_status = ReviewStatus.BLOCK
+
+            if quantity_was_derived:
+                quantity_audit = "DERIVED"
+                code = "QUANTITY_DERIVED_FROM_ENGINEERING"
+                issue = GoldAuditIssue(
+                    id=_issue_id(source_hash, sheet.name, row_number, code),
+                    code=code,
+                    severity="REVIEW",
+                    message=(
+                        "按已确认业务口径以人工工程量为准，反推出数量字段存在漏写或默认值"
+                    ),
+                    sheet_name=sheet.name,
+                    row=row_number,
+                    field="quantity",
+                    actual=str(quantity) if quantity is not None else None,
+                    expected=str(derived_quantity),
+                    evidence_cells=sum(
+                        (
+                            field_cells.get(field, [])
+                            for field in (
+                                "width_mm",
+                                "length_mm",
+                                "quantity",
+                                "engineering_quantity",
+                                "unit",
+                            )
+                        ),
+                        [],
+                    ),
+                )
+                issues.append(issue)
+                issue_ids.append(issue.id)
 
             missing_required = [
                 label for label, value in (("名称", name), ("MT编号", mt_code)) if not value
@@ -1107,10 +1229,6 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                 issue_ids.append(issue.id)
                 row_status = ReviewStatus.BLOCK
             else:
-                engineering_cell = sheet.cell(row_number, mapping.get("engineering_quantity", 0))
-                tolerance = _format_quantum(
-                    engineering_cell.number_format if engineering_cell else None
-                )
                 difference = reported - recalculated
                 if abs(difference) > tolerance:
                     quantity_audit = "MISMATCH"
@@ -1295,6 +1413,14 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
                     reported_engineering_quantity=(
                         float(reported) if reported is not None else None
                     ),
+                    reported_quantity=float(quantity) if quantity is not None else None,
+                    effective_quantity=(
+                        float(quantity_for_calculation)
+                        if quantity_for_calculation is not None
+                        else None
+                    ),
+                    quantity_source=quantity_source,
+                    quantity_derivation_basis=quantity_derivation_basis,
                     quantity_difference=float(difference) if difference is not None else None,
                     quantity_tolerance=float(tolerance) if tolerance is not None else None,
                     quantity_audit=quantity_audit,
@@ -1330,6 +1456,9 @@ def import_gold_workbook(path: str | Path) -> GoldImportResult:
         quantity_material_mismatch_count=issue_counts["QUANTITY_FORMULA_MISMATCH"],
         quantity_rounding_deviation_count=issue_counts["QUANTITY_ROUNDING_DEVIATION"],
         quantity_not_calculable_count=issue_counts["QUANTITY_NOT_CALCULABLE"],
+        quantity_derived_from_engineering_count=issue_counts[
+            "QUANTITY_DERIVED_FROM_ENGINEERING"
+        ],
         amount_mismatch_count=issue_counts["AMOUNT_FORMULA_MISMATCH"],
         amount_not_calculable_count=issue_counts["AMOUNT_NOT_CALCULABLE"],
         pass_count=status_counts[ReviewStatus.PASS.value],

@@ -23,6 +23,25 @@ def _bool(value: object) -> bool:
     return _norm(value) in {"1", "true", "yes", "y", "是", "已批准", "approved"}
 
 
+def _code_list(value: object | None) -> list[str]:
+    if value is None:
+        return []
+    raw_values = (
+        value
+        if isinstance(value, (list, tuple, set))
+        else re.split(r"[,，;；|｜]+", str(value))
+    )
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        code = str(raw).strip()
+        identity = _norm(code)
+        if code and identity not in seen:
+            result.append(code)
+            seen.add(identity)
+    return result
+
+
 def load_price_book(path: str | Path) -> PriceBook:
     source = Path(path)
     if source.suffix.lower() == ".json":
@@ -54,6 +73,16 @@ def load_price_book(path: str | Path) -> PriceBook:
         "valid_to": {"失效日期", "validto"},
         "source": {"价格来源", "来源", "source"},
         "note": {"备注", "note"},
+        "included_material_codes": {
+            "包含材料编号",
+            "随附材料编号",
+            "includedmaterialcodes",
+        },
+        "composite_billing_basis": {
+            "复合计量口径",
+            "复合计价口径",
+            "compositebillingbasis",
+        },
     }
     header_map: dict[str, int] = {}
     for index, raw in enumerate(rows[0]):
@@ -119,6 +148,14 @@ def load_price_book(path: str | Path) -> PriceBook:
                 valid_to=str(cell(row, "valid_to")) if cell(row, "valid_to") else None,
                 source=str(cell(row, "source", source)),
                 note=cell(row, "note"),
+                included_material_codes=_code_list(
+                    cell(row, "included_material_codes")
+                ),
+                composite_billing_basis=(
+                    str(cell(row, "composite_billing_basis")).strip()
+                    if cell(row, "composite_billing_basis") not in (None, "")
+                    else None
+                ),
             )
         )
     versions = sorted({entry.version for entry in entries})
@@ -157,6 +194,43 @@ def match_price(
     if material.conflicts:
         return None, ["材料定义存在冲突"]
 
+    assembly = item.composite_assembly
+    included_code_set: set[str] = set()
+    if assembly is not None:
+        if item.unit != "㎡":
+            issues.append("复合屏风必须以㎡计量")
+        if assembly.billing_basis != "whole_elevation_projection":
+            issues.append("复合屏风必须按整樘立面投影计量")
+        if (
+            not assembly.projection_width_candidate_id
+            or not assembly.projection_length_candidate_id
+            or not assembly.projection_component_entity_id
+            or not assembly.projection_axis_basis
+            or not assembly.projection_axis_evidence_ids
+        ):
+            issues.append("复合屏风缺少整樘投影轴及CAD证据")
+        present_roles = {reference.role for reference in assembly.included_materials}
+        if "glass_infill" not in present_roles:
+            issues.append("screen_with_glass复合构件缺少glass_infill材料")
+        missing_roles = sorted(set(assembly.required_material_roles) - present_roles)
+        if missing_roles:
+            issues.append("复合构件缺少必需材料角色：" + ", ".join(missing_roles))
+        for reference in assembly.included_materials:
+            if (
+                reference.status.value != "PASS"
+                or not reference.material_code.strip()
+                or not reference.material_name.strip()
+                or not reference.evidence_ids
+            ):
+                issues.append(
+                    f"复合材料{reference.role}缺少已确认编号、名称或同构件证据"
+                )
+            included_code_set.add(_norm(reference.material_code))
+        if not assembly.included_materials:
+            issues.append("复合构件没有随附材料")
+        if issues:
+            return None, issues
+
     if quote_date is None:
         effective_date = date.today()
     elif isinstance(quote_date, date):
@@ -185,6 +259,17 @@ def match_price(
         if _norm(entry.pricing_method) != _norm(item.pricing_method):
             continue
         if _norm(entry.unit) != _norm(item.unit):
+            continue
+        entry_included_codes = {
+            _norm(code) for code in entry.included_material_codes if _norm(code)
+        }
+        if assembly is None:
+            if entry.composite_billing_basis is not None or entry_included_codes:
+                continue
+        elif (
+            _norm(entry.composite_billing_basis) != _norm(assembly.billing_basis)
+            or entry_included_codes != included_code_set
+        ):
             continue
         required_entry = (
             entry.material,
@@ -256,7 +341,16 @@ def apply_price(
         tax_included=tax_included,
     )
     if entry is None:
-        return item, issues
+        return (
+            item.model_copy(
+                update={
+                    "unit_price": None,
+                    "price_entry_id": None,
+                    "amount": None,
+                }
+            ),
+            issues,
+        )
     return item.model_copy(
         update={"unit_price": entry.unit_price, "price_entry_id": entry.id}
     ), issues

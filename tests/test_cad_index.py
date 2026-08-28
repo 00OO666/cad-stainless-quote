@@ -7,8 +7,13 @@ from pathlib import Path
 import ezdxf
 import pytest
 from cadquote import converter
-from cadquote.cad_index import build_cad_index, index_dxf
+from cadquote.cad_index import (
+    _leader_anchor_from_geometry,
+    build_cad_index,
+    index_dxf,
+)
 from cadquote.classifier import classify_sheet
+from ezdxf.math import Vec2
 
 
 def _make_fixture(path: Path) -> Path:
@@ -29,6 +34,12 @@ def _make_fixture(path: Path) -> Path:
     dimension = modelspace.add_linear_dim(base=(0, 10), p1=(0, 0), p2=(100, 0))
     dimension.render()
     modelspace.add_leader([(0, 0), (5, 5), (10, 5)])
+    multileader = modelspace.add_multileader_mtext()
+    multileader.quick_leader(
+        "MT-02 stainless trim",
+        target=Vec2(120, 20),
+        segment1=Vec2(30, 10),
+    )
 
     sheet = document.layouts.new("一层平面")
     sheet.add_text("P-01 一层平面图", dxfattribs={"height": 4}).set_placement((5, 5))
@@ -125,6 +136,19 @@ def test_index_all_layouts_and_semantic_entities(tmp_path: Path) -> None:
     assert viewport.bbox
     assert len(viewport.geometry["model_bbox"]) == 4
 
+    multileader = next(
+        entity for entity in result.entities if entity.entity_type == "MULTILEADER"
+    )
+    assert multileader.geometry["leader_target"] == pytest.approx([120.0, 20.0, 0.0])
+    assert multileader.geometry["landing_point"] == pytest.approx([150.0, 30.0, 0.0])
+    assert multileader.geometry["label_point"] != multileader.geometry["leader_target"]
+    assert multileader.geometry["leader_paths"][0]["vertices"][0] == pytest.approx(
+        [120.0, 20.0, 0.0]
+    )
+    assert len(multileader.geometry["leader_paths"][0]["vertices"]) >= 2
+    assert multileader.bbox[0] <= 120.0 <= multileader.bbox[2]
+    assert multileader.bbox[1] <= 20.0 <= multileader.bbox[3]
+
 
 def test_json_and_sqlite_are_repeatable(tmp_path: Path) -> None:
     drawing = _make_fixture(tmp_path / "fixture.dxf")
@@ -147,6 +171,19 @@ def test_json_and_sqlite_are_repeatable(tmp_path: Path) -> None:
     assert source_count == 1
     assert sheet_count == len(first.sheets)
     assert entity_count == len(first.entities)
+
+
+def test_multi_arrow_leader_anchor_stays_on_annotation_not_first_arrow() -> None:
+    geometry = {
+        "leader_targets": [[1, 1, 0], [9, 9, 0]],
+        "label_point": [20, 20, 0],
+        "vertices": [[1, 1, 0], [20, 20, 0], [9, 9, 0]],
+    }
+
+    assert _leader_anchor_from_geometry(geometry) == (20.0, 20.0)
+
+    without_label = {key: value for key, value in geometry.items() if key != "label_point"}
+    assert _leader_anchor_from_geometry(without_label) is None
 
 
 def test_block_expansion_depth_and_entity_limits_are_explicit(tmp_path: Path) -> None:

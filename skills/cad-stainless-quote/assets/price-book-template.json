@@ -21,6 +21,8 @@
       "valid_from": null,
       "valid_to": null,
       "source": "REPLACE_WITH_PRICE_SOURCE",
+      "included_material_codes": [],
+      "composite_billing_basis": null,
       "note": "模板默认未批准；填写真实单价、含税口径、有效期并审核后，再把两处 approved 改为 true"
     }
   ]
