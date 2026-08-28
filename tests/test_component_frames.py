@@ -87,3 +87,61 @@ def test_component_frames_are_review_only_and_augment_selection(tmp_path: Path):
     )
     assert augmented["rows"][0]["object_bbox_state"] == {"group:1": "REVIEW"}
     assert augmented["rows"][0]["stage"] == {"group:1": "elevation"}
+
+
+def test_component_frames_keep_local_review_proposals_for_multiple_leaders(tmp_path: Path):
+    panels = {
+        "sheets": [{"id": "panel:1", "kind": "elevation", "bbox": [0, 0, 1_000, 500]}],
+        "entities": [
+            {
+                "id": "left",
+                "sheet_id": "panel:1",
+                "entity_type": "LWPOLYLINE",
+                "bbox": [80, 100, 260, 360],
+            },
+            {
+                "id": "right",
+                "sheet_id": "panel:1",
+                "entity_type": "LWPOLYLINE",
+                "bbox": [740, 100, 920, 360],
+            },
+        ],
+    }
+    boards = {
+        "groups": [
+            {
+                "group_id": "group:1",
+                "sheet_id": "panel:1",
+                "candidates": [
+                    {"occurrence_id": "occurrence:left", "leader_target": [160, 220]},
+                    {"occurrence_id": "occurrence:right", "leader_target": [840, 220]},
+                ],
+            }
+        ]
+    }
+    selections = [
+        {
+            "component_id": "component:1",
+            "group_id": "group:1",
+            "selected_occurrence_ids": ["occurrence:left", "occurrence:right"],
+        }
+    ]
+
+    result = suggest_component_frames(panels, boards, selections, tmp_path / "frames")
+
+    frames = result["records"][0]["frames"]
+    assert [frame["frame_role"] for frame in frames] == [
+        "selection_aggregate",
+        "occurrence_local",
+        "occurrence_local",
+    ]
+    assert frames[1]["selected_occurrence_ids"] == ["occurrence:left"]
+    assert frames[2]["selected_occurrence_ids"] == ["occurrence:right"]
+    augmented = json.loads(
+        (tmp_path / "frames" / "selections_with_frame_candidates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    instances = augmented["rows"][0]["instance_object_bboxes"]["group:1"]
+    assert len(instances) == 2
+    assert all(value["object_bbox_state"] == "REVIEW" for value in instances)

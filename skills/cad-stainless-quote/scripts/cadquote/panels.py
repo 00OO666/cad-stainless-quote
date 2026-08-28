@@ -13,11 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from .classifier import classify_sheet
-from .linking import extract_reference_codes
+from .linking import extract_reference_codes, extract_structured_reference_callouts
 from .models import CadEntity, Sheet
 from .mt import detect_mt_occurrences
 
 BBox = tuple[float, float, float, float]
+
+_PLAN_VIEW_TITLE_RE = re.compile(
+    r"平面(?:图|布置)?|(?:FLOOR|LAYOUT|FURNISHING|FIXTURE)\s+PLAN|\bPLAN\b",
+    re.I,
+)
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -35,6 +40,35 @@ def _as_bbox(value: Any) -> BBox | None:
     if x1 <= x0 or y1 <= y0:
         return None
     return x0, y0, x1, y1
+
+
+def _structured_cross_sheet_plan_evidence(
+    drawing_number: str | None,
+    title_texts: Sequence[str],
+    paper_entities: Sequence[CadEntity],
+) -> list[str]:
+    """Return explicit cross-sheet callouts that resolve a plan/ceiling tie.
+
+    Many interior sheets intentionally place a reflected-ceiling view beside a
+    floor-plan view and give both viewports the same model extents.  The shared
+    title can therefore score as both ``plan`` and ``ceiling``.  A structured
+    ``view number / target sheet`` callout inside one viewport is stronger
+    evidence that this particular viewport is the plan/index half.
+
+    The page's own title-block number is excluded: it is provenance for the
+    sheet, not a cross-drawing relationship.
+    """
+
+    if not any(_PLAN_VIEW_TITLE_RE.search(value or "") for value in title_texts):
+        return []
+    own_codes = extract_reference_codes(drawing_number)
+    return sorted(
+        {
+            callout.code
+            for callout in extract_structured_reference_callouts(paper_entities)
+            if callout.code not in own_codes
+        }
+    )
 
 
 def _intersects(left: BBox | None, right: BBox) -> bool:
@@ -1278,7 +1312,14 @@ def expand_viewport_panels(
         paper_entities = [entity for entity in source_entities if entity.space.startswith("paper:")]
         viewports = [entity for entity in paper_entities if entity.entity_type == "VIEWPORT"]
         page_references = _paper_page_references(paper_entities)
-        seen_boxes: set[tuple[str, tuple[float, ...]]] = set()
+        # A plan view and a reflected-ceiling view may deliberately show the
+        # same model region in two side-by-side paper viewports.  Deduplicating
+        # by model bbox alone discards one viewport and its distinct paper
+        # annotations (often the only elevation-index callouts).  Only collapse
+        # viewports that overlap in both paper and model coordinates.
+        seen_views: set[
+            tuple[str, tuple[float, ...], tuple[float, ...] | tuple[str]]
+        ] = set()
         specs: list[_ViewportPanelSpec] = []
         for viewport in sorted(viewports, key=lambda entity: (entity.space, entity.id)):
             viewport_id = viewport.geometry.get("viewport_id")
@@ -1288,10 +1329,22 @@ def expand_viewport_panels(
             if model_box is None or entity_count < minimum_entity_count:
                 output.warnings.append(f"{viewport.id}: no usable model-space region")
                 continue
-            dedupe_key = (viewport.space, tuple(round(value, 5) for value in model_box))
-            if dedupe_key in seen_boxes:
+            paper_box = _as_bbox(viewport.bbox)
+            paper_identity: tuple[float, ...] | tuple[str]
+            if paper_box is not None:
+                paper_identity = tuple(round(value, 5) for value in paper_box)
+            else:
+                # Without a paper bbox there is no safe geometric basis for
+                # collapsing two viewport records.
+                paper_identity = (viewport.id,)
+            dedupe_key = (
+                viewport.space,
+                tuple(round(value, 5) for value in model_box),
+                paper_identity,
+            )
+            if dedupe_key in seen_views:
                 continue
-            seen_boxes.add(dedupe_key)
+            seen_views.add(dedupe_key)
             specs.append(
                 _ViewportPanelSpec(
                     viewport=viewport,
@@ -1329,6 +1382,19 @@ def expand_viewport_panels(
                 layout_name=paper_layout,
                 primary_title_texts=primary_title_texts,
             )
+            page_code = page_reference.code if page_reference is not None else None
+            structured_plan_codes = _structured_cross_sheet_plan_evidence(
+                page_code,
+                [*primary_title_texts, *title_texts, *semantic_texts],
+                selected_paper,
+            )
+            if classification.kind in {"unknown", "ceiling"} and structured_plan_codes:
+                classification.kind = "plan"
+                classification.confidence = max(classification.confidence, 0.68)
+                classification.evidence = [
+                    *classification.evidence,
+                    "structured_plan_references:" + ",".join(structured_plan_codes),
+                ]
             sheet_id = _stable_id("panel", source_id, paper_layout, viewport.handle, model_box)
             title = (
                 primary_title_texts[0]

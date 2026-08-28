@@ -100,6 +100,7 @@ _HEADER_ALIASES = {
     "节点示意图": "detail",
     "计算式附图": "unfolded_spec",
     "计算式": "unfolded_spec",
+    "展开尺寸": "unfolded_spec",
     "规格尺寸": "unfolded_spec",
     "规格": "unfolded_spec",
     "造型规格mm": "unfolded_spec",

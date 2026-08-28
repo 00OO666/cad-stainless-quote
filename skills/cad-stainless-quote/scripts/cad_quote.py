@@ -15,7 +15,13 @@ from typing import Any
 from cadquote.cad_index import build_cad_index
 from cadquote.candidate_benchmark import build_candidate_benchmark
 from cadquote.candidate_boards import render_occurrence_candidate_boards
+from cadquote.component_closeups import render_component_frame_closeups
 from cadquote.component_frames import suggest_component_frames
+from cadquote.component_geometry import probe_component_geometry
+from cadquote.convention_candidates import (
+    build_convention_candidates,
+    load_convention_profile,
+)
 from cadquote.converter import convert_dwgs
 from cadquote.doctor import run_doctor
 from cadquote.evaluation import (
@@ -25,6 +31,7 @@ from cadquote.evaluation import (
 )
 from cadquote.evidence_quality import audit_evidence_quality
 from cadquote.exporter import build_quote_workbook
+from cadquote.geometry_boards import build_geometry_boards
 from cadquote.gold import import_gold_workbook
 from cadquote.gold_images import MANIFEST_NAME, export_gold_image_assets
 from cadquote.image_matching import register_screenshot_to_panel, write_registration
@@ -37,6 +44,7 @@ from cadquote.materials import (
     load_docx_material_specs,
     load_material_specs,
 )
+from cadquote.measurement_boards import build_measurement_boards
 from cadquote.models import (
     CadEntity,
     EvidenceEdge,
@@ -72,8 +80,11 @@ from cadquote.render import (
     viewport_model_regions,
 )
 from cadquote.selected_evidence import render_selected_occurrence_evidence
+from cadquote.stage_candidate_boards import render_stage_candidate_boards
+from cadquote.stage_candidate_regions import build_stage_candidate_regions
 from cadquote.stage_evidence import build_stage_evidence_manifest
 from cadquote.takeoff import build_takeoff
+from cadquote.variant_bindings import build_variant_bindings
 from cadquote.vector_probe import probe_repeated_vectors
 
 
@@ -162,6 +173,26 @@ def _evaluation_rows(payload: Any) -> tuple[list[dict[str, Any]], list[str | Non
         if isinstance(value.get("item"), dict):
             item = dict(value["item"])
             row_id = value.get("gold_id") or value.get("row_id") or value.get("id")
+            # ``gold-import`` deliberately keeps a workbook's source material
+            # code outside ``TakeoffItem.mt_code`` when it is not a legacy MT
+            # family.  Evaluation still has to compare that business code with
+            # the prediction, so use the first non-empty source-code line as the
+            # comparison value when (and only when) the canonical item has no
+            # code.  This is categorical source data; it is never inferred from
+            # dimensions, quantities, row order, or another row.
+            if not str(item.get("mt_code") or "").strip():
+                source_code = value.get("source_material_code")
+                if source_code is not None:
+                    primary_source_code = next(
+                        (
+                            line.strip()
+                            for line in str(source_code).replace("\r", "").split("\n")
+                            if line.strip()
+                        ),
+                        None,
+                    )
+                    if primary_source_code is not None:
+                        item["mt_code"] = primary_source_code
         else:
             item = dict(value)
             row_id = item.pop("gold_id", None) or item.pop("row_id", None) or item.pop("id", None)
@@ -600,6 +631,7 @@ def command_link(args: argparse.Namespace) -> int:
         occurrences,
         entities,
         promote_explicit=args.promote_explicit,
+        top_k=args.top_k,
     )
     payload = [value.model_dump(mode="json") for value in values]
     write_json_atomic(Path(args.out), payload)
@@ -692,6 +724,45 @@ def command_quote(args: argparse.Namespace) -> int:
             "issue_count": len(issues),
             "limitations": limitations,
             "output": str(output.resolve()),
+        }
+    )
+    return 0
+
+
+def command_convention_candidates(args: argparse.Namespace) -> int:
+    """Apply an external convention profile as a non-mutating candidate stage."""
+
+    profile = load_convention_profile(_load_json(args.profile))
+    result = build_convention_candidates(_load_json(args.takeoff), profile)
+    write_json_atomic(args.out, result)
+    _print(
+        {
+            "profile_id": profile.profile_id,
+            "profile_version": profile.profile_version,
+            "candidate_count": result["summary"]["candidate_count"],
+            "state_counts": result["summary"]["state_counts"],
+            "mutates_takeoff": False,
+            "commercial_effect": "NONE",
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 0
+
+
+def command_variant_bindings(args: argparse.Namespace) -> int:
+    """Build fail-closed lettered-casework candidates from CAD-native views."""
+
+    result = build_variant_bindings(_load_json(args.tasks), _load_json(args.panels))
+    result["input_provenance"] = {
+        "tasks_sha256": sha256_file(args.tasks),
+        "panels_sha256": sha256_file(args.panels),
+    }
+    write_json_atomic(args.out, result)
+    _print(
+        {
+            **result["summary"],
+            "production_eligible": False,
+            "output": str(args.out.resolve()),
         }
     )
     return 0
@@ -886,6 +957,178 @@ def command_component_frames(args: argparse.Namespace) -> int:
     return 0 if result.get("suggested_count") == result.get("selection_count") else 2
 
 
+def command_component_closeups(args: argparse.Namespace) -> int:
+    """Re-render component frames from vector CAD instead of enlarging panel PNGs."""
+
+    result = render_component_frame_closeups(
+        _load_json(args.index),
+        _load_json(args.panels),
+        _load_json(args.frames),
+        args.out,
+        target_px=args.target_px,
+        render_profile=args.render_profile,
+        margin_ratio=args.margin_ratio,
+        maximum=args.maximum,
+    )
+    _print(
+        {
+            "selection_count": result.get("selection_count", 0),
+            "requested_count": result.get("requested_count", 0),
+            "rendered_count": result.get("rendered_count", 0),
+            "missing_count": result.get("missing_count", 0),
+            "truncated_count": result.get("truncated_count", 0),
+            "failure_count": result.get("failure_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return (
+        2
+        if any(result.get(key) for key in ("missing_count", "truncated_count", "failure_count"))
+        else 0
+    )
+
+
+def command_component_geometry(args: argparse.Namespace) -> int:
+    """Expand bounded DXF block geometry into REVIEW-only world-coordinate candidates."""
+
+    result = probe_component_geometry(
+        _load_json(args.index),
+        _load_json(args.closeups),
+        args.out,
+        flattening_tolerance=args.flattening_tolerance,
+        endpoint_tolerance=args.endpoint_tolerance,
+        max_primitives_per_region=args.max_primitives_per_region,
+        max_total_primitives=args.max_total_primitives,
+        max_source_entities=args.max_source_entities,
+        max_paths_per_region=args.max_paths_per_region,
+        max_recursion_depth=args.max_recursion_depth,
+        max_points_per_primitive=args.max_points_per_primitive,
+    )
+    summary = result.get("summary", {})
+    _print(
+        {
+            "selection_count": summary.get("selection_count", 0),
+            "selection_without_evidence_count": summary.get("selection_without_evidence_count", 0),
+            "region_count": summary.get("region_count", 0),
+            "usable_region_count": summary.get("usable_region_count", 0),
+            "primitive_count": summary.get("primitive_count", 0),
+            "path_candidate_count": summary.get("path_candidate_count", 0),
+            "truncated_region_count": summary.get("truncated_region_count", 0),
+            "issue_count": summary.get("issue_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return (
+        2
+        if (
+            summary.get("usable_region_count") != summary.get("region_count")
+            or summary.get("truncated_region_count")
+            or summary.get("global_output_truncated")
+            or summary.get("issue_count")
+        )
+        else 0
+    )
+
+
+def command_stage_candidate_regions(args: argparse.Namespace) -> int:
+    """Turn ranked stage candidates into bounded REVIEW-only analysis regions."""
+
+    result = build_stage_candidate_regions(
+        _load_json(args.panels),
+        _load_json(args.stage_evidence),
+        _load_json(args.panel_catalog),
+        args.out,
+        stage=args.stage,
+        maximum_per_selection=args.maximum_per_selection,
+    )
+    _print(
+        {
+            "selection_count": result.get("selection_count", 0),
+            "evidence_count": result.get("evidence_count", 0),
+            "missing_count": result.get("missing_count", 0),
+            "truncated_selection_count": result.get("truncated_selection_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 2 if result.get("missing_count") else 0
+
+
+def command_stage_candidate_boards(args: argparse.Namespace) -> int:
+    """Render bounded REVIEW-only contact sheets for candidate comparison."""
+
+    result = render_stage_candidate_boards(
+        _load_json(args.regions),
+        args.out,
+        columns=args.columns,
+        tile_width=args.tile_width,
+        tile_height=args.tile_height,
+        maximum_per_board=args.maximum_per_board,
+    )
+    _print(
+        {
+            "board_count": result.get("board_count", 0),
+            "candidate_count": result.get("candidate_count", 0),
+            "missing_image_count": result.get("missing_image_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 2 if result.get("missing_image_count") else 0
+
+
+def command_geometry_boards(args: argparse.Namespace) -> int:
+    """Number REVIEW-only primitive/path boxes on their source close-up images."""
+
+    result = build_geometry_boards(
+        _load_json(args.closeups),
+        _load_json(args.geometry),
+        args.out,
+        closeup_root=args.closeups.parent,
+        maximum_per_image=args.maximum_per_image,
+        maximum_boards=args.maximum_boards,
+    )
+    _print(
+        {
+            "region_count": result.get("region_count", 0),
+            "board_count": result.get("board_count", 0),
+            "missing_count": result.get("missing_count", 0),
+            "unusable_count": result.get("unusable_count", 0),
+            "truncated_count": result.get("truncated_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return (
+        2
+        if any(
+            result.get(key)
+            for key in ("missing_count", "unusable_count", "truncated_count")
+        )
+        else 0
+    )
+
+
+def command_measurement_boards(args: argparse.Namespace) -> int:
+    """Label visible measurement candidates with their exact CAD entities."""
+
+    result = build_measurement_boards(
+        _load_json(args.panels),
+        _load_json(args.closeups),
+        args.out,
+        takeoff_payload=_load_json(args.takeoff) if args.takeoff else None,
+        closeup_root=args.closeups.parent,
+        maximum_per_image=args.maximum_per_image,
+    )
+    _print(
+        {
+            "selection_count": result.get("selection_count", 0),
+            "board_count": result.get("board_count", 0),
+            "missing_count": result.get("missing_count", 0),
+            "truncated_count": result.get("truncated_count", 0),
+            "output": str(args.out.resolve()),
+        }
+    )
+    return 2 if result.get("missing_count") or result.get("truncated_count") else 0
+
+
 def command_annotate_panel_catalog(args: argparse.Namespace) -> int:
     """Overlay projected paper annotations on an existing full model catalog."""
 
@@ -1028,7 +1271,11 @@ def command_stage_evidence(args: argparse.Namespace) -> int:
 
 
 def command_image_match(args: argparse.Namespace) -> int:
-    result = register_screenshot_to_panel(args.screenshot, args.panel)
+    result = register_screenshot_to_panel(
+        args.screenshot,
+        args.panel,
+        panel_cad_bbox=getattr(args, "panel_bbox", None),
+    )
     if args.out:
         write_registration(args.out, result)
     _print(result)
@@ -1407,6 +1654,12 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--panels", type=Path)
     link.add_argument("--out", type=Path, required=True)
     link.add_argument("--promote-explicit", action="store_true")
+    link.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="每个源图保留的弱关系候选数；显式图号关系不受此上限截断",
+    )
     link.set_defaults(handler=command_link)
 
     takeoff = subparsers.add_parser("takeoff", help="组装构件并生成尺寸候选/算量草稿")
@@ -1423,6 +1676,24 @@ def build_parser() -> argparse.ArgumentParser:
     quote.add_argument("takeoff", type=Path)
     quote.add_argument("--out", type=Path, required=True)
     quote.set_defaults(handler=command_quote)
+
+    convention_candidates = subparsers.add_parser(
+        "convention-candidates",
+        help="用外部版本化估算约定生成REVIEW/CONFIRMED候选，不改takeoff和报价金额",
+    )
+    convention_candidates.add_argument("takeoff", type=Path)
+    convention_candidates.add_argument("profile", type=Path)
+    convention_candidates.add_argument("--out", type=Path, required=True)
+    convention_candidates.set_defaults(handler=command_convention_candidates)
+
+    variant_bindings = subparsers.add_parser(
+        "variant-bindings",
+        help="按A/B/C构件视图标题、材料码和多视图原生尺寸生成REVIEW候选",
+    )
+    variant_bindings.add_argument("tasks", type=Path)
+    variant_bindings.add_argument("panels", type=Path)
+    variant_bindings.add_argument("--out", type=Path, required=True)
+    variant_bindings.set_defaults(handler=command_variant_bindings)
 
     render = subparsers.add_parser("render", help="渲染DXF局部证据图")
     render.add_argument("dxf", type=Path)
@@ -1502,6 +1773,67 @@ def build_parser() -> argparse.ArgumentParser:
     component_frames.add_argument("--out", type=Path, required=True)
     component_frames.set_defaults(handler=command_component_frames)
 
+    component_closeups = subparsers.add_parser(
+        "component-closeups",
+        help="按构件包络从DXF矢量重绘高清局部证据，避免放大模糊整图",
+    )
+    component_closeups.add_argument("index", type=Path)
+    component_closeups.add_argument("panels", type=Path)
+    component_closeups.add_argument("frames", type=Path)
+    component_closeups.add_argument("--out", type=Path, required=True)
+    component_closeups.add_argument("--target-px", type=int, default=3_200)
+    component_closeups.add_argument("--margin-ratio", type=float, default=0.04)
+    component_closeups.add_argument("--maximum", type=int, default=500)
+    component_closeups.add_argument(
+        "--render-profile",
+        choices=("white-fast", "cad-dark", "cad-dark-full"),
+        default="cad-dark-full",
+    )
+    component_closeups.set_defaults(handler=command_component_closeups)
+
+    component_geometry = subparsers.add_parser(
+        "component-geometry",
+        help="递归展开构件局部内块几何并生成连通路径尺寸候选，仅供REVIEW",
+    )
+    component_geometry.add_argument("index", type=Path)
+    component_geometry.add_argument("closeups", type=Path)
+    component_geometry.add_argument("--out", type=Path, required=True)
+    component_geometry.add_argument("--flattening-tolerance", type=float, default=0.5)
+    component_geometry.add_argument("--endpoint-tolerance", type=float, default=0.5)
+    component_geometry.add_argument("--max-primitives-per-region", type=int, default=20_000)
+    component_geometry.add_argument("--max-total-primitives", type=int, default=250_000)
+    component_geometry.add_argument("--max-source-entities", type=int, default=500_000)
+    component_geometry.add_argument("--max-paths-per-region", type=int, default=2_000)
+    component_geometry.add_argument("--max-recursion-depth", type=int, default=12)
+    component_geometry.add_argument("--max-points-per-primitive", type=int, default=4_096)
+    component_geometry.set_defaults(handler=command_component_geometry)
+
+    geometry_boards = subparsers.add_parser(
+        "geometry-boards",
+        help="在高清构件图上给高价值几何/连通路径bbox编号，仅供REVIEW",
+    )
+    geometry_boards.add_argument("closeups", type=Path)
+    geometry_boards.add_argument("geometry", type=Path)
+    geometry_boards.add_argument("--out", type=Path, required=True)
+    geometry_boards.add_argument("--maximum-per-image", type=int, default=80)
+    geometry_boards.add_argument("--maximum-boards", type=int, default=500)
+    geometry_boards.set_defaults(handler=command_geometry_boards)
+
+    measurement_boards = subparsers.add_parser(
+        "measurement-boards",
+        help="在高清构件图上给尺寸实体编号，供模型/审核人精确绑定CAD句柄",
+    )
+    measurement_boards.add_argument("panels", type=Path)
+    measurement_boards.add_argument("closeups", type=Path)
+    measurement_boards.add_argument(
+        "--takeoff",
+        type=Path,
+        help="可选：把构件内CAD entity ID进一步映射到measurement candidate ID",
+    )
+    measurement_boards.add_argument("--out", type=Path, required=True)
+    measurement_boards.add_argument("--maximum-per-image", type=int, default=120)
+    measurement_boards.set_defaults(handler=command_measurement_boards)
+
     annotate_catalog = subparsers.add_parser(
         "annotate-panel-catalog",
         help="在完整模型面板上叠加已投影的纸空间文字/引线，避免整张Layout重绘",
@@ -1551,12 +1883,51 @@ def build_parser() -> argparse.ArgumentParser:
     stage_evidence.add_argument("--out", type=Path, required=True)
     stage_evidence.set_defaults(handler=command_stage_evidence)
 
+    stage_candidate_regions = subparsers.add_parser(
+        "stage-candidate-regions",
+        help="把排序后的阶段候选转成可复用的REVIEW尺寸/几何分析区域",
+    )
+    stage_candidate_regions.add_argument("panels", type=Path)
+    stage_candidate_regions.add_argument("stage_evidence", type=Path)
+    stage_candidate_regions.add_argument("panel_catalog", type=Path)
+    stage_candidate_regions.add_argument("--out", type=Path, required=True)
+    stage_candidate_regions.add_argument(
+        "--stage",
+        choices=("plan", "elevation", "detail"),
+        default="detail",
+    )
+    stage_candidate_regions.add_argument(
+        "--maximum-per-selection",
+        type=int,
+        default=3,
+    )
+    stage_candidate_regions.set_defaults(handler=command_stage_candidate_regions)
+
+    stage_candidate_boards = subparsers.add_parser(
+        "stage-candidate-boards",
+        help="把多个阶段候选排成REVIEW联系表，先比图再选择节点候选",
+    )
+    stage_candidate_boards.add_argument("regions", type=Path)
+    stage_candidate_boards.add_argument("--out", type=Path, required=True)
+    stage_candidate_boards.add_argument("--columns", type=int, default=4)
+    stage_candidate_boards.add_argument("--tile-width", type=int, default=420)
+    stage_candidate_boards.add_argument("--tile-height", type=int, default=300)
+    stage_candidate_boards.add_argument("--maximum-per-board", type=int, default=24)
+    stage_candidate_boards.set_defaults(handler=command_stage_candidate_boards)
+
     image_match = subparsers.add_parser(
         "image-match",
         help="将人工清单中的CAD截图配准到自动渲染面板",
     )
     image_match.add_argument("screenshot", type=Path)
     image_match.add_argument("panel", type=Path)
+    image_match.add_argument(
+        "--panel-bbox",
+        type=float,
+        nargs=4,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help=("面板对应的CAD范围；把截图投影范围换算为REVIEW级CAD bbox，不会确认物理构件"),
+    )
     image_match.add_argument("--out", type=Path)
     image_match.set_defaults(handler=command_image_match)
 

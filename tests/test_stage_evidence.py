@@ -266,6 +266,75 @@ def _complete_selectors(record, closeups, *, detail_sheet="panel:detail-a"):
     ]
 
 
+def test_audited_not_applicable_detail_can_complete_plan_elevation_chain(tmp_path: Path):
+    fixture = _fixtures(tmp_path)
+    panel_payload, edges, selected, catalog, evidence_root, selection, closeups = fixture
+    discovery = _discover(fixture, tmp_path, suffix="discover-no-detail")
+    selectors = _complete_selectors(discovery, closeups)
+    selectors[-1] = {
+        "stage": "detail",
+        "state": "NOT_APPLICABLE",
+        "kind": "not_applicable",
+        "basis": "立面已包含全部计量尺寸，且索引未指向节点或大样",
+        "searched_sheet_ids": ["panel:elevation"],
+        "review": _review(2),
+    }
+    selection["stages"] = selectors
+
+    record = _build(
+        tmp_path,
+        panel_payload,
+        edges,
+        selected,
+        catalog,
+        selection,
+        evidence_root,
+        suffix="confirmed-no-detail",
+    )["records"][0]
+
+    assert record["state"] == "CONFIRMED"
+    assert record["stages"]["plan"]["state"] == "CONFIRMED"
+    assert record["stages"]["elevation"]["state"] == "CONFIRMED"
+    assert record["stages"]["detail"]["state"] == "NOT_APPLICABLE"
+    disposition = record["stages"]["detail"]["selected"][0]
+    assert disposition["candidate_id"] == "stage-disposition:detail-not-applicable"
+    assert disposition["context_image"] is None
+    assert disposition["closeup_image"] is None
+
+
+def test_not_applicable_detail_search_must_cover_selected_elevation(tmp_path: Path):
+    fixture = _fixtures(tmp_path)
+    panel_payload, edges, selected, catalog, evidence_root, selection, closeups = fixture
+    discovery = _discover(fixture, tmp_path, suffix="discover-bad-no-detail")
+    selectors = _complete_selectors(discovery, closeups)
+    selectors[-1] = {
+        "stage": "detail",
+        "state": "NOT_APPLICABLE",
+        "kind": "not_applicable",
+        "basis": "错误地只检查了平面",
+        "searched_sheet_ids": ["panel:plan"],
+        "review": _review(2),
+    }
+    selection["stages"] = selectors
+
+    record = _build(
+        tmp_path,
+        panel_payload,
+        edges,
+        selected,
+        catalog,
+        selection,
+        evidence_root,
+        suffix="bad-no-detail",
+    )["records"][0]
+
+    assert record["state"] == "BLOCK"
+    assert (
+        "NOT_APPLICABLE_DETAIL_SEARCH_MUST_COVER_SELECTED_ELEVATION"
+        in record["stages"]["detail"]["reason_codes"]
+    )
+
+
 def test_stage_evidence_never_takes_first_candidate(tmp_path: Path):
     fixture = _fixtures(tmp_path)
     record = _discover(fixture, tmp_path)
@@ -280,6 +349,60 @@ def test_stage_evidence_never_takes_first_candidate(tmp_path: Path):
     assert record["stages"]["detail"]["candidates"][0]["reference_entity_ids"] == [
         "panel_paper_entity:bbbb"
     ]
+
+
+def test_plan_occurrence_discovers_elevation_pivot_and_detail_candidates(tmp_path: Path):
+    fixture = _fixtures(tmp_path)
+    selected = fixture[2]
+    selected["records"][0]["evidence"][0].update(
+        {
+            "sheet_id": "panel:plan",
+            "selected_occurrence_ids": ["occurrence:plan"],
+            "object_bbox": [10, 10, 90, 90],
+        }
+    )
+
+    record = _discover(fixture, tmp_path, suffix="plan-anchor")
+
+    assert _candidate(record, "elevation", "panel:elevation")["source"] == (
+        "relation_pivot_candidate"
+    )
+    assert _candidate(record, "detail", "panel:detail-a")["relation_edge_id"] == (
+        "edge:detail-a"
+    )
+    relation_plan = [
+        candidate
+        for candidate in record["stages"]["plan"]["candidates"]
+        if candidate.get("relation_edge_id") == "edge:plan"
+    ]
+    assert len(relation_plan) == 1
+    assert record["state"] == "REVIEW"
+
+
+def test_detail_occurrence_discovers_elevation_pivot_and_plan_candidates(tmp_path: Path):
+    fixture = _fixtures(tmp_path)
+    selected = fixture[2]
+    selected["records"][0]["evidence"][0].update(
+        {
+            "sheet_id": "panel:detail-a",
+            "selected_occurrence_ids": ["occurrence:detail"],
+            "object_bbox": [10, 10, 70, 70],
+        }
+    )
+
+    record = _discover(fixture, tmp_path, suffix="detail-anchor")
+
+    assert _candidate(record, "elevation", "panel:elevation")["source"] == (
+        "relation_pivot_candidate"
+    )
+    assert _candidate(record, "plan", "panel:plan")["relation_edge_id"] == "edge:plan"
+    relation_details = [
+        candidate
+        for candidate in record["stages"]["detail"]["candidates"]
+        if candidate.get("relation_edge_id") == "edge:detail-a"
+    ]
+    assert len(relation_details) == 1
+    assert record["state"] == "REVIEW"
 
 
 def test_stage_evidence_confirms_only_verified_connected_complete_chain(tmp_path: Path):
@@ -1095,3 +1218,80 @@ def test_unknown_sheet_kind_never_defaults_to_elevation(tmp_path: Path):
 
     assert record["stages"]["elevation"]["candidates"] == []
     assert "SELECTED_EVIDENCE_KIND_OUTSIDE_STAGE_MODEL" in record["reason_codes"]
+
+
+def test_exact_material_code_recovers_detail_candidate_without_confirming_it(
+    tmp_path: Path,
+):
+    fixture = _fixtures(tmp_path)
+    panel_payload, _edges, _selected, _catalog, _root, selection, _closeups = fixture
+    selection["mt_code"] = "GC-SS-987"
+    next(
+        sheet for sheet in panel_payload["sheets"] if sheet["id"] == "panel:detail-b"
+    )["title"] = "门套节点图"
+    panel_payload["entities"].extend(
+        [
+            {
+                "id": "material:exact",
+                "sheet_id": "panel:detail-b",
+                "entity_type": "MTEXT",
+                "text": "304不锈钢 GC SS 987",
+            },
+            {
+                "id": "material:near-miss",
+                "sheet_id": "panel:detail-a",
+                "entity_type": "MTEXT",
+                "text": "GC-SS-9870",
+            },
+        ]
+    )
+
+    record = _discover(fixture, tmp_path, suffix="exact-material-retrieval")
+    recovered = [
+        value
+        for value in record["stages"]["detail"]["candidates"]
+        if value["source"] == "exact_material_code_candidate"
+    ]
+
+    assert len(recovered) == 1
+    assert recovered[0]["sheet_id"] == "panel:detail-b"
+    assert recovered[0]["reference_entity_ids"] == ["material:exact"]
+    assert recovered[0]["relation_edge_id"] is None
+    assert recovered[0]["state"] == "CANDIDATE"
+    assert record["stages"]["detail"]["candidates"][0]["sheet_id"] == (
+        "panel:detail-b"
+    )
+    assert recovered[0]["component_semantic_support"]["score"] > 0.7
+    assert record["state"] == "REVIEW"
+
+
+def test_explicit_companion_material_code_is_retrieval_only(tmp_path: Path):
+    fixture = _fixtures(tmp_path)
+    panel_payload, _edges, _selected, _catalog, _root, selection, _closeups = fixture
+    selection["mt_code"] = "GC-MR-101"
+    selection["companion_material_codes"] = ["GC-SS-987"]
+    panel_payload["entities"].append(
+        {
+            "id": "material:companion",
+            "sheet_id": "panel:detail-b",
+            "entity_type": "ATTRIB",
+            "text": "GC-SS-987",
+        }
+    )
+
+    record = _discover(fixture, tmp_path, suffix="companion-material-retrieval")
+    recovered = [
+        value
+        for value in record["stages"]["detail"]["candidates"]
+        if value["source"] == "companion_material_code_candidate"
+    ]
+
+    assert len(recovered) == 1
+    assert recovered[0]["sheet_id"] == "panel:detail-b"
+    assert recovered[0]["reference_entity_ids"] == ["material:companion"]
+    assert recovered[0]["relation_basis"] == ["exact_material_code:GC-SS-987"]
+    assert recovered[0]["reason_codes"] == [
+        "COMPANION_MATERIAL_CODE_IS_RETRIEVAL_ONLY"
+    ]
+    assert recovered[0]["relation_edge_id"] is None
+    assert record["state"] == "REVIEW"

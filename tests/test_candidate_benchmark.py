@@ -1,4 +1,8 @@
-from cadquote.candidate_benchmark import _page_code, build_candidate_benchmark
+from cadquote.candidate_benchmark import (
+    _is_physical_label,
+    _page_code,
+    build_candidate_benchmark,
+)
 from cadquote.models import MaterialMention, MtOccurrence
 
 
@@ -282,6 +286,67 @@ def test_vector_quantity_probe_is_candidate_only_and_does_not_fill_auto_row() ->
     assert result["auto_rows"][0]["quantity"] is None
 
 
+def test_vector_probe_structured_quantity_candidates_are_all_retrievable() -> None:
+    panel_payload = {
+        "sheets": [
+            {
+                "id": "sheet:1",
+                "source_file_id": "file:1",
+                "drawing_number": "E-03",
+                "kind": "elevation",
+            }
+        ],
+        "entities": [],
+    }
+    occurrence = MtOccurrence(
+        id="occurrence:1",
+        mt_code="MT-01",
+        source_file_id="file:1",
+        sheet_id="sheet:1",
+        leader_target=(100.0, 200.0),
+    )
+    gold_payload = {
+        "rows": [
+            {
+                "id": "gold:1",
+                "row": 6,
+                "source_material_code": "MT-01",
+                "item": {
+                    "sequence": 1,
+                    "name": "隔板",
+                    "mt_code": "MT-01",
+                    "plan_location": "E-03",
+                    "quantity": 3.0,
+                },
+            }
+        ]
+    }
+
+    result = build_candidate_benchmark(
+        panel_payload,
+        [occurrence],
+        {"components": [], "measurements": [], "items": []},
+        gold_payload,
+        vector_probe_payload={
+            "probes": [
+                {
+                    "occurrence_id": "occurrence:1",
+                    "recommended_quantity": None,
+                    "quantity_candidates": [
+                        {"value": 2, "method": "repeated_insert"},
+                        {"value": 3, "method": "repeated_connected_graph"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    row = result["comparison_rows"][0]
+    assert row["vector_quantity_probe_count"] == 1
+    assert row["vector_quantity_values"] == [2.0, 3.0]
+    assert row["quantity_probe"]["hit"] is True
+
+
 def test_quantity_candidate_uses_five_percent_not_one_whole_count_tolerance() -> None:
     panel_payload = {
         "sheets": [
@@ -335,3 +400,255 @@ def test_quantity_candidate_uses_five_percent_not_one_whole_count_tolerance() ->
     assert probe["closest"] == 2.0
     assert probe["relative_error"] == 1.0
     assert probe["hit"] is False
+
+
+def test_detail_material_tag_is_not_counted_as_a_second_line_item_occurrence() -> None:
+    panel_payload = {
+        "sheets": [
+            {
+                "id": "sheet:elevation",
+                "source_file_id": "file:1",
+                "drawing_number": "E-05",
+                "kind": "elevation",
+            },
+            {
+                "id": "sheet:detail",
+                "source_file_id": "file:1",
+                "drawing_number": "E-05",
+                "kind": "detail",
+            },
+        ],
+        "entities": [],
+    }
+    elevation = MtOccurrence(
+        id="occurrence:elevation",
+        mt_code="MT-01",
+        source_file_id="file:1",
+        sheet_id="sheet:elevation",
+        leader_target=(10.0, 20.0),
+    )
+    detail = elevation.model_copy(
+        update={"id": "occurrence:detail", "sheet_id": "sheet:detail"}
+    )
+    result = build_candidate_benchmark(
+        panel_payload,
+        [elevation, detail],
+        {
+            "components": [
+                {
+                    "id": "component:1",
+                    "mt_code": "MT-01",
+                    "elevation_occurrence_ids": ["occurrence:elevation"],
+                }
+            ],
+            "measurements": [],
+            "items": [],
+        },
+        {
+            "rows": [
+                {
+                    "id": "gold:1",
+                    "row": 5,
+                    "source_material_code": "MT-01",
+                    "item": {
+                        "sequence": 1,
+                        "name": "门套",
+                        "mt_code": "MT-01",
+                        "plan_location": "E-05",
+                    },
+                }
+            ]
+        },
+    )
+
+    row = result["comparison_rows"][0]
+    assert row["candidate_occurrence_ids"] == ["occurrence:elevation"]
+    assert row["candidate_occurrence_count"] == 1
+
+
+def test_categorical_assignment_is_one_to_one_and_never_uses_row_order() -> None:
+    panel_payload = {
+        "sheets": [
+            {
+                "id": "sheet:1",
+                "source_file_id": "file:1",
+                "drawing_number": "E-06",
+                "title": "立面图",
+                "kind": "elevation",
+            }
+        ],
+        "entities": [],
+    }
+    occurrences = [
+        MtOccurrence(
+            id=f"occurrence:{index}",
+            mt_code="MT-01",
+            source_file_id="file:1",
+            sheet_id="sheet:1",
+            leader_target=(float(index), 0.0),
+        )
+        for index in (1, 2)
+    ]
+    takeoff_payload = {
+        "components": [
+            {
+                "id": f"component:{index}",
+                "mt_code": "MT-01",
+                "elevation_occurrence_ids": [f"occurrence:{index}"],
+            }
+            for index in (1, 2)
+        ],
+        "measurements": [],
+        "items": [],
+    }
+    gold_payload = {
+        "rows": [
+            {
+                "id": f"gold:{index}",
+                "row": index + 4,
+                "source_material_code": "MT-01",
+                "item": {
+                    "sequence": index,
+                    "name": name,
+                    "mt_code": "MT-01",
+                    "plan_location": "E-06",
+                },
+            }
+            for index, name in ((1, "门套"), (2, "踢脚线"))
+        ]
+    }
+
+    result = build_candidate_benchmark(
+        panel_payload,
+        occurrences,
+        takeoff_payload,
+        gold_payload,
+    )
+
+    assert [
+        row["component_assignment"]["status"] for row in result["comparison_rows"]
+    ] == ["AMBIGUOUS", "AMBIGUOUS"]
+    summary = result["summary"]["categorical_one_to_one_assignment"]
+    assert summary["matched_count"] == 0
+    assert summary["duplicate_component_assignment_count"] == 0
+    assert summary["auto_components_in_gold_buckets"] == 2
+    assert summary["auto_components_outside_gold_buckets"] == 0
+    assert summary["overcomplete_bucket_component_count"] == 0
+
+
+def test_exact_physical_names_enable_unique_categorical_assignment() -> None:
+    panel_payload = {
+        "sheets": [
+            {
+                "id": "sheet:1",
+                "source_file_id": "file:1",
+                "drawing_number": "E-07",
+                "title": "立面图",
+                "kind": "elevation",
+            }
+        ],
+        "entities": [],
+    }
+    occurrences = [
+        MtOccurrence(
+            id=f"occurrence:{index}",
+            mt_code="MT-01",
+            source_file_id="file:1",
+            sheet_id="sheet:1",
+            leader_target=(float(index), 0.0),
+        )
+        for index in (1, 2)
+    ]
+    takeoff_payload = {
+        "components": [
+            {
+                "id": "component:door",
+                "mt_code": "MT-01",
+                "name": "门套",
+                "elevation_occurrence_ids": ["occurrence:1"],
+            },
+            {
+                "id": "component:skirting",
+                "mt_code": "MT-01",
+                "name": "踢脚线",
+                "elevation_occurrence_ids": ["occurrence:2"],
+            },
+        ],
+        "measurements": [],
+        "items": [],
+    }
+    gold_payload = {
+        "rows": [
+            {
+                "id": f"gold:{index}",
+                "row": index + 4,
+                "source_material_code": "MT-01",
+                "item": {
+                    "sequence": index,
+                    "name": name,
+                    "mt_code": "MT-01",
+                    "plan_location": "E-07",
+                },
+            }
+            for index, name in ((1, "踢脚线"), (2, "门套"))
+        ]
+    }
+
+    result = build_candidate_benchmark(
+        panel_payload,
+        occurrences,
+        takeoff_payload,
+        gold_payload,
+    )
+
+    matched = [
+        row["component_assignment"]["matched_component_id"]
+        for row in result["comparison_rows"]
+    ]
+    assert matched == ["component:skirting", "component:door"]
+    summary = result["summary"]["categorical_one_to_one_assignment"]
+    assert summary["matched_count"] == 2
+    assert summary["duplicate_component_assignment_count"] == 0
+
+
+def test_material_description_is_not_reported_as_a_physical_component_name() -> None:
+    occurrence = MtOccurrence(
+        id="occurrence:1",
+        mt_code="MT-01",
+        source_file_id="file:1",
+        sheet_id="sheet:1",
+    )
+    result = build_candidate_benchmark(
+        {
+            "sheets": [
+                {
+                    "id": "sheet:1",
+                    "source_file_id": "file:1",
+                    "drawing_number": "E-08",
+                    "title": "立面图",
+                    "kind": "elevation",
+                }
+            ],
+            "entities": [],
+        },
+        [occurrence],
+        {
+            "components": [
+                {
+                    "id": "component:1",
+                    "mt_code": "MT-01",
+                    "name": "灰色不锈钢",
+                    "elevation_occurrence_ids": ["occurrence:1"],
+                }
+            ],
+            "measurements": [],
+            "items": [],
+        },
+        {"rows": []},
+    )
+
+    assert result["auto_rows"][0]["name"] is None
+    assert result["auto_rows"][0]["name_candidates"] == []
+    assert _is_physical_label("全部版权归设计单位所有") is False
+    assert _is_physical_label("某市某路A座2505室") is False
+    assert _is_physical_label("健身室门套") is True

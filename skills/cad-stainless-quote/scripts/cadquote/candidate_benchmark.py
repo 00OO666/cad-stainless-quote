@@ -50,6 +50,226 @@ def _business_text(value: Any) -> str:
     return re.sub(r"[\s,，。()（）/|｜:：;；._\-—–]+", "", str(value or "")).casefold()
 
 
+_GENERIC_MATERIAL_LABELS = frozenset(
+    {
+        "不锈钢",
+        "灰色不锈钢",
+        "蓝色不锈钢",
+        "不锈钢构件",
+        "金属雕花",
+        "木转印铝板",
+        "玻璃",
+        "镜子",
+        "银镜",
+    }
+)
+_GENERIC_MATERIAL_KEYS = frozenset(_business_text(value) for value in _GENERIC_MATERIAL_LABELS)
+_NON_COMPONENT_LABEL_RE = re.compile(
+    r"(?:版权(?:归|所有)|copyright|(?:^|\W)(?:tel|email|www)(?:\W|$)|https?://)",
+    re.I,
+)
+
+
+def _is_physical_label(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text or _business_text(text) in _GENERIC_MATERIAL_KEYS:
+        return False
+    if _NON_COMPONENT_LABEL_RE.search(text):
+        return False
+    # Long address/title-block strings are a common false component hint.  A
+    # real room name can contain ``室`` or ``区``; require both an address token
+    # and a digit before rejecting it.
+    if len(text) >= 8 and re.search(r"\d", text) and re.search(r"[省市区县路街道号座室]", text):
+        return False
+    return True
+
+
+def _physical_label_candidates(
+    component: ComponentInstance,
+    item: Mapping[str, Any],
+    component_sheets: Sequence[Sheet],
+) -> list[str]:
+    """Return only categorical component labels, never numeric takeoff facts.
+
+    Material descriptions such as ``灰色不锈钢`` are not physical-component
+    names.  A specific viewport title can still be useful (for example a named
+    service-counter elevation), while a bare ``立面图`` cannot distinguish two
+    components.
+    """
+
+    values: list[str] = []
+    for raw in (component.name, component.room, item.get("name")):
+        text = str(raw or "").strip()
+        if _is_physical_label(text):
+            values.append(text)
+    for sheet in component_sheets:
+        title = re.sub(
+            r"\s*SCALE\s*[:：]?\s*1\s*[/：:]\s*\d+\s*$",
+            "",
+            sheet.title or "",
+            flags=re.I,
+        )
+        title = title.strip()
+        semantic_title = re.sub(
+            r"(?:平面图|正立面图|背立面图|侧立面图|立面图|剖面图|节点图|大样图)$",
+            "",
+            title,
+        ).strip()
+        if semantic_title and semantic_title != title or (
+            semantic_title
+            and not re.fullmatch(r"(?:平面|立面|剖面|节点|大样)", semantic_title)
+        ):
+            if _is_physical_label(semantic_title):
+                values.append(semantic_title)
+    return list(dict.fromkeys(values))
+
+
+def _categorical_name_score(gold_name: Any, label_candidates: Sequence[str]) -> int:
+    """Score names without dimensions, quantities, or engineering amounts."""
+
+    gold = _business_text(gold_name)
+    if not gold:
+        return 0
+    normalized = [_business_text(value) for value in label_candidates if _business_text(value)]
+    if gold in normalized:
+        return 4
+    for value in normalized:
+        shorter, longer = sorted((gold, value), key=len)
+        if len(shorter) >= 3 and shorter in longer and len(shorter) / len(longer) >= 0.6:
+            return 2
+    return 0
+
+
+def _assign_components_one_to_one(
+    comparison_rows: Sequence[dict[str, Any]],
+    auto_rows: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attach conservative categorical assignments without reusing components.
+
+    Matching uses only page/material identity and exact or strongly-contained
+    physical labels.  It deliberately ignores width, length, quantity, and
+    engineering quantity so a human answer cannot leak into prediction.
+    """
+
+    gold_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    auto_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, row in enumerate(comparison_rows):
+        bucket_key = (
+            str(row.get("page") or ""),
+            str(row.get("material_code") or ""),
+        )
+        gold_buckets[bucket_key].append(index)
+    for index, row in enumerate(auto_rows):
+        auto_buckets[
+            (_page_code(row.get("page")), str(row.get("mt_code") or ""))
+        ].append(index)
+
+    assignments: dict[int, tuple[int, str]] = {}
+    used_auto: set[int] = set()
+    for bucket_key, gold_indices in sorted(gold_buckets.items()):
+        auto_indices = auto_buckets.get(bucket_key, [])
+        if len(gold_indices) == 1 and len(auto_indices) == 1:
+            assignments[gold_indices[0]] = (auto_indices[0], "unique_page_material")
+            used_auto.add(auto_indices[0])
+            continue
+        if not auto_indices:
+            continue
+
+        scores = {
+            (gold_index, auto_index): _categorical_name_score(
+                comparison_rows[gold_index].get("name"),
+                auto_rows[auto_index].get("name_candidates", []),
+            )
+            for gold_index in gold_indices
+            for auto_index in auto_indices
+        }
+        proposals: list[tuple[int, int]] = []
+        for gold_index in gold_indices:
+            ranked = sorted(
+                ((scores[(gold_index, auto_index)], auto_index) for auto_index in auto_indices),
+                reverse=True,
+            )
+            if not ranked or ranked[0][0] <= 0:
+                continue
+            if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+                continue
+            proposals.append((gold_index, ranked[0][1]))
+        for gold_index, auto_index in proposals:
+            competing = [
+                other_gold
+                for other_gold in gold_indices
+                if scores[(other_gold, auto_index)] == scores[(gold_index, auto_index)]
+                and scores[(other_gold, auto_index)] > 0
+            ]
+            if competing == [gold_index] and auto_index not in used_auto:
+                assignments[gold_index] = (auto_index, "unique_categorical_name")
+                used_auto.add(auto_index)
+
+        # Categorical elimination is safe only when the bucket cardinalities
+        # already agree and every other member has an explicit unique match.
+        remaining_gold = [value for value in gold_indices if value not in assignments]
+        remaining_auto = [value for value in auto_indices if value not in used_auto]
+        if (
+            len(gold_indices) == len(auto_indices)
+            and len(remaining_gold) == 1
+            and len(remaining_auto) == 1
+        ):
+            assignments[remaining_gold[0]] = (remaining_auto[0], "categorical_elimination")
+            used_auto.add(remaining_auto[0])
+
+    matched_ids: list[str] = []
+    status_counts: Counter[str] = Counter()
+    for gold_index, row in enumerate(comparison_rows):
+        bucket = (str(row.get("page") or ""), str(row.get("material_code") or ""))
+        candidate_indices = auto_buckets.get(bucket, [])
+        candidate_ids = [str(auto_rows[index]["component_id"]) for index in candidate_indices]
+        if gold_index in assignments:
+            auto_index, method = assignments[gold_index]
+            component_id = str(auto_rows[auto_index]["component_id"])
+            matched_ids.append(component_id)
+            assignment = {
+                "status": "MATCHED",
+                "method": method,
+                "matched_component_id": component_id,
+                "candidate_component_ids": candidate_ids,
+            }
+        elif candidate_ids:
+            assignment = {
+                "status": "AMBIGUOUS",
+                "method": None,
+                "matched_component_id": None,
+                "candidate_component_ids": candidate_ids,
+            }
+        else:
+            assignment = {
+                "status": "MISSING",
+                "method": None,
+                "matched_component_id": None,
+                "candidate_component_ids": [],
+            }
+        row["component_assignment"] = assignment
+        status_counts[assignment["status"]] += 1
+
+    auto_components_in_gold_buckets = sum(
+        len(auto_buckets.get(bucket_key, ())) for bucket_key in gold_buckets
+    )
+    overcomplete_bucket_component_count = sum(
+        max(0, len(auto_buckets.get(bucket_key, ())) - len(gold_indices))
+        for bucket_key, gold_indices in gold_buckets.items()
+    )
+    return {
+        "matched_count": status_counts["MATCHED"],
+        "ambiguous_count": status_counts["AMBIGUOUS"],
+        "missing_count": status_counts["MISSING"],
+        "extra_auto_component_count": len(auto_rows) - len(set(matched_ids)),
+        "duplicate_component_assignment_count": len(matched_ids) - len(set(matched_ids)),
+        "auto_components_in_gold_buckets": auto_components_in_gold_buckets,
+        "auto_components_outside_gold_buckets": len(auto_rows)
+        - auto_components_in_gold_buckets,
+        "overcomplete_bucket_component_count": overcomplete_bucket_component_count,
+    }
+
+
 def _numeric_probe(
     expected: Any,
     values: Sequence[float],
@@ -137,7 +357,10 @@ def build_candidate_benchmark(
     occurrences_by_page_code: dict[tuple[str, str], list[MtOccurrence]] = defaultdict(list)
     for occurrence in occurrences:
         sheet = sheet_by_id.get(occurrence.sheet_id or "")
-        if sheet and sheet.drawing_number:
+        # A detail viewport can repeat the same material code and drawing number
+        # as its parent elevation.  It is valid detail evidence, but it is not a
+        # second physical line-item occurrence on that elevation page.
+        if sheet and sheet.drawing_number and sheet.kind != "detail":
             occurrences_by_page_code[(_page_code(sheet.drawing_number), occurrence.mt_code)].append(
                 occurrence
             )
@@ -151,8 +374,19 @@ def build_candidate_benchmark(
         if not isinstance(probe, Mapping):
             continue
         occurrence_id = probe.get("occurrence_id")
-        quantity = probe.get("recommended_quantity")
-        if isinstance(occurrence_id, str) and isinstance(quantity, (int, float)):
+        quantity_values = [
+            value
+            for value in [
+                probe.get("recommended_quantity"),
+                *[
+                    candidate.get("value")
+                    for candidate in probe.get("quantity_candidates", [])
+                    if isinstance(candidate, Mapping)
+                ],
+            ]
+            if isinstance(value, (int, float))
+        ]
+        if isinstance(occurrence_id, str) and quantity_values:
             vector_probe_by_occurrence[occurrence_id] = probe
     component_by_occurrence: dict[str, list[str]] = defaultdict(list)
     for component in components:
@@ -243,9 +477,17 @@ def build_candidate_benchmark(
             if occurrence.id in vector_probe_by_occurrence
         ]
         vector_quantity_values = {
-            float(probe["recommended_quantity"])
+            float(value)
             for probe in vector_quantity_probes
-            if isinstance(probe.get("recommended_quantity"), (int, float))
+            for value in [
+                probe.get("recommended_quantity"),
+                *[
+                    candidate.get("value")
+                    for candidate in probe.get("quantity_candidates", [])
+                    if isinstance(candidate, Mapping)
+                ],
+            ]
+            if isinstance(value, (int, float))
         }
         quantity_values = sorted(
             {
@@ -322,14 +564,34 @@ def build_candidate_benchmark(
             for value in occurrence_ids
             if value in occurrence_by_id
         ]
-        sheet = next(
+        component_sheets: list[Sheet] = []
+        component_sheet_ids: set[str] = set()
+        for occurrence in component_occurrences:
+            candidate_sheet = sheet_by_id.get(occurrence.sheet_id or "")
+            if candidate_sheet is None or candidate_sheet.id in component_sheet_ids:
+                continue
+            component_sheets.append(candidate_sheet)
+            component_sheet_ids.add(candidate_sheet.id)
+        elevation_sheet = next(
             (
                 sheet_by_id.get(occurrence.sheet_id or "")
                 for occurrence in component_occurrences
                 if sheet_by_id.get(occurrence.sheet_id or "") is not None
+                and sheet_by_id[occurrence.sheet_id or ""].kind in {"elevation", "door"}
             ),
             None,
         )
+        plan_sheet = next(
+            (
+                sheet_by_id.get(occurrence.sheet_id or "")
+                for occurrence in component_occurrences
+                if sheet_by_id.get(occurrence.sheet_id or "") is not None
+                and sheet_by_id[occurrence.sheet_id or ""].kind
+                in {"plan", "elevation_index", "ceiling", "floor"}
+            ),
+            None,
+        )
+        sheet = elevation_sheet or plan_sheet or (component_sheets[0] if component_sheets else None)
         candidates = measurements_by_component.get(component.id, [])
         auto_length = _auto_measurement(candidates, "length")
         auto_unfolded = _auto_measurement(candidates, "unfolded_spec")
@@ -343,6 +605,7 @@ def build_candidate_benchmark(
         distinct_quantities = sorted({value.numeric_value for value in quantity_candidates})
         auto_quantity = distinct_quantities[0] if len(distinct_quantities) == 1 else None
         item = items_by_component.get(component.id, {})
+        name_candidates = _physical_label_candidates(component, item, component_sheets)
         evidence_paths = []
         for occurrence in component_occurrences:
             record = evidence_by_occurrence.get(occurrence.id, {})
@@ -352,9 +615,13 @@ def build_candidate_benchmark(
         auto_rows.append(
             {
                 "component_id": component.id,
-                "name": item.get("name") or component.name or "不锈钢构件",
+                "name": next(iter(name_candidates), None),
+                "name_candidates": name_candidates,
+                "room": component.room,
                 "mt_code": component.mt_code,
                 "page": sheet.drawing_number if sheet else None,
+                "plan_page": plan_sheet.drawing_number if plan_sheet else None,
+                "elevation_page": elevation_sheet.drawing_number if elevation_sheet else None,
                 "sheet_kind": sheet.kind if sheet else None,
                 "sheet_title": sheet.title if sheet else None,
                 "unfolded_spec": auto_unfolded.raw_value if auto_unfolded else None,
@@ -374,6 +641,7 @@ def build_candidate_benchmark(
             }
         )
 
+    assignment_summary = _assign_components_one_to_one(comparison_rows, auto_rows)
     readiness_counts = Counter(row["readiness"] for row in comparison_rows)
     summary = {
         "gold_row_count": len(comparison_rows),
@@ -397,13 +665,14 @@ def build_candidate_benchmark(
             row["vector_quantity_probe_count"] > 0 for row in comparison_rows
         ),
         "readiness_distribution": dict(sorted(readiness_counts.items())),
+        "categorical_one_to_one_assignment": assignment_summary,
         "warning": (
             "This report measures candidate retrieval only. It does not select gold-fitted "
             "values as AI predictions and must not be reported as 95% row accuracy."
         ),
     }
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "summary": summary,
         "auto_rows": auto_rows,
         "comparison_rows": comparison_rows,

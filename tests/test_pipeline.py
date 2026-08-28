@@ -409,6 +409,242 @@ def test_confirmation_parser_preserves_reviewer_audit(tmp_path: Path):
     assert bundle.audit["component:1"]["reason"] == "与立面尺寸一致"
 
 
+def test_confirmation_parser_preserves_auditable_derived_measurement(tmp_path: Path):
+    path = tmp_path / "derived-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "length": {
+                                "kind": "derived_measurement",
+                                "expression": "left+middle+right",
+                                "terms": [
+                                    {"symbol": "left", "candidate_id": "measurement:1"},
+                                    {"symbol": "middle", "candidate_id": "measurement:2"},
+                                    {"symbol": "right", "candidate_id": "measurement:3"},
+                                ],
+                                "unit": "mm",
+                                "basis": "同一立面连续三段尺寸链",
+                            }
+                        },
+                        "reviewer": "张工",
+                        "reviewed_at": "2026-08-26T03:00:00+08:00",
+                        "reason": "逐段核对实体句柄",
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = load_confirmation_bundle(path)
+
+    derived = bundle.selections["component:1"]["length"]
+    assert derived["kind"] == "derived_measurement"
+    assert derived["expression"] == "left+middle+right"
+    assert derived["terms"][1] == {
+        "symbol": "middle",
+        "candidate_id": "measurement:2",
+    }
+    assert bundle.audit["component:1"]["selected"]["length"] == derived
+
+
+def test_confirmation_parser_preserves_audited_engineering_quantity_expression(
+    tmp_path: Path,
+):
+    path = tmp_path / "engineering-quantity-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "unit": "m",
+                            "engineering_quantity": {
+                                "kind": "engineering_quantity_expression",
+                                "expression": "length_mm*2/1000",
+                                "basis": "立面证实两条独立实体线",
+                                "evidence_ids": [" entity:left ", "entity:right"],
+                            }
+                        },
+                        "reviewer": "张工",
+                        "reviewed_at": "2026-08-26T03:00:00+08:00",
+                        "reason": "核对构件拓扑与计价轴",
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = load_confirmation_bundle(path)
+
+    assert bundle.selections["component:1"]["engineering_quantity"] == {
+        "kind": "engineering_quantity_expression",
+        "expression": "length_mm*2/1000",
+        "basis": "立面证实两条独立实体线",
+        "evidence_ids": ["entity:left", "entity:right"],
+    }
+
+
+def test_confirmation_parser_rejects_target_value_engineering_quantity(
+    tmp_path: Path,
+):
+    path = tmp_path / "target-value-engineering-quantity.json"
+    path.write_text(
+        json.dumps(
+            {
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "unit": "m",
+                            "engineering_quantity": {
+                                "kind": "engineering_quantity_expression",
+                                "expression": "7.25",
+                                "basis": "直接复制目标值",
+                                "evidence_ids": ["entity:1"],
+                            },
+                        }
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must reference a CAD-backed field"):
+        load_confirmation_bundle(path)
+
+
+def test_confirmation_parser_rejects_unsafe_engineering_quantity_expression(
+    tmp_path: Path,
+):
+    path = tmp_path / "unsafe-engineering-quantity-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "engineering_quantity": {
+                                "kind": "engineering_quantity_expression",
+                                "expression": "SUM(length_mm)",
+                                "basis": "人工输入",
+                                "evidence_ids": ["entity:1"],
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported engineering quantity expression"):
+        load_confirmation_bundle(path)
+
+
+def test_confirmation_parser_preserves_audited_not_applicable_detail(tmp_path: Path):
+    path = tmp_path / "no-detail-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "detail_requirement": {
+                                "kind": "not_applicable",
+                                "basis": "立面已包含全部计量尺寸，且无节点索引",
+                                "searched_sheet_ids": [" elevation ", "elevation"],
+                                "reference_entity_ids": ["entity:1"],
+                            }
+                        },
+                        "reviewer": "张工",
+                        "reviewed_at": "2026-08-26T03:00:00+08:00",
+                        "reason": "复核立面及索引范围",
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = load_confirmation_bundle(path)
+
+    assert bundle.selections["component:1"]["detail_requirement"] == {
+        "kind": "not_applicable",
+        "basis": "立面已包含全部计量尺寸，且无节点索引",
+        "searched_sheet_ids": ["elevation"],
+        "reference_entity_ids": ["entity:1"],
+    }
+
+
+def test_confirmation_parser_rejects_not_applicable_detail_without_search_scope(
+    tmp_path: Path,
+):
+    path = tmp_path / "invalid-no-detail-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "detail_requirement": {
+                                "kind": "not_applicable",
+                                "basis": "未发现节点",
+                                "searched_sheet_ids": [],
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="searched_sheet_ids"):
+        load_confirmation_bundle(path)
+
+
+def test_confirmation_parser_rejects_derived_measurement_without_source_terms(
+    tmp_path: Path,
+):
+    path = tmp_path / "invalid-derived-confirmations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "components": {
+                    "component:1": {
+                        "selected": {
+                            "length": {
+                                "kind": "derived_measurement",
+                                "expression": "7080",
+                                "terms": [],
+                                "basis": "人工填值",
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="terms"):
+        load_confirmation_bundle(path)
+
+
 def test_confirmation_parser_accepts_legacy_mapping(tmp_path: Path):
     path = tmp_path / "legacy.json"
     path.write_text(

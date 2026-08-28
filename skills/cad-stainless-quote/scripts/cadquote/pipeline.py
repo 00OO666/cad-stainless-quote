@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -12,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .cad_index import CadIndexBundle, index_dxf, write_index_sqlite
-from .calculation import calculate_item
+from .calculation import (
+    calculate_item,
+    engineering_quantity_expression_to_excel,
+    validate_engineering_quantity_expression,
+)
 from .converter import ConversionAudit, convert_dwgs
 from .evidence_images import build_excel_evidence_targets, render_excel_evidence
 from .exporter import build_quote_workbook
@@ -125,7 +130,7 @@ class PipelineResult:
 class ConfirmationBundle:
     """Normalized reviewer choices plus canonical reviewer audit context."""
 
-    selections: dict[str, dict[str, str | list[str]]] = field(default_factory=dict)
+    selections: dict[str, dict[str, Any]] = field(default_factory=dict)
     audit: dict[str, dict[str, Any]] = field(default_factory=dict)
     schema_version: str = "legacy"
     source_path: str | None = None
@@ -275,12 +280,220 @@ def _block_docx_cross_source_conflicts(
     ]
 
 
-def _selected_candidates(value: Any, *, label: str) -> dict[str, str | list[str]]:
+_DERIVED_MEASUREMENT_ROLES = frozenset(
+    {"unfolded_spec", "length", "height", "width", "quantity"}
+)
+_DERIVED_MEASUREMENT_KEYS = frozenset(
+    {"kind", "expression", "value_expression", "terms", "unit", "basis"}
+)
+_DERIVED_TERM_KEYS = frozenset({"symbol", "candidate_id"})
+_DERIVED_SYMBOL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}\Z")
+_DETAIL_REQUIREMENT_KEYS = frozenset(
+    {"kind", "basis", "searched_sheet_ids", "reference_entity_ids"}
+)
+_ENGINEERING_QUANTITY_KEYS = frozenset(
+    {"kind", "expression", "basis", "evidence_ids"}
+)
+
+
+def _derived_measurement_selection(
+    value: Mapping[str, Any],
+    *,
+    role: str,
+    label: str,
+) -> dict[str, Any]:
+    """Validate the portable shape of an auditable composite measurement.
+
+    Candidate existence, role compatibility and arithmetic are validated later,
+    when the takeoff builder has the current CAD evidence graph in memory.
+    """
+
+    if role not in _DERIVED_MEASUREMENT_ROLES:
+        raise ValueError(f"{label} is not a measurement role")
+    unknown = sorted(set(value) - _DERIVED_MEASUREMENT_KEYS)
+    if unknown:
+        raise ValueError(f"{label} has unsupported keys: {', '.join(unknown)}")
+    if value.get("kind") != "derived_measurement":
+        raise ValueError(f"{label}.kind must be 'derived_measurement'")
+
+    expression = value.get("expression")
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError(f"{label}.expression must be a non-empty symbolic expression")
+    value_expression = value.get("value_expression")
+    if value_expression is not None and (
+        not isinstance(value_expression, str) or not value_expression.strip()
+    ):
+        raise ValueError(f"{label}.value_expression must be a non-empty string")
+    basis = value.get("basis")
+    if not isinstance(basis, str) or not basis.strip():
+        raise ValueError(f"{label}.basis must be a non-empty explanation")
+
+    expected_unit = "count" if role == "quantity" else "mm"
+    unit = value.get("unit", expected_unit)
+    if unit != expected_unit:
+        raise ValueError(f"{label}.unit must be {expected_unit!r} for role {role!r}")
+
+    raw_terms = value.get("terms")
+    if not isinstance(raw_terms, list) or not raw_terms:
+        raise ValueError(f"{label}.terms must be a non-empty array")
+    terms: list[dict[str, str]] = []
+    symbols: set[str] = set()
+    for index, raw_term in enumerate(raw_terms):
+        term_label = f"{label}.terms[{index}]"
+        if not isinstance(raw_term, Mapping):
+            raise ValueError(f"{term_label} must be an object")
+        term_unknown = sorted(set(raw_term) - _DERIVED_TERM_KEYS)
+        if term_unknown:
+            raise ValueError(
+                f"{term_label} has unsupported keys: {', '.join(term_unknown)}"
+            )
+        symbol = raw_term.get("symbol")
+        candidate_id = raw_term.get("candidate_id")
+        if not isinstance(symbol, str) or not _DERIVED_SYMBOL_RE.fullmatch(symbol.strip()):
+            raise ValueError(f"{term_label}.symbol must be a short ASCII identifier")
+        normalized_symbol = symbol.strip()
+        if normalized_symbol in symbols:
+            raise ValueError(f"{label}.terms has duplicate symbol {normalized_symbol!r}")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError(f"{term_label}.candidate_id must be a non-empty ID")
+        symbols.add(normalized_symbol)
+        terms.append(
+            {"symbol": normalized_symbol, "candidate_id": candidate_id.strip()}
+        )
+
+    return {
+        "kind": "derived_measurement",
+        "expression": expression.strip(),
+        **(
+            {"value_expression": value_expression.strip()}
+            if isinstance(value_expression, str)
+            else {}
+        ),
+        "terms": terms,
+        "unit": unit,
+        "basis": basis.strip(),
+    }
+
+
+def _detail_requirement_selection(value: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+    """Validate an audited decision that a physical item has no detail stage.
+
+    A missing detail candidate is never enough.  The reviewer must name the CAD
+    sheets that were checked; takeoff validation later proves that those sheet
+    IDs belong to the selected component chain.
+    """
+
+    unknown = sorted(set(value) - _DETAIL_REQUIREMENT_KEYS)
+    if unknown:
+        raise ValueError(f"{label} has unsupported keys: {', '.join(unknown)}")
+    if value.get("kind") != "not_applicable":
+        raise ValueError(f"{label}.kind must be 'not_applicable'")
+    basis = value.get("basis")
+    if not isinstance(basis, str) or not basis.strip():
+        raise ValueError(f"{label}.basis must be a non-empty explanation")
+
+    raw_sheet_ids = value.get("searched_sheet_ids")
+    if not isinstance(raw_sheet_ids, list) or not raw_sheet_ids:
+        raise ValueError(f"{label}.searched_sheet_ids must be a non-empty array")
+
+    def normalized_ids(raw: Any, *, field: str, allow_empty: bool) -> list[str]:
+        if not isinstance(raw, list) or (not raw and not allow_empty):
+            qualifier = "an array" if allow_empty else "a non-empty array"
+            raise ValueError(f"{label}.{field} must be {qualifier}")
+        result: list[str] = []
+        seen: set[str] = set()
+        for index, candidate in enumerate(raw):
+            if not isinstance(candidate, str) or not candidate.strip():
+                raise ValueError(
+                    f"{label}.{field}[{index}] must be a non-empty ID"
+                )
+            candidate_id = candidate.strip()
+            if candidate_id not in seen:
+                result.append(candidate_id)
+                seen.add(candidate_id)
+        return result
+
+    searched_sheet_ids = normalized_ids(
+        raw_sheet_ids,
+        field="searched_sheet_ids",
+        allow_empty=False,
+    )
+    raw_reference_ids = value.get("reference_entity_ids", [])
+    reference_entity_ids = normalized_ids(
+        raw_reference_ids,
+        field="reference_entity_ids",
+        allow_empty=True,
+    )
+    return {
+        "kind": "not_applicable",
+        "basis": basis.strip(),
+        "searched_sheet_ids": searched_sheet_ids,
+        "reference_entity_ids": reference_entity_ids,
+    }
+
+
+def _engineering_quantity_selection(
+    value: Mapping[str, Any], *, label: str
+) -> dict[str, Any]:
+    """Validate an auditable exception to the standard unit formula."""
+
+    unknown = sorted(set(value) - _ENGINEERING_QUANTITY_KEYS)
+    if unknown:
+        raise ValueError(f"{label} has unsupported keys: {', '.join(unknown)}")
+    if value.get("kind") != "engineering_quantity_expression":
+        raise ValueError(f"{label}.kind must be 'engineering_quantity_expression'")
+    expression = value.get("expression")
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError(f"{label}.expression must be a non-empty string")
+    engineering_quantity_expression_to_excel(expression.strip(), row=1)
+    basis = value.get("basis")
+    if not isinstance(basis, str) or not basis.strip():
+        raise ValueError(f"{label}.basis must be a non-empty explanation")
+    raw_evidence_ids = value.get("evidence_ids")
+    if not isinstance(raw_evidence_ids, list) or not raw_evidence_ids:
+        raise ValueError(f"{label}.evidence_ids must be a non-empty array")
+    evidence_ids: list[str] = []
+    seen: set[str] = set()
+    for index, raw_id in enumerate(raw_evidence_ids):
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise ValueError(f"{label}.evidence_ids[{index}] must be a non-empty CAD entity ID")
+        entity_id = raw_id.strip()
+        if entity_id not in seen:
+            evidence_ids.append(entity_id)
+            seen.add(entity_id)
+    return {
+        "kind": "engineering_quantity_expression",
+        "expression": expression.strip(),
+        "basis": basis.strip(),
+        "evidence_ids": evidence_ids,
+    }
+
+
+def _selected_candidates(value: Any, *, label: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be an object mapping roles to candidate IDs")
-    result: dict[str, str | list[str]] = {}
+    result: dict[str, Any] = {}
     for role, candidate in value.items():
         normalized_role = str(role)
+        if isinstance(candidate, Mapping):
+            if normalized_role == "detail_requirement":
+                result[normalized_role] = _detail_requirement_selection(
+                    candidate,
+                    label=f"{label}[{role!r}]",
+                )
+                continue
+            if normalized_role == "engineering_quantity":
+                result[normalized_role] = _engineering_quantity_selection(
+                    candidate,
+                    label=f"{label}[{role!r}]",
+                )
+                continue
+            result[normalized_role] = _derived_measurement_selection(
+                candidate,
+                role=normalized_role,
+                label=f"{label}[{role!r}]",
+            )
+            continue
         if normalized_role == "merge_component_ids" and isinstance(candidate, list):
             normalized_ids: list[str] = []
             seen_ids: set[str] = set()
@@ -298,6 +511,13 @@ def _selected_candidates(value: Any, *, label: str) -> dict[str, str | list[str]
         if not isinstance(candidate, str) or not candidate.strip():
             raise ValueError(f"{label}[{role!r}] must be a non-empty candidate ID")
         result[normalized_role] = candidate.strip()
+    engineering = result.get("engineering_quantity")
+    unit = result.get("unit")
+    if isinstance(engineering, Mapping) and isinstance(unit, str):
+        validate_engineering_quantity_expression(
+            str(engineering["expression"]),
+            unit=unit,
+        )
     return result
 
 
@@ -316,7 +536,7 @@ def _reviewed_at(value: Any, *, label: str) -> str:
 
 def _confirmation_audit_record(
     record: Mapping[str, Any],
-    selected: Mapping[str, str | list[str]],
+    selected: Mapping[str, Any],
     *,
     label: str,
 ) -> dict[str, Any]:
@@ -373,7 +593,7 @@ def _load_confirmations(value: Path | str | None) -> ConfirmationBundle:
         if not isinstance(component_payload, Mapping):
             raise ValueError("confirmations.components must be an object")
         schema_version = str(payload.get("schema_version") or "1.0")
-        selections: dict[str, dict[str, str | list[str]]] = {}
+        selections: dict[str, dict[str, Any]] = {}
         audit: dict[str, dict[str, Any]] = {}
         for component_id, record in component_payload.items():
             if not isinstance(record, Mapping):
@@ -428,7 +648,7 @@ def _load_manifest_confirmations(path: Path) -> ConfirmationBundle:
     if not isinstance(audit_payload, Mapping):
         raise ValueError("manifest metadata.confirmation_audit must be an object")
     schema_version = str(metadata.get("confirmation_schema_version") or "1.0")
-    selections: dict[str, dict[str, str | list[str]]] = {}
+    selections: dict[str, dict[str, Any]] = {}
     audit: dict[str, dict[str, Any]] = {}
     for component_id, record in audit_payload.items():
         if not isinstance(record, Mapping):
@@ -902,6 +1122,31 @@ def _build_review_pack(
                 "merge_component_ids_comma_separated": (
                     "component:SOURCE_ID_1,component:SOURCE_ID_2"
                 ),
+                "detail_requirement_when_reviewed_as_absent": {
+                    "kind": "not_applicable",
+                    "basis": (
+                        "selected elevation contains all takeoff dimensions and no detail reference"
+                    ),
+                    "searched_sheet_ids": ["panel:SELECTED_ELEVATION_ID"],
+                    "reference_entity_ids": [],
+                },
+                "derived_measurement": {
+                    "kind": "derived_measurement",
+                    "expression": "left+middle+right*2",
+                    "terms": [
+                        {"symbol": "left", "candidate_id": "measurement:LEFT"},
+                        {"symbol": "middle", "candidate_id": "measurement:MIDDLE"},
+                        {"symbol": "right", "candidate_id": "measurement:RIGHT"},
+                    ],
+                    "unit": "mm",
+                    "basis": "同一已确认立面中的连续尺寸链，right 对称重复两次",
+                },
+                "engineering_quantity": {
+                    "kind": "engineering_quantity_expression",
+                    "expression": "length_mm*quantity*2/1000",
+                    "basis": "CAD证实显示数量之外还存在两条独立计价线",
+                    "evidence_ids": ["entity:SELECTED_CHAIN_ENTITY_ID"],
+                },
             },
             "components": {
                 component.id: {

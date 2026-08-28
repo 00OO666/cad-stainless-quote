@@ -196,6 +196,8 @@ def test_import_composite_headers_images_and_non_mt_material_code(tmp_path: Path
     assert result.sheets[0].field_columns["engineering_quantity"] == 12
     assert result.rows[0].row == 6
     assert result.rows[0].source_material_code == "GC-SS-201"
+    assert result.rows[0].item.unfolded_spec == "10+20+10"
+    assert result.rows[0].field_cells["unfolded_spec"] == ["H6"]
     assert result.rows[0].mt_code_source is None
     assert result.rows[0].item.mt_code == ""
     assert result.rows[0].item.status.value == "BLOCK"

@@ -111,3 +111,103 @@ def test_occurrence_without_leader_target_is_not_probed(tmp_path: Path) -> None:
     assert result["probes"] == []
     assert result["summary"]["skipped_without_leader_target_count"] == 1
     assert result["skipped_without_leader_target_ids"] == ["mt:synthetic"]
+
+
+def test_repeated_insert_instances_are_a_structured_review_candidate(tmp_path: Path) -> None:
+    drawing = tmp_path / "repeated-inserts.dxf"
+    document = ezdxf.new("R2013")
+    block = document.blocks.new("METAL_PANEL")
+    block.add_lwpolyline([(0, 0), (500, 0), (500, 800), (0, 800)], close=True)
+    modelspace = document.modelspace()
+    modelspace.add_blockref("METAL_PANEL", (0, 0), dxfattribs={"layer": "METAL"})
+    modelspace.add_blockref("METAL_PANEL", (900, 0), dxfattribs={"layer": "METAL"})
+    document.saveas(drawing)
+
+    result = probe_repeated_vectors(
+        {"file:synthetic": drawing},
+        [_sheet()],
+        [_occurrence((250, 400))],
+        radius=1_500,
+    )
+
+    probe = result["probes"][0]
+    insert = next(
+        value for value in probe["quantity_candidates"] if value["method"] == "repeated_insert"
+    )
+    assert insert["value"] == 2
+    assert len(insert["handles"]) == 2
+    assert insert["anchor_handles"]
+    assert probe["recommended_quantity"] == 2
+
+
+def test_repeated_connected_line_graphs_are_counted_as_instances(tmp_path: Path) -> None:
+    drawing = tmp_path / "connected-graphs.dxf"
+    document = ezdxf.new("R2013")
+    modelspace = document.modelspace()
+    for offset in (0, 900):
+        modelspace.add_line((offset, 0), (offset + 500, 0), dxfattribs={"layer": "METAL"})
+        modelspace.add_line((offset, 0), (offset, 800), dxfattribs={"layer": "METAL"})
+        modelspace.add_line(
+            (offset + 500, 0),
+            (offset + 500, 800),
+            dxfattribs={"layer": "METAL"},
+        )
+    document.saveas(drawing)
+
+    result = probe_repeated_vectors(
+        {"file:synthetic": drawing},
+        [_sheet()],
+        [_occurrence((250, 400))],
+        radius=1_500,
+    )
+
+    probe = result["probes"][0]
+    connected = next(
+        value
+        for value in probe["quantity_candidates"]
+        if value["method"] == "repeated_connected_graph"
+    )
+    assert connected["value"] == 2
+    assert len(connected["handles"]) == 6
+
+
+def test_one_containing_insert_without_peer_supports_quantity_one_candidate(
+    tmp_path: Path,
+) -> None:
+    drawing = tmp_path / "single-insert.dxf"
+    document = ezdxf.new("R2013")
+    block = document.blocks.new("UNIQUE_METAL_PANEL")
+    block.add_lwpolyline([(0, 0), (600, 0), (600, 900), (0, 900)], close=True)
+    document.modelspace().add_blockref(
+        "UNIQUE_METAL_PANEL",
+        (0, 0),
+        dxfattribs={"layer": "METAL"},
+    )
+    document.saveas(drawing)
+
+    result = probe_repeated_vectors(
+        {"file:synthetic": drawing},
+        [_sheet()],
+        [_occurrence((300, 450))],
+        radius=1_500,
+    )
+
+    probe = result["probes"][0]
+    assert probe["recommended_quantity"] is None
+    assert probe["quantity_candidates"] == [
+        {
+            "value": 1,
+            "method": "single_insert",
+            "status": "REVIEW",
+            "confidence": 0.52,
+            "signature": probe["quantity_candidates"][0]["signature"],
+            "handles": probe["quantity_candidates"][0]["handles"],
+            "anchor_handles": probe["quantity_candidates"][0]["anchor_handles"],
+            "anchor_distance_drawing_units": 0.0,
+            "basis": [
+                "single_non_annotation_insert_envelope_contains_leader",
+                "no_congruent_peer_in_local_probe",
+                "review_only_not_billable_quantity",
+            ],
+        }
+    ]

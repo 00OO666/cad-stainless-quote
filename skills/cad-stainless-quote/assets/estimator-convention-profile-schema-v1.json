@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cad-stainless-quote/estimator-convention-profile-v1.schema.json",
+  "title": "Estimator convention profile v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile_id",
+    "profile_version",
+    "lifecycle_status",
+    "rules"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "estimator-convention-profile/v1"
+    },
+    "profile_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "profile_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lifecycle_status": {
+      "enum": ["DRAFT", "REVIEW", "APPROVABLE", "APPROVED", "RETIRED"]
+    },
+    "approval": {
+      "$ref": "#/$defs/approval"
+    },
+    "normalization": {
+      "type": "object"
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "lifecycle_status": {
+            "const": "APPROVED"
+          }
+        },
+        "required": ["lifecycle_status"]
+      },
+      "then": {
+        "required": ["approval"]
+      }
+    }
+  ],
+  "$defs": {
+    "approval": {
+      "type": "object",
+      "required": ["reviewer", "reviewed_at", "reason"],
+      "properties": {
+        "reviewer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "required": ["id", "category", "title", "match", "action"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": ["DRAFT", "REVIEW", "APPROVABLE", "APPROVED", "RETIRED"]
+        },
+        "enabled_for_auto_apply": {
+          "type": "boolean"
+        },
+        "match": {
+          "type": "object",
+          "minProperties": 1
+        },
+        "action": {
+          "type": "object",
+          "minProperties": 1,
+          "not": {
+            "anyOf": [
+              {"required": ["amount"]},
+              {"required": ["price"]},
+              {"required": ["unit_price"]},
+              {"required": ["price_entry_id"]},
+              {"required": ["status"]},
+              {"required": ["item_status"]},
+              {"required": ["takeoff_status"]},
+              {"required": ["commercial_status"]},
+              {"required": ["quotation_status"]}
+            ]
+          }
+        },
+        "required_measurement_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["length", "height", "width", "unfolded_spec", "quantity"]
+          }
+        },
+        "conditions": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "guardrails": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    }
+  }
+}

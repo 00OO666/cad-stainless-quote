@@ -1,0 +1,94 @@
+{
+  "schema_version": "estimator-convention-profile/v1",
+  "profile_id": "replace-with-policy-id",
+  "profile_version": "0.1.0",
+  "lifecycle_status": "REVIEW",
+  "normalization": {
+    "component_families": [
+      {
+        "id": "EXAMPLE_TRIM",
+        "name_terms_any": ["example trim"]
+      }
+    ],
+    "material_families": [
+      {
+        "id": "EXAMPLE_METAL",
+        "material_terms_all": ["example metal"]
+      }
+    ],
+    "pricing_bases": [
+      {
+        "id": "AREA",
+        "unit_aliases": ["m2", "㎡"],
+        "method_terms_any": ["area basis"]
+      },
+      {
+        "id": "LINEAR",
+        "unit_aliases": ["m"],
+        "method_terms_any": ["linear basis"]
+      },
+      {
+        "id": "SET",
+        "unit_aliases": ["set", "套"],
+        "method_terms_any": ["set basis"]
+      }
+    ]
+  },
+  "rules": [
+    {
+      "id": "EXAMPLE-AREA-001",
+      "category": "engineering_quantity_formula",
+      "title": "Role-labelled area candidate",
+      "status": "REVIEW",
+      "enabled_for_auto_apply": false,
+      "match": {
+        "component_family": "EXAMPLE_TRIM",
+        "material_family": "EXAMPLE_METAL",
+        "pricing_basis": "AREA"
+      },
+      "action": {
+        "formula": "width_mm * length_mm * physical_quantity / 1000000",
+        "result_unit": "m2"
+      },
+      "required_measurement_roles": ["width", "length", "quantity"],
+      "guardrails": [
+        "A formula result does not promote unresolved inputs."
+      ]
+    },
+    {
+      "id": "EXAMPLE-EMBEDDED-MULTIPLIER-001",
+      "category": "default_quantity",
+      "title": "Avoid multiplying an audited embedded factor twice",
+      "status": "REVIEW",
+      "enabled_for_auto_apply": false,
+      "match": {
+        "measurement_role": "verified_aggregated_path_expression",
+        "expression_contains_any": ["*"]
+      },
+      "action": {
+        "outer_quantity": 1,
+        "preserve_internal_multipliers": true,
+        "forbid_double_multiplication": true
+      },
+      "required_measurement_roles": ["length"]
+    },
+    {
+      "id": "EXAMPLE-SET-001",
+      "category": "engineering_quantity_formula",
+      "title": "Set candidate uses proved physical assembly count",
+      "status": "REVIEW",
+      "enabled_for_auto_apply": false,
+      "match": {
+        "pricing_basis": "SET"
+      },
+      "action": {
+        "formula": "physical_quantity",
+        "result_unit": "set"
+      },
+      "required_measurement_roles": ["quantity"],
+      "guardrails": [
+        "Set pricing never defaults quantity to one."
+      ]
+    }
+  ]
+}

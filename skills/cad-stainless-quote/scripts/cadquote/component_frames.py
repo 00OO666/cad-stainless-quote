@@ -257,6 +257,7 @@ def suggest_component_frames(
         updated = dict(selection)
         object_bboxes: dict[str, list[float]] = {}
         dimension_bboxes: dict[str, list[list[float]]] = {}
+        instance_object_bboxes: dict[str, list[dict[str, Any]]] = {}
         bbox_states: dict[str, str] = {}
         stages: dict[str, str] = {}
         selected_ids = {str(value) for value in _list(selection.get("selected_occurrence_ids"))}
@@ -273,13 +274,17 @@ def suggest_component_frames(
             sheet = sheets.get(sheet_id)
             if sheet is None or _box(sheet.get("bbox")) is None:
                 continue
-            points = [
-                candidate.get("leader_target")
+            point_records = [
+                {
+                    "occurrence_id": str(candidate.get("occurrence_id")),
+                    "leader_target": candidate.get("leader_target"),
+                }
                 for candidate in group.get("candidates", [])
                 if isinstance(candidate, Mapping)
                 and str(candidate.get("occurrence_id")) in selected_ids
                 and isinstance(candidate.get("leader_target"), Sequence)
             ]
+            points = [value["leader_target"] for value in point_records]
             if not points:
                 continue
             bbox, dimensions, entity_ids = _suggest_bbox(
@@ -295,6 +300,10 @@ def suggest_component_frames(
                 {
                     "group_id": group_id,
                     "sheet_id": sheet_id,
+                    "frame_role": "selection_aggregate",
+                    "selected_occurrence_ids": sorted(
+                        value["occurrence_id"] for value in point_records
+                    ),
                     "object_bbox": bbox,
                     "dimension_bboxes": dimensions,
                     "entity_ids": entity_ids,
@@ -302,11 +311,57 @@ def suggest_component_frames(
                     "reason_codes": ["ALGORITHMIC_GEOMETRY_ENVELOPE_REQUIRES_CONFIRMATION"],
                 }
             )
+            # Preserve one local REVIEW proposal per selected leader as well as
+            # the aggregate crop.  Multiple MT leaders may identify separate
+            # physical instances, or several subparts of one assembly; the
+            # geometry alone cannot decide which.  Exposing both levels avoids
+            # averaging distant leaders into an empty middle crop while keeping
+            # quantity and component identity explicitly unresolved.
+            local_frames: list[dict[str, Any]] = []
+            if len(point_records) > 1:
+                for local_index, point_record in enumerate(point_records, start=1):
+                    local_bbox, local_dimensions, local_entity_ids = _suggest_bbox(
+                        sheet["bbox"],
+                        [point_record["leader_target"]],
+                        entities_by_sheet.get(sheet_id, []),
+                    )
+                    instance_id = f"{group_id}:leader:{local_index}"
+                    local_frame = {
+                        "instance_id": instance_id,
+                        "group_id": group_id,
+                        "sheet_id": sheet_id,
+                        "frame_role": "occurrence_local",
+                        "selected_occurrence_ids": [point_record["occurrence_id"]],
+                        "leader_target": list(point_record["leader_target"]),
+                        "object_bbox": local_bbox,
+                        "dimension_bboxes": local_dimensions,
+                        "entity_ids": local_entity_ids,
+                        "state": "REVIEW",
+                        "reason_codes": [
+                            "LOCAL_LEADER_FRAME_DOES_NOT_PROVE_PHYSICAL_INSTANCE"
+                        ],
+                    }
+                    local_frames.append(local_frame)
+                    row_frames.append(local_frame)
+            if local_frames:
+                instance_object_bboxes[group_id] = [
+                    {
+                        "instance_id": value["instance_id"],
+                        "selected_occurrence_ids": value["selected_occurrence_ids"],
+                        "leader_target": value["leader_target"],
+                        "object_bbox": value["object_bbox"],
+                        "object_bbox_state": "REVIEW",
+                        "reason_codes": value["reason_codes"],
+                    }
+                    for value in local_frames
+                ]
         if object_bboxes:
             updated["object_bbox"] = object_bboxes
             updated["dimension_bboxes"] = dimension_bboxes
             updated["object_bbox_state"] = bbox_states
             updated["stage"] = stages
+        if instance_object_bboxes:
+            updated["instance_object_bboxes"] = instance_object_bboxes
         augmented.append(updated)
         records.append(
             {

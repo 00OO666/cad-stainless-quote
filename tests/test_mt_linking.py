@@ -400,6 +400,106 @@ def test_drawing_title_is_not_used_as_component_name() -> None:
     assert detected[0].component_hint == "门套收口"
 
 
+@pytest.mark.parametrize(
+    "component_name",
+    [
+        "电视壁龛",
+        "天花灯槽",
+        "银镜框",
+        "毛巾吊架",
+        "电梯按钮板",
+        "大堂旋转门",
+        "电视背景板",
+        "走廊酒柜侧板",
+        "推拉门",
+        "门扇",
+    ],
+)
+def test_common_interior_component_nouns_are_retained_as_hints(
+    component_name: str,
+) -> None:
+    detected = detect_mt_occurrences(
+        [
+            entity("entity:code", "MT-01", 0, 0),
+            entity("entity:component", component_name, 5, 0),
+        ],
+        cluster_distance=12,
+    )
+
+    assert len(detected) == 1
+    assert detected[0].component_hint == component_name
+
+
+def test_same_attributed_callout_block_binds_far_component_description() -> None:
+    detected = detect_mt_occurrences(
+        [
+            entity(
+                "entity:code",
+                "GC-MR-101",
+                0,
+                0,
+                entity_type="ATTRIB",
+                geometry={"parent_insert_handle": "CALL-1", "tag": "MATERIAL_CODE"},
+            ),
+            entity(
+                "entity:description",
+                "镜子",
+                1_000,
+                0,
+                entity_type="ATTRIB",
+                geometry={"parent_insert_handle": "CALL-1", "tag": "DESCRIPTION"},
+            ),
+            entity("entity:nearby", "门套", 5, 0),
+        ],
+        cluster_distance=12,
+        review_code_families={"GC-MR"},
+    )
+
+    assert len(detected) == 1
+    assert detected[0].component_hint == "镜子"
+
+
+def test_stale_bare_mirror_attribute_is_not_a_stainless_component_hint() -> None:
+    detected = detect_mt_occurrences(
+        [
+            entity(
+                "entity:code",
+                "GC-SS-987",
+                0,
+                0,
+                entity_type="ATTRIB",
+                geometry={"parent_insert_handle": "CALL-1"},
+            ),
+            entity(
+                "entity:stale-description",
+                "镜子(加防爆膜)",
+                1_000,
+                0,
+                entity_type="ATTRIB",
+                geometry={"parent_insert_handle": "CALL-1"},
+            ),
+        ],
+        cluster_distance=12,
+        stainless_code_families={"GC-SS"},
+    )
+
+    assert len(detected) == 1
+    assert detected[0].component_hint is None
+
+
+def test_specific_view_title_contributes_only_its_component_part() -> None:
+    detected = detect_mt_occurrences(
+        [
+            entity("entity:code", "MT-01", 0, 0),
+            entity("entity:title", "服务台A正立面图  SCALE:1/10", 5, 0),
+        ],
+        cluster_distance=12,
+    )
+
+    assert len(detected) == 1
+    assert detected[0].component_hint == "服务台A"
+
+
 def test_numeric_attribute_with_mt_tag_is_structured_code_evidence() -> None:
     tagged = entity("entity:tagged", "7", 5, 5, entity_type="ATTRIB")
     tagged = tagged.model_copy(update={"geometry": {"tag": "MT_NO"}})
@@ -717,3 +817,66 @@ def test_structured_explicit_edges_are_not_truncated_by_top_k() -> None:
         any(value.startswith("view_reference:") for value in edge.basis)
         for edge in plan_edges
     )
+
+
+def test_explicit_drawing_sheet_reference_preserves_all_detail_panels() -> None:
+    elevation = Sheet(
+        id="elevation:fixture",
+        source_file_id="synthetic",
+        kind="elevation",
+        drawing_number="9F-E-97",
+    )
+    details = [
+        Sheet(
+            id=f"detail:{number}",
+            source_file_id="synthetic",
+            kind="detail",
+            drawing_number="9F-QS-97",
+            title=f"节点 {number}",
+        )
+        for number in range(1, 9)
+    ]
+    material_titled_panel = Sheet(
+        id="detail:material-title",
+        source_file_id="synthetic",
+        kind="detail",
+        drawing_number="9F-QS-99",
+        title="GC-SS-987",
+    )
+    entities = [
+        entity(
+            "entity:sheet-reference",
+            "详见 9F-QS-97",
+            10,
+            10,
+            sheet_id=elevation.id,
+        ),
+        entity(
+            "entity:material-code",
+            "GC-SS-987",
+            20,
+            20,
+            sheet_id=elevation.id,
+        ),
+    ]
+
+    edges = rank_evidence_edges(
+        [elevation, *details, material_titled_panel],
+        entities=entities,
+        top_k=1,
+    )
+    detail_edges = [
+        edge
+        for edge in edges
+        if edge.relation == "elevation_to_detail" and edge.source_id == elevation.id
+    ]
+
+    preserved = [edge for edge in detail_edges if edge.target_id.startswith("detail:")]
+    assert {edge.target_id for edge in preserved} >= {detail.id for detail in details}
+    for edge in preserved:
+        if edge.target_id in {detail.id for detail in details}:
+            assert any(
+                value.startswith("drawing_sheet_reference:9F-QS-97@")
+                for value in edge.basis
+            )
+            assert edge.status == ReviewStatus.REVIEW

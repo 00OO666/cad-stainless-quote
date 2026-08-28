@@ -190,8 +190,10 @@ def test_duplicate_prediction_is_reported_and_cannot_inflate_precision():
     )
 
     assert report["duplicate_predicted_count"] >= 1
-    assert report["unexpected_count"] == 1
-    assert report["output_precision"] == 0.5
+    assert report["matched_count"] == 0
+    assert report["missing_count"] == 1
+    assert report["unexpected_count"] == 2
+    assert report["output_precision"] == 0
     assert report["overall_gate"] == "FAIL"
 
 
@@ -265,13 +267,90 @@ def test_numeric_nearness_is_never_used_to_swap_ambiguous_duplicate_rows():
     ]
     report = evaluate_takeoff(predicted, gold, policy=confirmed_policy())
 
-    assert report["matched_count"] == 2
+    assert report["matched_count"] == 0
+    assert report["missing_count"] == 2
+    assert report["unexpected_count"] == 2
     assert report["correct_rows"] == 0
     assert report["overall_gate"] == "FAIL"
     assert all(
-        value["field_results"]["engineering_quantity"]["status"] == "FAIL"
+        value["field_results"]["engineering_quantity"]["reason"]
+        == "predicted_row_missing"
         for value in report["row_results"]
     )
+
+
+def test_cli_uses_primary_source_material_code_for_non_mt_gold(tmp_path: Path):
+    policy_values = confirmed_policy().model_dump(mode="json")
+    policy_values["unfolded_spec"]["mode"] = "evaluated-total"
+    policy = EvaluationPolicy.model_validate(policy_values)
+    predicted_path = tmp_path / "predicted.json"
+    gold_path = tmp_path / "gold.json"
+    policy_path = tmp_path / "policy.json"
+    output_path = tmp_path / "report.json"
+    predicted_path.write_text(
+        json.dumps(
+            [
+                {
+                    "gold_id": "gold-row-1",
+                    **item(
+                        mt_code="GC-SS-201",
+                        component_id=None,
+                        unfolded_spec="60",
+                        length_mm=1050,
+                        quantity=10.5,
+                        engineering_quantity=0.63,
+                        unit="m",
+                        unit_price=999,
+                        amount=999,
+                    ).model_dump(mode="json"),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    gold_item = item(mt_code="", component_id=None).model_dump(mode="json")
+    gold_path.write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "id": "gold-row-1",
+                        "source_material_code": "GC-SS-201\nGC-GL-104",
+                        "item": gold_item,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy_path.write_text(policy.model_dump_json(indent=2), encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "evaluate",
+                str(predicted_path),
+                str(gold_path),
+                "--policy",
+                str(policy_path),
+                "--out",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert report["overall_gate"] == "PASS"
+    material_code = report["row_results"][0]["field_results"]["mt_code"]
+    assert material_code["status"] == "PASS"
+    assert material_code["gold"] == "GC-SS-201"
+    fields = report["row_results"][0]["field_results"]
+    assert fields["unfolded_spec"]["status"] == "PASS"
+    for field in ("length_mm", "quantity", "engineering_quantity"):
+        assert fields[field]["status"] == "PASS"
+    assert "unit" not in fields
+    assert "unit_price" not in fields
 
 
 def test_ten_of_eleven_rows_does_not_meet_a_95_percent_gate():

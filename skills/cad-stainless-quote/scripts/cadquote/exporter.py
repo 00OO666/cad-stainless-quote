@@ -18,9 +18,9 @@ from openpyxl import load_workbook
 from xlsxwriter.exceptions import XlsxInputError
 from xlsxwriter.image import Image as XlsxWriterImage
 
-from .calculation import calculate_item
+from .calculation import calculate_item, engineering_quantity_expression_to_excel
 from .io import write_json_atomic
-from .models import EvidenceEdge, MeasurementCandidate, RunIssue, TakeoffItem
+from .models import EvidenceEdge, MeasurementCandidate, ReviewStatus, RunIssue, TakeoffItem
 
 QUOTE_HEADERS = [
     "序号",
@@ -289,15 +289,107 @@ def _quantity_and_amount_cache(item: TakeoffItem) -> tuple[float | None, float |
     """Return cached formula results consistent with deterministic takeoff JSON."""
 
     calculated = calculate_item(item)
-    quantity = (
-        item.engineering_quantity
-        if item.engineering_quantity is not None
-        else calculated.engineering_quantity
-    )
-    amount = item.amount if item.amount is not None else calculated.amount
+    if item.engineering_quantity_expression:
+        quantity = (
+            None
+            if _status_text(item) == "BLOCK" and item.engineering_quantity is None
+            else calculated.engineering_quantity
+        )
+        amount = calculated.amount
+    else:
+        quantity = (
+            item.engineering_quantity
+            if item.engineering_quantity is not None
+            else calculated.engineering_quantity
+        )
+        amount = item.amount if item.amount is not None else calculated.amount
     if _status_text(item) != "PASS":
         amount = None
     return quantity, amount
+
+
+def _effective_export_items(
+    items: list[TakeoffItem], edges: list[EvidenceEdge]
+) -> list[TakeoffItem]:
+    """Recalculate rows and require portable proof for every custom formula."""
+
+    proved_targets: set[tuple[str, str, str, str]] = set()
+    for edge in edges:
+        if (
+            edge.relation == "component_to_engineering_quantity_evidence"
+            and _enum_value(edge.status) == "PASS"
+        ):
+            expressions = [
+                value.removeprefix("expression:")
+                for value in edge.basis
+                if value.startswith("expression:")
+            ]
+            bases = [
+                value.removeprefix("basis:")
+                for value in edge.basis
+                if value.startswith("basis:")
+            ]
+            if len(expressions) == 1 and len(bases) == 1:
+                proved_targets.add(
+                    (edge.source_id, edge.target_id, expressions[0], bases[0])
+                )
+
+    effective: list[TakeoffItem] = []
+    for source in items:
+        item = calculate_item(source)
+        if item.engineering_quantity_expression and _status_text(item) != "BLOCK":
+            proof_identity = (
+                item.component_id or "",
+                item.engineering_quantity_expression,
+                item.engineering_quantity_basis or "",
+            )
+            missing = sorted(
+                evidence_id
+                for evidence_id in set(item.engineering_quantity_evidence_ids)
+                if (
+                    proof_identity[0],
+                    evidence_id,
+                    proof_identity[1],
+                    proof_identity[2],
+                )
+                not in proved_targets
+            )
+            if not item.component_id or missing:
+                detail = (
+                    "缺少构件ID"
+                    if not item.component_id
+                    else "缺少PASS工程量证据边：" + "，".join(missing)
+                )
+                item = item.model_copy(
+                    update={
+                        "status": ReviewStatus.BLOCK,
+                        "block_reason": detail,
+                        "engineering_quantity": None,
+                        "amount": None,
+                    }
+                )
+        effective.append(item)
+    return effective
+
+
+def _quantity_formula(
+    item: TakeoffItem,
+    *,
+    excel_row: int,
+    engineering_cache: float | None,
+) -> str:
+    if item.engineering_quantity_expression and engineering_cache is not None:
+        return engineering_quantity_expression_to_excel(
+            item.engineering_quantity_expression,
+            row=excel_row,
+        )
+    if item.engineering_quantity_expression:
+        return '=""'
+    return (
+        f'=IF(M{excel_row}="㎡",I{excel_row}*J{excel_row}*K{excel_row}/1000000,'
+        f'IF(M{excel_row}="m",J{excel_row}*K{excel_row}/1000,'
+        f'IF(OR(M{excel_row}="件",M{excel_row}="套"),K{excel_row},"")))'
+    )
 
 
 def _quote_note(item: TakeoffItem) -> str:
@@ -443,10 +535,10 @@ def _write_quote_sheet(workbook: Any, items: list[TakeoffItem]) -> dict[str, Any
                 cell_format = body
             _write_cell(sheet, row, column, value, cell_format)
 
-        quantity_formula = (
-            f'=IF(M{excel_row}="㎡",I{excel_row}*J{excel_row}*K{excel_row}/1000000,'
-            f'IF(M{excel_row}="m",J{excel_row}*K{excel_row}/1000,'
-            f'IF(OR(M{excel_row}="件",M{excel_row}="套"),K{excel_row},"")))'
+        quantity_formula = _quantity_formula(
+            item,
+            excel_row=excel_row,
+            engineering_cache=engineering_cache,
         )
         amount_formula = (
             f'=IF(LEFT(Q{excel_row},6)<>"[PASS]","",'
@@ -467,20 +559,31 @@ def _write_quote_sheet(workbook: Any, items: list[TakeoffItem]) -> dict[str, Any
             numeric,
             "" if amount_cache is None else amount_cache,
         )
-        formula_text = (
-            f"{item.width_mm if item.width_mm is not None else '?'}×"
-            f"{item.length_mm if item.length_mm is not None else '?'}×"
-            f"{item.quantity if item.quantity is not None else '?'}÷1,000,000"
-            if item.unit == "㎡"
-            else f"{item.length_mm if item.length_mm is not None else '?'}×"
-            f"{item.quantity if item.quantity is not None else '?'}"
+        if item.engineering_quantity_expression:
+            formula_text = item.engineering_quantity_expression
+        elif item.unit == "㎡":
+            formula_text = (
+                f"{item.width_mm if item.width_mm is not None else '?'}×"
+                f"{item.length_mm if item.length_mm is not None else '?'}×"
+                f"{item.quantity if item.quantity is not None else '?'}÷1,000,000"
+            )
+        elif item.unit == "m":
+            formula_text = (
+                f"{item.length_mm if item.length_mm is not None else '?'}×"
+                f"{item.quantity if item.quantity is not None else '?'}÷1,000"
+            )
+        else:
+            formula_text = f"{item.quantity if item.quantity is not None else '?'}"
+        quantity_evidence = sorted(
+            set(item.evidence_ids) | set(item.engineering_quantity_evidence_ids)
         )
         sheet.write_comment(
             row,
             11,
             f"构件ID：{item.component_id or '—'}\n"
             f"计算：{formula_text}\n"
-            f"证据：{'，'.join(item.evidence_ids) or '—'}",
+            f"依据：{item.engineering_quantity_basis or '标准单位公式'}\n"
+            f"证据：{'，'.join(quantity_evidence) or '—'}",
             {"author": "User", "width": 420, "height": 150},
         )
 
@@ -574,18 +677,39 @@ def _write_trace_sheet(
     measurement_by_id = {value.id: value for value in measurements}
     for row, edge in enumerate(edges, start=1):
         measurement = measurement_by_id.get(edge.target_id)
+        engineering_fields = {
+            value.split(":", 1)[0]: value.split(":", 1)[1]
+            for value in edge.basis
+            if edge.relation == "component_to_engineering_quantity_evidence" and ":" in value
+        }
         values = [
             edge.id,
             edge.relation,
             edge.source_id,
             edge.target_id,
-            measurement.role if measurement else None,
-            measurement.raw_value if measurement else None,
+            (
+                measurement.role
+                if measurement
+                else "engineering_quantity_evidence" if engineering_fields else None
+            ),
+            (
+                measurement.raw_value
+                if measurement
+                else engineering_fields.get("expression")
+            ),
             measurement.numeric_value if measurement else None,
             measurement.unit if measurement else None,
-            measurement.source_file_id if measurement else None,
-            measurement.sheet_id if measurement else None,
-            "；".join(measurement.entity_ids) if measurement else None,
+            (
+                measurement.source_file_id
+                if measurement
+                else engineering_fields.get("source_file")
+            ),
+            measurement.sheet_id if measurement else engineering_fields.get("sheet"),
+            (
+                "；".join(measurement.entity_ids)
+                if measurement
+                else edge.target_id if engineering_fields else None
+            ),
             "；".join(edge.basis),
             edge.confidence,
             edge.status,
@@ -1028,9 +1152,15 @@ def _validate_xlsx(path: Path, items: list[TakeoffItem], state: dict[str, Any]) 
     checks = {
         "sheet_order": actual_sheets == expected_sheets,
         "quote_headers": actual_headers == QUOTE_HEADERS,
-        "quantity_formulas": all(
-            isinstance(value, str) and value.startswith("=IF(") for value in quantity_formulas
-        ),
+        "quantity_formulas": quantity_formulas
+        == [
+            _quantity_formula(
+                item,
+                excel_row=index + 2,
+                engineering_cache=state["engineering_cache"][index],
+            )
+            for index, item in enumerate(items)
+        ],
         "amount_formulas": all(
             isinstance(value, str) and value.startswith("=IF(") for value in amount_formulas
         ),
@@ -1112,10 +1242,11 @@ def build_quote_workbook(
 ) -> Path:
     """Create and validate a portable formula-driven quotation workbook."""
 
+    edge_rows = edges or []
+    effective_items = _effective_export_items(items, edge_rows)
     destination = Path(output).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now(UTC).isoformat()
-    edge_rows = edges or []
     measurement_rows = measurements or []
     issue_rows = issues or []
     run_metadata = metadata or {}
@@ -1131,7 +1262,7 @@ def build_quote_workbook(
         temporary_output = Path(temp) / destination.name
         state = _build_xlsx(
             temporary_output,
-            items,
+            effective_items,
             edge_rows,
             measurement_rows,
             issue_rows,
@@ -1139,7 +1270,7 @@ def build_quote_workbook(
             generated_at,
             evidence_rows,
         )
-        report = _validate_xlsx(temporary_output, items, state)
+        report = _validate_xlsx(temporary_output, effective_items, state)
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise RuntimeError("XlsxWriter reported success but produced no workbook")
         os.replace(temporary_output, destination)

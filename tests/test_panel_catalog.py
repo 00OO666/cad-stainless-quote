@@ -27,7 +27,7 @@ def test_panel_catalog_renders_panels_without_mt_occurrences(tmp_path: Path, mon
         mark_center,
         render_profile,
     ):
-        calls.append((dxf_path, regions, render_profile))
+        calls.append((dxf_path, regions, render_profile, output_dir))
         output_dir.mkdir(parents=True, exist_ok=True)
         records = {}
         for sheet_id, bbox in regions.items():
@@ -86,6 +86,8 @@ def test_panel_catalog_renders_panels_without_mt_occurrences(tmp_path: Path, mon
     assert result["skipped_entity_type_counts"] == {"WIPEOUT": 2}
     assert list(result["panels"]) == ["panel:detail"]
     assert calls[0][2] == "cad-dark-full"
+    assert calls[0][3].name.startswith("source_")
+    assert len(calls[0][3].name) == len("source_") + 16
     assert (tmp_path / "catalog" / "panel_catalog.json").is_file()
 
 

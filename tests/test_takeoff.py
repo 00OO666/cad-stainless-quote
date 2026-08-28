@@ -3,11 +3,16 @@ from cadquote.models import (
     CadEntity,
     EvidenceEdge,
     MaterialSpec,
+    MeasurementCandidate,
     MtOccurrence,
     ReviewStatus,
     Sheet,
 )
-from cadquote.takeoff import build_component_instances, build_takeoff
+from cadquote.takeoff import (
+    _engineering_chain_sheet_ids,
+    build_component_instances,
+    build_takeoff,
+)
 
 
 def _fixture():
@@ -131,6 +136,20 @@ def _material(*, conflicts: list[str] | None = None) -> MaterialSpec:
     )
 
 
+def _fixture_without_detail():
+    sheets, occurrences, edges, entities = _fixture()
+    sheets = [sheet for sheet in sheets if sheet.id != "detail"]
+    occurrences = [value for value in occurrences if value.sheet_id != "detail"]
+    edges = [edge for edge in edges if edge.relation != "elevation_to_detail"]
+    entities = [
+        value.model_copy(update={"sheet_id": "elevation"})
+        if value.id == "unfold-text"
+        else value
+        for value in entities
+    ]
+    return sheets, occurrences, edges, entities
+
+
 def test_takeoff_requires_measurement_confirmation_before_pass():
     sheets, occurrences, edges, entities = _fixture()
     draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
@@ -157,6 +176,352 @@ def test_takeoff_requires_measurement_confirmation_before_pass():
     )
     assert final.items[0].engineering_quantity == 4
     assert final.items[0].status == ReviewStatus.PASS
+
+
+def test_audited_not_applicable_detail_uses_elevation_measurements_and_outputs_wu():
+    sheets, occurrences, edges, entities = _fixture_without_detail()
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    by_role = {candidate.role: candidate for candidate in draft.measurements}
+    confirmation = {
+        "unit": "㎡",
+        "pricing_method": "按实际展开面积计算",
+        "plan_to_elevation_edge": "p2e",
+        "unfolded_spec": by_role["unfolded_spec"].id,
+        "length": by_role["length"].id,
+        "quantity": by_role["quantity"].id,
+        "detail_requirement": {
+            "kind": "not_applicable",
+            "basis": "立面已给出展开、长度和数量，未引用节点或大样",
+            "searched_sheet_ids": ["elevation"],
+            "reference_entity_ids": ["unfold-text", "length-dim"],
+        },
+    }
+
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations={component.id: confirmation},
+    )
+
+    assert final.items[0].status == ReviewStatus.PASS
+    assert final.items[0].detail == "无"
+    assert final.items[0].engineering_quantity == 4
+    assert {"unfold-text", "length-dim"} <= set(final.items[0].evidence_ids)
+
+
+def test_not_applicable_detail_requires_selected_elevation_in_search_audit():
+    sheets, occurrences, edges, entities = _fixture_without_detail()
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    by_role = {candidate.role: candidate for candidate in draft.measurements}
+    confirmation = {
+        "unit": "㎡",
+        "pricing_method": "按实际展开面积计算",
+        **{
+            role: by_role[role].id
+            for role in ("unfolded_spec", "length", "quantity")
+        },
+        "detail_requirement": {
+            "kind": "not_applicable",
+            "basis": "人工声称无节点但没有覆盖对应立面",
+            "searched_sheet_ids": ["plan"],
+        },
+    }
+
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations={component.id: confirmation},
+    )
+
+    assert final.items[0].status == ReviewStatus.BLOCK
+    assert "does not cover selected elevation sheets" in (final.items[0].block_reason or "")
+
+
+def test_audited_derived_length_combines_cad_candidates_without_free_numbers():
+    sheets, occurrences, edges, entities = _fixture()
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    by_role = {candidate.role: candidate for candidate in draft.measurements}
+    confirmation = {
+        component.id: {
+            "unit": "㎡",
+            "pricing_method": "按实际展开面积计算",
+            "unfolded_spec": by_role["unfolded_spec"].id,
+            "quantity": by_role["quantity"].id,
+            "length": {
+                "kind": "derived_measurement",
+                "expression": "run*2",
+                "terms": [
+                    {"symbol": "run", "candidate_id": by_role["length"].id}
+                ],
+                "unit": "mm",
+                "basis": "立面显示两段同长构件",
+            },
+        }
+    }
+
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations=confirmation,
+    )
+
+    item = final.items[0]
+    assert item.status == ReviewStatus.PASS
+    assert item.length_mm == 10000
+    assert item.engineering_quantity == 8
+    derived = next(
+        candidate
+        for candidate in final.measurements
+        if candidate.derived_expression is not None
+    )
+    assert derived.raw_value == "5000*2"
+    assert derived.source_candidate_ids == [by_role["length"].id]
+    assert derived.entity_ids == ["length-dim"]
+    assert derived.source_sheet_ids == ["elevation"]
+    edge = next(
+        edge
+        for edge in final.evidence_edges
+        if edge.relation == "component_to_dimension" and edge.target_id == derived.id
+    )
+    assert edge.status == ReviewStatus.PASS
+
+
+def test_audited_engineering_quantity_expression_preserves_display_quantity():
+    sheets, occurrences, edges, entities = _fixture()
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    by_role = {candidate.role: candidate for candidate in draft.measurements}
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations={
+            component.id: {
+                "unit": "m",
+                "pricing_method": "按米计算",
+                "length": by_role["length"].id,
+                "quantity": by_role["quantity"].id,
+                "engineering_quantity": {
+                    "kind": "engineering_quantity_expression",
+                    "expression": "length_mm*quantity*2/1000",
+                    "basis": "立面证实两条独立实体线；数量列保留构件件数",
+                    "evidence_ids": ["length-dim"],
+                },
+            }
+        },
+    )
+
+    item = final.items[0]
+    assert item.status == ReviewStatus.PASS
+    assert item.length_mm == 5000
+    assert item.quantity == 4
+    assert item.engineering_quantity == 40
+    assert item.engineering_quantity_expression == "length_mm*quantity*2/1000"
+    assert item.engineering_quantity_evidence_ids == ["length-dim"]
+    assert "length-dim" in item.evidence_ids
+    engineering_edge = next(
+        edge
+        for edge in final.evidence_edges
+        if edge.relation == "component_to_engineering_quantity_evidence"
+    )
+    assert engineering_edge.source_id == component.id
+    assert engineering_edge.target_id == "length-dim"
+    assert engineering_edge.status == ReviewStatus.PASS
+    assert any(value.startswith("sheet:elevation") for value in engineering_edge.basis)
+
+
+def test_engineering_quantity_expression_rejects_evidence_outside_selected_chain():
+    sheets, occurrences, edges, entities = _fixture()
+    entities.append(
+        CadEntity(
+            id="unrelated-line",
+            source_file_id="f",
+            sheet_id="unrelated",
+            entity_type="LINE",
+            space="model",
+        )
+    )
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    by_role = {candidate.role: candidate for candidate in draft.measurements}
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations={
+            component.id: {
+                "unit": "m",
+                "pricing_method": "按米计算",
+                "length": by_role["length"].id,
+                "quantity": by_role["quantity"].id,
+                "engineering_quantity": {
+                    "kind": "engineering_quantity_expression",
+                    "expression": "length_mm*2/1000",
+                    "basis": "错误地引用别处图元",
+                    "evidence_ids": ["unrelated-line"],
+                },
+            }
+        },
+    )
+
+    assert final.items[0].status == ReviewStatus.BLOCK
+    assert "outside selected chain" in (final.items[0].block_reason or "")
+
+
+def test_engineering_chain_includes_validated_same_drawing_split_panel():
+    plan_edge = EvidenceEdge(
+        id="p2e",
+        relation="plan_to_elevation",
+        source_id="plan",
+        target_id="elevation-main",
+        status=ReviewStatus.PASS,
+    )
+    detail_edge = EvidenceEdge(
+        id="e2d",
+        relation="elevation_to_detail",
+        source_id="elevation-main",
+        target_id="detail-main",
+        status=ReviewStatus.PASS,
+    )
+    split_panel_measurement = MeasurementCandidate(
+        id="measurement:split",
+        component_id="component:1",
+        role="length",
+        raw_value="4200",
+        numeric_value=4200,
+        unit="mm",
+        source_file_id="file:1",
+        sheet_id="elevation-split",
+        source_sheet_ids=["elevation-split"],
+        entity_ids=["entity:split-dim"],
+    )
+
+    assert _engineering_chain_sheet_ids(
+        plan_edge,
+        detail_edge,
+        {"length": split_panel_measurement},
+    ) == {"plan", "elevation-main", "detail-main", "elevation-split"}
+
+
+def test_derived_measurement_rejects_unanchored_literal_as_a_guess():
+    sheets, occurrences, edges, entities = _fixture()
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    by_role = {candidate.role: candidate for candidate in draft.measurements}
+    confirmation = {
+        component.id: {
+            "unit": "㎡",
+            "pricing_method": "按实际展开面积计算",
+            "unfolded_spec": by_role["unfolded_spec"].id,
+            "quantity": by_role["quantity"].id,
+            "length": {
+                "kind": "derived_measurement",
+                "expression": "run+7080",
+                "terms": [
+                    {"symbol": "run", "candidate_id": by_role["length"].id}
+                ],
+                "unit": "mm",
+                "basis": "缺少另一段 CAD 尺寸",
+            },
+        }
+    }
+
+    result = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations=confirmation,
+    )
+
+    assert result.items[0].status == ReviewStatus.BLOCK
+    assert "numeric literals may only be multiplicities" in (
+        result.items[0].block_reason or ""
+    )
+
+
+def test_derived_spec_preserves_three_axis_display_but_uses_confirmed_width_axis():
+    sheets, occurrences, edges, entities = _fixture()
+    for entity_id, value, x in (
+        ("detail-width", 2600, 48),
+        ("detail-height", 1050, 50),
+        ("detail-depth", 900, 52),
+    ):
+        entities.append(
+            CadEntity(
+                id=entity_id,
+                source_file_id="f",
+                sheet_id="detail",
+                entity_type="DIMENSION",
+                space="model",
+                value=value,
+                insert=(x, 50),
+                bbox=(x - 1, 49, x + 1, 51),
+                geometry={"units": "millimeters"},
+            )
+        )
+    draft = build_takeoff(sheets, entities, occurrences, edges, materials=[_material()])
+    component = draft.components[0]
+    candidates_by_value = {
+        candidate.numeric_value: candidate
+        for candidate in draft.measurements
+        if candidate.role == "unfolded_spec"
+    }
+    length = next(candidate for candidate in draft.measurements if candidate.role == "length")
+    quantity = next(
+        candidate for candidate in draft.measurements if candidate.role == "quantity"
+    )
+    selection = {
+        "kind": "derived_measurement",
+        "expression": "width*height*depth",
+        "value_expression": "width",
+        "terms": [
+            {"symbol": "width", "candidate_id": candidates_by_value[2600].id},
+            {"symbol": "height", "candidate_id": candidates_by_value[1050].id},
+            {"symbol": "depth", "candidate_id": candidates_by_value[900].id},
+        ],
+        "unit": "mm",
+        "basis": "节点标注宽、高、深；面积按宽轴乘立面长度",
+    }
+
+    final = build_takeoff(
+        sheets,
+        entities,
+        occurrences,
+        edges,
+        materials=[_material()],
+        confirmations={
+            component.id: {
+                "unit": "㎡",
+                "pricing_method": "按实际展开面积计算",
+                "unfolded_spec": selection,
+                "length": length.id,
+                "quantity": quantity.id,
+            }
+        },
+    )
+
+    assert final.items[0].status == ReviewStatus.PASS
+    assert final.items[0].unfolded_spec == "2600*1050*900"
+    assert final.items[0].width_mm == 2600
+    assert final.items[0].engineering_quantity == 52
 
 
 def test_mt_occurrence_count_is_not_used_as_quantity():
@@ -189,6 +554,130 @@ def test_explicit_detail_link_with_local_anchor_keeps_local_unfolded_spec():
     assert unfolded.raw_value == "10+180+10"
     assert "component_local_detail_anchor" in unfolded.basis
     assert "detail_occurrence:detail-mt" in unfolded.basis
+
+
+def test_linked_detail_native_dimension_is_unfolded_review_candidate():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [value for value in entities if value.id != "unfold-text"]
+    entities.append(
+        CadEntity(
+            id="detail-native-dimension",
+            source_file_id="f",
+            sheet_id="detail",
+            entity_type="DIMENSION",
+            space="model",
+            value=220,
+            insert=(52, 50),
+            bbox=(48, 48, 56, 52),
+            geometry={"units": "millimeters"},
+        )
+    )
+
+    result = build_takeoff(sheets, entities, occurrences, edges)
+    unfolded = next(
+        candidate for candidate in result.measurements if candidate.role == "unfolded_spec"
+    )
+
+    assert unfolded.numeric_value == 220
+    assert unfolded.status == ReviewStatus.REVIEW
+    assert "cad_detail_dimension_candidate" in unfolded.basis
+    assert "component_local_detail_anchor" in unfolded.basis
+    assert "detail_occurrence:detail-mt" in unfolded.basis
+
+
+def test_structured_height_attribute_is_length_candidate_with_height_semantics():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [value for value in entities if value.id != "length-dim"]
+    entities.append(
+        CadEntity(
+            id="height-attribute",
+            source_file_id="f",
+            sheet_id="elevation",
+            entity_type="ATTRIB",
+            space="model",
+            text="3000",
+            insert=(50, 50),
+            bbox=(48, 48, 54, 52),
+            geometry={"tag": "HT", "parent_insert_handle": "insert-1"},
+        )
+    )
+
+    result = build_takeoff(sheets, entities, occurrences, edges)
+    length = next(
+        candidate
+        for candidate in result.measurements
+        if candidate.role == "length" and candidate.numeric_value == 3000
+    )
+
+    assert length.status == ReviewStatus.REVIEW
+    assert "structured_numeric_attribute" in length.basis
+    assert "structured_attribute_tag:HT" in length.basis
+    assert "structured_attribute_semantic:height" in length.basis
+
+
+def test_structured_quantity_attribute_is_count_candidate_but_decimal_is_not():
+    sheets, occurrences, edges, entities = _fixture()
+    entities = [value for value in entities if value.id != "quantity-text"]
+    entities.extend(
+        [
+            CadEntity(
+                id="quantity-attribute",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="6",
+                insert=(50, 50),
+                geometry={"tag": "QTY", "parent_insert_handle": "insert-2"},
+            ),
+            CadEntity(
+                id="invalid-decimal-count",
+                source_file_id="f",
+                sheet_id="elevation",
+                entity_type="ATTRIB",
+                space="model",
+                text="2.5",
+                insert=(50, 50),
+                geometry={"tag": "COUNT", "parent_insert_handle": "insert-3"},
+            ),
+        ]
+    )
+
+    result = build_takeoff(sheets, entities, occurrences, edges)
+    quantities = [
+        candidate.numeric_value
+        for candidate in result.measurements
+        if candidate.role == "quantity"
+    ]
+
+    assert quantities == [6]
+
+
+def test_far_structured_height_attribute_remains_bounded_linked_sheet_candidate():
+    sheets, occurrences, edges, entities = _fixture()
+    entities.append(
+        CadEntity(
+            id="far-height-attribute",
+            source_file_id="f",
+            sheet_id="elevation",
+            entity_type="ATTRIB",
+            space="model",
+            text="5950",
+            insert=(2_000, 2_000),
+            bbox=(1_990, 1_990, 2_050, 2_020),
+            geometry={"tag": "HT", "parent_insert_handle": "insert-far"},
+        )
+    )
+
+    result = build_takeoff(sheets, entities, occurrences, edges)
+    candidate = next(
+        value
+        for value in result.measurements
+        if value.role == "length" and value.numeric_value == 5950
+    )
+
+    assert "linked_sheet_structured_attribute_fallback" in candidate.basis
+    assert candidate.confidence <= 0.54
 
 
 def test_similarity_only_ceiling_target_cannot_supply_unfolded_spec():
@@ -1026,6 +1515,172 @@ def test_sheet_level_mt_fanout_does_not_claim_every_elevation_occurrence():
         for occurrence_id in value.elevation_occurrence_ids
     }
     assert orphan_ids == {"elevation-mt", "elevation-mt-2", "elevation-mt-3"}
+
+
+def test_named_object_views_aggregate_without_same_sheet_material_fanout():
+    sheets = [
+        Sheet(id="plan-a", source_file_id="f", kind="plan", title="服务台A平面图"),
+        Sheet(
+            id="front-a",
+            source_file_id="f",
+            kind="elevation",
+            drawing_number="GS-01",
+            title="服务台A正立面图 SCALE:1/10",
+        ),
+        Sheet(
+            id="side-a",
+            source_file_id="f",
+            kind="elevation",
+            drawing_number="GS-02",
+            title="服务台A侧立面图 SCALE:1/10",
+        ),
+        Sheet(
+            id="generic",
+            source_file_id="f",
+            kind="elevation",
+            drawing_number="E-01",
+            title="立面图 SCALE:1/40",
+        ),
+        Sheet(id="detail", source_file_id="f", kind="detail", title="服务台A节点图"),
+    ]
+    occurrences = [
+        MtOccurrence(id="plan-a-mt", mt_code="MT-01", source_file_id="f", sheet_id="plan-a"),
+        MtOccurrence(
+            id="front-a-mt-1",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="front-a",
+            leader_target=(10, 10),
+        ),
+        MtOccurrence(
+            id="front-a-mt-2",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="front-a",
+            leader_target=(20, 10),
+        ),
+        MtOccurrence(
+            id="side-a-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="side-a",
+            leader_target=(30, 10),
+        ),
+        MtOccurrence(
+            id="generic-mt-1",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="generic",
+            leader_target=(10, 20),
+        ),
+        MtOccurrence(
+            id="generic-mt-2",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="generic",
+            leader_target=(20, 20),
+        ),
+        MtOccurrence(
+            id="detail-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="detail",
+            leader_target=(10, 10),
+        ),
+    ]
+    components = build_component_instances(sheets, occurrences, [])
+
+    assert len(components) == 3
+    service_desk = next(value for value in components if value.plan_occurrence_ids)
+    assert service_desk.name == "服务台A"
+    assert service_desk.plan_occurrence_ids == ["plan-a-mt"]
+    assert set(service_desk.elevation_occurrence_ids) == {
+        "front-a-mt-1",
+        "front-a-mt-2",
+        "side-a-mt",
+    }
+    assert {
+        occurrence_id
+        for value in components
+        if value.id != service_desk.id
+        for occurrence_id in value.elevation_occurrence_ids
+    } == {"generic-mt-1", "generic-mt-2"}
+    assert all(
+        "detail-mt" not in {*value.plan_occurrence_ids, *value.elevation_occurrence_ids}
+        for value in components
+    )
+
+
+def test_named_views_with_conflicting_component_hints_do_not_merge():
+    sheets = [
+        Sheet(id="front", source_file_id="f", kind="elevation", title="服务台A正立面图"),
+        Sheet(id="side", source_file_id="f", kind="elevation", title="服务台A侧立面图"),
+    ]
+    occurrences = [
+        MtOccurrence(
+            id="front-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="front",
+            leader_target=(10, 10),
+            component_hint="台面包边",
+        ),
+        MtOccurrence(
+            id="side-mt",
+            mt_code="MT-01",
+            source_file_id="f",
+            sheet_id="side",
+            leader_target=(20, 10),
+            component_hint="踢脚线",
+        ),
+    ]
+
+    components = build_component_instances(sheets, occurrences, [])
+
+    assert len(components) == 2
+
+
+def test_named_plan_and_elevation_can_merge_across_linked_source_files():
+    sheets = [
+        Sheet(id="plan", source_file_id="plan-file", kind="plan", title="接待台平面图"),
+        Sheet(
+            id="elevation",
+            source_file_id="elevation-file",
+            kind="elevation",
+            title="接待台正立面图",
+        ),
+    ]
+    occurrences = [
+        MtOccurrence(
+            id="plan-mt",
+            mt_code="MT-01",
+            source_file_id="plan-file",
+            sheet_id="plan",
+        ),
+        MtOccurrence(
+            id="elevation-mt",
+            mt_code="MT-01",
+            source_file_id="elevation-file",
+            sheet_id="elevation",
+            leader_target=(10, 10),
+        ),
+    ]
+    edge = EvidenceEdge(
+        id="p2e",
+        relation="plan_to_elevation",
+        source_id="plan",
+        target_id="elevation",
+        confidence=0.8,
+        status=ReviewStatus.REVIEW,
+    )
+
+    linked = build_component_instances(sheets, occurrences, [edge])
+    unlinked = build_component_instances(sheets, occurrences, [])
+
+    assert len(linked) == 1
+    assert linked[0].plan_occurrence_ids == ["plan-mt"]
+    assert linked[0].elevation_occurrence_ids == ["elevation-mt"]
+    assert len(unlinked) == 2
 
 
 def test_confirmed_elevation_occurrence_is_validated_and_suppresses_its_orphan():

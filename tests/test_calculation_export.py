@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 from cad_quote import command_quote
-from cadquote.calculation import calculate_item, evaluate_numeric_expression
+from cadquote.calculation import (
+    calculate_item,
+    engineering_quantity_expression_to_excel,
+    evaluate_numeric_expression,
+)
 from cadquote.evaluation import evaluate_takeoff
 from cadquote.exporter import QUOTE_HEADERS, build_quote_workbook
 from cadquote.models import (
@@ -75,6 +79,9 @@ def test_safe_expression_and_quantity_calculation():
     assert evaluate_numeric_expression("5+10+120+10") == 145
     with pytest.raises(ValueError):
         evaluate_numeric_expression("__import__('os').system('whoami')")
+    for invalid in (True, float("nan"), float("inf"), 1e16):
+        with pytest.raises(ValueError):
+            evaluate_numeric_expression(invalid)
     calculated = calculate_item(item())
     assert calculated.width_mm == 200
     assert calculated.engineering_quantity == 4.0
@@ -90,6 +97,139 @@ def test_linear_and_piece_calculation():
         item(unfolded_spec=None, width_mm=None, length_mm=None, quantity=3, unit="件")
     )
     assert piece.engineering_quantity == 3
+
+
+def test_audited_engineering_quantity_expression_supports_billing_axis_and_multiplier():
+    width_axis = calculate_item(
+        item(
+            unfolded_spec=None,
+            width_mm=3600,
+            length_mm=900,
+            quantity=1,
+            unit="m",
+            engineering_quantity_expression="width_mm * quantity / 1000",
+            engineering_quantity_basis="线性构件按平面可见长边计延米",
+            engineering_quantity_evidence_ids=["entity:width:3600"],
+        )
+    )
+    assert width_axis.engineering_quantity == 3.6
+
+    two_runs = calculate_item(
+        item(
+            unfolded_spec=None,
+            width_mm=70,
+            length_mm=3000,
+            quantity=1,
+            unit="m",
+            engineering_quantity_expression="length_mm * 2 / 1000",
+            engineering_quantity_basis="节点证实同一构件包含两条实体线",
+            engineering_quantity_evidence_ids=["entity:run:left", "entity:run:right"],
+        )
+    )
+    assert two_runs.quantity == 1
+    assert two_runs.engineering_quantity == 6
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "unknown_mm / 1000",
+        "__import__('os').system('whoami')",
+        "length_mm / 0",
+        "7.25",
+        "length_mm + quantity",
+        "length_mm * quantity / 1000000",
+        "length_mm * 1.05 / 1000",
+        "length_mm * (quantity-quantity+2) / 1000",
+        "1e308*1e308/1e308/1e308",
+    ],
+)
+def test_invalid_engineering_quantity_expression_blocks(expression: str):
+    calculated = calculate_item(
+        item(
+            unit="m",
+            engineering_quantity_expression=expression,
+            engineering_quantity_basis="已核对",
+            engineering_quantity_evidence_ids=["entity:1"],
+            engineering_quantity=999,
+            amount=999,
+            status=ReviewStatus.PASS,
+        )
+    )
+    assert calculated.status == ReviewStatus.BLOCK
+    assert calculated.engineering_quantity is None
+    assert calculated.amount is None
+    assert "表达式" in (calculated.block_reason or "")
+
+
+def test_custom_engineering_quantity_expression_requires_audit_evidence():
+    calculated = calculate_item(
+        item(
+            unit="m",
+            engineering_quantity_expression="length_mm * 2 / 1000",
+            status=ReviewStatus.PASS,
+        )
+    )
+    assert calculated.status == ReviewStatus.BLOCK
+    assert calculated.engineering_quantity is None
+    assert "计算依据" in (calculated.block_reason or "")
+    assert "证据ID" in (calculated.block_reason or "")
+
+
+def test_custom_engineering_quantity_expression_requires_visible_quantity():
+    calculated = calculate_item(
+        item(
+            unit="m",
+            quantity=None,
+            engineering_quantity_expression="length_mm*2/1000",
+            engineering_quantity_basis="两条计价线",
+            engineering_quantity_evidence_ids=["entity:1", "entity:2"],
+            status=ReviewStatus.PASS,
+        )
+    )
+    assert calculated.status == ReviewStatus.BLOCK
+    assert calculated.engineering_quantity is None
+    assert calculated.block_reason == "缺少构件数量"
+
+
+def test_area_engineering_quantity_expression_enforces_dimension_and_scale():
+    valid = calculate_item(
+        item(
+            unit="㎡",
+            width_mm=200,
+            length_mm=5000,
+            quantity=4,
+            engineering_quantity_expression="width_mm*length_mm*quantity/1000000",
+            engineering_quantity_basis="已确认展开宽、长度和四个实例",
+            engineering_quantity_evidence_ids=["entity:w", "entity:l", "entity:q"],
+        )
+    )
+    assert valid.engineering_quantity == 4
+    invalid = calculate_item(
+        item(
+            unit="㎡",
+            engineering_quantity_expression="length_mm*quantity/1000000",
+            engineering_quantity_basis="缺少面积第二轴",
+            engineering_quantity_evidence_ids=["entity:l", "entity:q"],
+            status=ReviewStatus.PASS,
+        )
+    )
+    assert invalid.status == ReviewStatus.BLOCK
+    assert "dimension" in (invalid.block_reason or "")
+
+
+def test_engineering_quantity_expression_excel_compiler_is_fixed_grammar():
+    assert (
+        engineering_quantity_expression_to_excel(
+            "width_mm * quantity / 1000",
+            row=2,
+        )
+        == "=((I2*K2)/1000)"
+    )
+    with pytest.raises(ValueError):
+        engineering_quantity_expression_to_excel("SUM(width_mm)", row=2)
+    with pytest.raises(ValueError, match="unsafe numeric literal"):
+        engineering_quantity_expression_to_excel("1e309", row=2)
 
 
 def test_exact_approved_price_match():
@@ -175,6 +315,217 @@ def test_portable_quote_workbook(tmp_path: Path):
     calculated_values = load_workbook(output, data_only=True)
     assert calculated_values["报价表"]["L2"].value == 4
     assert calculated_values["报价表"]["P2"].value == 2000
+
+
+def test_quote_uses_audited_engineering_expression_formula_and_cache(tmp_path: Path):
+    rows = [
+        calculate_item(
+            item(
+                sequence=1,
+                unfolded_spec=None,
+                width_mm=3600,
+                length_mm=900,
+                quantity=1,
+                unit="m",
+                unit_price=100,
+                engineering_quantity=999,
+                engineering_quantity_expression="width_mm * quantity / 1000",
+                engineering_quantity_basis="按已确认的平面长边计价",
+                engineering_quantity_evidence_ids=["entity:width:3600"],
+                component_id="component:width-axis",
+                status=ReviewStatus.PASS,
+            )
+        ),
+        calculate_item(
+            item(
+                sequence=2,
+                unfolded_spec=None,
+                width_mm=70,
+                length_mm=3000,
+                quantity=1,
+                unit="m",
+                unit_price=100,
+                engineering_quantity_expression="length_mm * 2 / 1000",
+                engineering_quantity_basis="两条物理线",
+                engineering_quantity_evidence_ids=["entity:left", "entity:right"],
+                component_id="component:two-runs",
+                status=ReviewStatus.PASS,
+            )
+        ),
+    ]
+    proof_rows = {
+        "component:width-axis": rows[0],
+        "component:two-runs": rows[1],
+    }
+    engineering_edges = [
+        EvidenceEdge(
+            id=f"edge:{index}",
+            relation="component_to_engineering_quantity_evidence",
+            source_id=component_id,
+            target_id=target_id,
+            basis=[
+                f"expression:{proof_rows[component_id].engineering_quantity_expression}",
+                f"basis:{proof_rows[component_id].engineering_quantity_basis}",
+                "source_file:file:synthetic",
+                "sheet:sheet:elevation",
+                f"handle:{index:X}",
+                "bbox:(0, 0, 1, 1)",
+            ],
+            confidence=1,
+            status=ReviewStatus.PASS,
+        )
+        for index, (component_id, target_id) in enumerate(
+            (
+                ("component:width-axis", "entity:width:3600"),
+                ("component:two-runs", "entity:left"),
+                ("component:two-runs", "entity:right"),
+            ),
+            start=1,
+        )
+    ]
+    output = build_quote_workbook(
+        rows,
+        tmp_path / "custom-formula.xlsx",
+        edges=engineering_edges,
+    )
+    formula_book = load_workbook(output, data_only=False)
+    formulas = formula_book["报价表"]
+    values = load_workbook(output, data_only=True)["报价表"]
+    assert formulas["L2"].value == "=((I2*K2)/1000)"
+    assert formulas["L3"].value == "=((J3*2)/1000)"
+    assert values["L2"].value == 3.6
+    assert values["L3"].value == 6
+    assert values["P2"].value == 360
+    assert values["P3"].value == 600
+    assert "按已确认的平面长边计价" in formulas["L2"].comment.text
+    assert "entity:width:3600" in formulas["L2"].comment.text
+    assert formula_book["来源追踪"]["B2"].value == (
+        "component_to_engineering_quantity_evidence"
+    )
+    assert formula_book["来源追踪"]["E2"].value == "engineering_quantity_evidence"
+    assert formula_book["来源追踪"]["F2"].value == "width_mm * quantity / 1000"
+    assert formula_book["来源追踪"]["I2"].value == "file:synthetic"
+    assert formula_book["来源追踪"]["J2"].value == "sheet:elevation"
+    assert formula_book["来源追踪"]["K2"].value == "entity:width:3600"
+
+
+def test_quote_blocks_custom_expression_without_portable_pass_evidence_edges(
+    tmp_path: Path,
+):
+    source = item(
+        unfolded_spec=None,
+        width_mm=70,
+        length_mm=3000,
+        quantity=1,
+        unit="m",
+        engineering_quantity_expression="length_mm*2/1000",
+        engineering_quantity_basis="两条物理线",
+        engineering_quantity_evidence_ids=["entity:left", "entity:right"],
+        component_id="component:two-runs",
+        status=ReviewStatus.PASS,
+    )
+    output = build_quote_workbook([source], tmp_path / "missing-proof-edges.xlsx")
+    formulas = load_workbook(output, data_only=False)
+    values = load_workbook(output, data_only=True)
+    assert formulas["报价表"]["Q2"].value.startswith("[BLOCK]")
+    assert "缺少PASS工程量证据边" in formulas["待确认"]["D2"].value
+    assert values["报价表"]["L2"].value is None
+
+
+def test_quote_rejects_pass_evidence_edge_for_an_old_expression(tmp_path: Path):
+    source = item(
+        unfolded_spec=None,
+        width_mm=70,
+        length_mm=3000,
+        quantity=1,
+        unit="m",
+        engineering_quantity_expression="length_mm*2/1000",
+        engineering_quantity_basis="当前两条物理线",
+        engineering_quantity_evidence_ids=["entity:run"],
+        component_id="component:run",
+        status=ReviewStatus.PASS,
+    )
+    stale_edge = EvidenceEdge(
+        id="edge:stale",
+        relation="component_to_engineering_quantity_evidence",
+        source_id="component:run",
+        target_id="entity:run",
+        basis=[
+            "expression:length_mm*quantity/1000",
+            "basis:旧版单线计价依据",
+        ],
+        confidence=1,
+        status=ReviewStatus.PASS,
+    )
+    output = build_quote_workbook(
+        [source],
+        tmp_path / "stale-proof-edge.xlsx",
+        edges=[stale_edge],
+    )
+    formulas = load_workbook(output, data_only=False)
+    assert formulas["报价表"]["Q2"].value.startswith("[BLOCK]")
+    assert "缺少PASS工程量证据边" in formulas["待确认"]["D2"].value
+
+
+def test_quote_rejects_ambiguous_multi_identity_engineering_edge(tmp_path: Path):
+    source = item(
+        unfolded_spec=None,
+        width_mm=70,
+        length_mm=3000,
+        quantity=1,
+        unit="m",
+        engineering_quantity_expression="length_mm*2/1000",
+        engineering_quantity_basis="当前两条物理线",
+        engineering_quantity_evidence_ids=["entity:run"],
+        component_id="component:run",
+        status=ReviewStatus.PASS,
+    )
+    ambiguous_edge = EvidenceEdge(
+        id="edge:ambiguous",
+        relation="component_to_engineering_quantity_evidence",
+        source_id="component:run",
+        target_id="entity:run",
+        basis=[
+            "expression:length_mm*2/1000",
+            "expression:length_mm*quantity/1000",
+            "basis:当前两条物理线",
+            "basis:旧版单线计价依据",
+        ],
+        confidence=1,
+        status=ReviewStatus.PASS,
+    )
+    output = build_quote_workbook(
+        [source],
+        tmp_path / "ambiguous-proof-edge.xlsx",
+        edges=[ambiguous_edge],
+    )
+    formulas = load_workbook(output, data_only=False)
+    assert formulas["报价表"]["Q2"].value.startswith("[BLOCK]")
+    assert "缺少PASS工程量证据边" in formulas["待确认"]["D2"].value
+
+
+def test_quote_downgrades_invalid_pass_expression_and_surfaces_pending_row(
+    tmp_path: Path,
+):
+    invalid = item(
+        unit="m",
+        engineering_quantity=999,
+        amount=999,
+        engineering_quantity_expression="length_mm/0",
+        engineering_quantity_basis="错误表达式",
+        engineering_quantity_evidence_ids=["entity:1"],
+        unit_price=100,
+        status=ReviewStatus.PASS,
+    )
+    output = build_quote_workbook([invalid], tmp_path / "invalid-custom-expression.xlsx")
+    formulas = load_workbook(output, data_only=False)
+    values = load_workbook(output, data_only=True)
+    assert formulas["报价表"]["L2"].value == '=""'
+    assert values["报价表"]["L2"].value is None
+    assert values["报价表"]["P2"].value is None
+    assert formulas["报价表"]["Q2"].value.startswith("[BLOCK]")
+    assert formulas["待确认"]["A2"].value == "算量项"
+    assert "工程量表达式无效" in formulas["待确认"]["D2"].value
 
 
 def test_optional_screenshot_evidence_sheet_embeds_images_and_marks_missing(

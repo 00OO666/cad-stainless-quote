@@ -9,6 +9,7 @@ evidence: it does not choose which detail belongs to a component.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -96,7 +97,14 @@ def render_panel_catalog(
     skipped_counts: Counter[str] = Counter()
     failures: list[dict[str, Any]] = []
     for source_id, source_sheets in sorted(grouped.items()):
-        group_dir = panel_root / _safe_label(source_id)
+        # Source IDs can contain a full SHA-256 pair.  Together with a long run
+        # root and the per-panel filename that exceeded legacy Windows MAX_PATH
+        # in real projects, causing an entire source group to fail before the
+        # first image was written.  A content-derived token is deterministic
+        # and keeps the local render path bounded without weakening provenance
+        # (the full source_file_id remains in every manifest record).
+        source_token = hashlib.sha256(source_id.encode()).hexdigest()[:16]
+        group_dir = panel_root / f"source_{source_token}"
         group_dir.mkdir(parents=True, exist_ok=True)
         regions = {str(sheet.id): sheet.bbox for sheet in source_sheets}
         try:

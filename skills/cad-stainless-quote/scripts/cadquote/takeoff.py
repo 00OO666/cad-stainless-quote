@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -9,9 +10,15 @@ import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, TypeVar
 
-from .calculation import calculate_item, evaluate_numeric_expression, infer_unit
+from .calculation import (
+    calculate_item,
+    engineering_quantity_expression_to_excel,
+    evaluate_numeric_expression,
+    infer_unit,
+)
 from .models import (
     CadEntity,
     ComponentInstance,
@@ -55,10 +62,33 @@ _SPLIT_COUNT_INTEGER_RE = re.compile(r"\d+")
 _SPLIT_COUNT_LABEL_RE = re.compile(r"(?P<label>QTY|数量)(?:[:=：])?", re.IGNORECASE)
 _SPLIT_COUNT_SEPARATOR_RE = re.compile(r"[:=：]")
 _DIMENSION_PRODUCT_RE = re.compile(r"\d+(?:\.\d+)?\s*[*xX×]\s*\d+(?:\.\d+)?")
+_STRUCTURED_ATTRIBUTE_NUMBER_RE = re.compile(
+    r"\s*(?P<value>\d+(?:\.\d+)?)\s*(?:mm|毫米)?\s*",
+    re.IGNORECASE,
+)
+_HEIGHT_ATTRIBUTE_TAGS = frozenset({"HT", "H", "HEIGHT", "高度", "高"})
+_LENGTH_ATTRIBUTE_TAGS = frozenset({"LEN", "LENGTH", "L", "长度", "长"})
+_WIDTH_ATTRIBUTE_TAGS = frozenset({"WD", "WIDTH", "W", "宽度", "宽"})
+_QUANTITY_ATTRIBUTE_TAGS = frozenset(
+    {"QTY", "QUANTITY", "COUNT", "NUM", "NUMBER", "数量", "件数"}
+)
 _LEADER_TYPES = {"LEADER", "MLEADER", "MULTILEADER"}
 _HEIGHT_RE = re.compile(r"(?:高度|高\s*[:=：]?|\bH\s*[:=])", re.IGNORECASE)
 _DIMENSION_TYPES = {"DIMENSION", "ARC_DIMENSION", "LARGE_RADIAL_DIMENSION"}
 _MAX_MEASUREMENT_CANDIDATES_PER_ROLE = 24
+_VIEW_TITLE_SUFFIX_RE = re.compile(
+    r"(?:正|背|侧|左|右|前|后|主|次|展开)?"
+    r"(?:平面|立面|剖面|大样|节点|详图|示意|轴测|放样|天花)(?:图)?$"
+)
+_PHYSICAL_OBJECT_TITLE_RE = re.compile(
+    r"服务台|接待台|吧台|柜|门套|门扇|旋转门|推拉门|窗套|壁炉|壁龛|"
+    r"屏风|隔断|踢脚|脚线|线条|灯槽|吊架|挂架|镜框|背景|包边|"
+    r"层板|侧板|背板|栏杆|扶手|吊顶|顶线|墙面|顶面"
+)
+_VALID_ROOM_RE = re.compile(
+    r"大厅|大堂|门厅|走廊|过道|卫生间|洗手间|健身房|办公室|会议室|"
+    r"休闲区|洽谈区|接待区|水吧|茶室|瑜伽室|厨房|卧室|客厅|餐厅"
+)
 
 _T = TypeVar("_T")
 
@@ -464,7 +494,8 @@ class _MeasurementIndex:
             dimension_entities = (
                 dimensions_by_sheet.get(sheet_id, ())
                 if sheet is not None
-                and sheet.kind in {"plan", "elevation_index", "elevation", "door"}
+                and sheet.kind
+                in {"plan", "elevation_index", "elevation", "door", "detail"}
                 else ()
             )
             for entity in dimension_entities:
@@ -473,12 +504,25 @@ class _MeasurementIndex:
                     continue
                 raw_value, numeric_value = resolved_dimension
                 point = _center(entity)
-                is_height = bool(
-                    point is not None
-                    and height_grid is not None
-                    and height_grid.within(point, radius * 0.25)
-                )
-                role = "height" if is_height else "length"
+                if sheet is not None and sheet.kind == "detail":
+                    # A native dimension on a specifically linked detail sheet is
+                    # often the only machine-readable source for the developed
+                    # width.  It is still only a REVIEW candidate: a detail can
+                    # contain thickness, clearance, radius, or substrate sizes,
+                    # so the component-local MT anchor and later role review are
+                    # mandatory before it can be selected.
+                    role = "unfolded_spec"
+                    basis_label = "cad_detail_dimension_candidate"
+                    confidence_base = 0.52
+                else:
+                    is_height = bool(
+                        point is not None
+                        and height_grid is not None
+                        and height_grid.within(point, radius * 0.25)
+                    )
+                    role = "height" if is_height else "length"
+                    basis_label = "cad_dimension"
+                    confidence_base = 0.58
                 facts_by_sheet[sheet_id].append(
                     _MeasurementFact(
                         entity=entity,
@@ -486,14 +530,71 @@ class _MeasurementIndex:
                         raw_value=raw_value,
                         numeric_value=numeric_value,
                         unit="mm",
-                        basis_label="cad_dimension",
-                        confidence_base=0.58,
+                        basis_label=basis_label,
+                        confidence_base=confidence_base,
                         identity=(entity.id, role, raw_value),
                     )
                 )
 
             for entity in text_by_sheet.get(sheet_id, ()):
                 text = entity.text or ""
+                attribute_tag = str(entity.geometry.get("tag") or "").strip().upper()
+                attribute_match = (
+                    _STRUCTURED_ATTRIBUTE_NUMBER_RE.fullmatch(text)
+                    if entity.entity_type == "ATTRIB" and attribute_tag
+                    else None
+                )
+                if attribute_match is not None:
+                    value = float(attribute_match.group("value"))
+                    attribute_role: str | None = None
+                    attribute_semantic: str | None = None
+                    attribute_unit = "mm"
+                    confidence_base = 0.64
+                    if attribute_tag in _HEIGHT_ATTRIBUTE_TAGS:
+                        # Interior-elevation dynamic blocks commonly expose the
+                        # visible height as ``HT``.  The business workbook calls
+                        # this governing vertical extent ``length``.  Preserve
+                        # the height semantics in the audit basis instead of
+                        # pretending the tag was an ordinary free-text length.
+                        attribute_role = "length"
+                        attribute_semantic = "height"
+                    elif attribute_tag in _LENGTH_ATTRIBUTE_TAGS:
+                        attribute_role = "length"
+                        attribute_semantic = "length"
+                    elif attribute_tag in _WIDTH_ATTRIBUTE_TAGS:
+                        attribute_role = "width"
+                        attribute_semantic = "width"
+                    elif attribute_tag in _QUANTITY_ATTRIBUTE_TAGS:
+                        if value.is_integer():
+                            attribute_role = "quantity"
+                            attribute_semantic = "quantity"
+                            attribute_unit = "count"
+
+                    if (
+                        attribute_role is not None
+                        and math.isfinite(value)
+                        and 0 < value <= 1_000_000
+                    ):
+                        facts_by_sheet[sheet_id].append(
+                            _MeasurementFact(
+                                entity=entity,
+                                role=attribute_role,
+                                raw_value=text.strip(),
+                                numeric_value=value,
+                                unit=attribute_unit,
+                                basis_label="structured_numeric_attribute",
+                                confidence_base=confidence_base,
+                                identity=(
+                                    entity.id,
+                                    attribute_role,
+                                    f"{attribute_tag}:{value:g}",
+                                ),
+                                basis_details=(
+                                    f"structured_attribute_tag:{attribute_tag}",
+                                    f"structured_attribute_semantic:{attribute_semantic}",
+                                ),
+                            )
+                        )
                 for match in _UNFOLDED_RE.finditer(text):
                     expression = re.sub(r"\s+", "", match.group())
                     try:
@@ -699,6 +800,337 @@ def _semantic_key(value: str | None) -> str | None:
     return normalized or None
 
 
+def _physical_object_title(value: str | None) -> tuple[str, str] | None:
+    """Return a stable physical-object label from a named CAD view title.
+
+    A title such as ``服务台A正立面图 SCALE:1/10`` identifies the same assembly
+    as ``服务台A侧立面图``.  A generic title such as ``立面图`` or a room-only
+    title such as ``大堂立面图`` does not identify one physical component and
+    must never collapse all same-material callouts on that sheet.
+    """
+
+    if not value:
+        return None
+    cleaned = re.sub(
+        r"\s*SCALE\s*[:：]?\s*1\s*[/：:]\s*\d+(?:\.\d+)?\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = _VIEW_TITLE_SUFFIX_RE.sub("", cleaned).strip(" -_—–:：")
+    if not cleaned or not _PHYSICAL_OBJECT_TITLE_RE.search(cleaned):
+        return None
+    key = _semantic_key(cleaned)
+    return (key, cleaned) if key is not None else None
+
+
+def _valid_room_key(value: str | None) -> str | None:
+    """Reject nearby object labels that the loose CAD room detector can capture."""
+
+    if not value or len(value.strip()) > 24 or not _VALID_ROOM_RE.search(value):
+        return None
+    if re.search(r"公司|地址|版权|设备|制卡|房卡", value):
+        return None
+    return _semantic_key(value)
+
+
+@dataclass(frozen=True, slots=True)
+class _ComponentSemanticProfile:
+    component: ComponentInstance
+    occurrence_ids: tuple[str, ...]
+    sheet_ids: frozenset[str]
+    source_file_ids: frozenset[str]
+    drawing_numbers: frozenset[str]
+    name_keys: frozenset[str]
+    room_keys: frozenset[str]
+    title_labels: tuple[tuple[str, str], ...]
+    leader_targets: tuple[tuple[str, tuple[float, float]], ...]
+
+    @property
+    def title_keys(self) -> frozenset[str]:
+        return frozenset(key for key, _ in self.title_labels)
+
+
+def _component_semantic_profile(
+    component: ComponentInstance,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    sheet_by_id: Mapping[str, Sheet],
+) -> _ComponentSemanticProfile:
+    occurrence_ids = tuple(
+        sorted({*component.plan_occurrence_ids, *component.elevation_occurrence_ids})
+    )
+    occurrences = [
+        occurrence_by_id[occurrence_id]
+        for occurrence_id in occurrence_ids
+        if occurrence_id in occurrence_by_id
+    ]
+    sheets = {
+        occurrence.sheet_id: sheet_by_id[occurrence.sheet_id]
+        for occurrence in occurrences
+        if occurrence.sheet_id and occurrence.sheet_id in sheet_by_id
+    }
+    title_labels = sorted(
+        {
+            title
+            for sheet in sheets.values()
+            if (title := _physical_object_title(sheet.title)) is not None
+        }
+    )
+    name_keys = {
+        key
+        for occurrence in occurrences
+        if (key := _semantic_key(occurrence.component_hint)) is not None
+    }
+    if not name_keys and (key := _semantic_key(component.name)) is not None:
+        name_keys.add(key)
+    room_keys = {
+        key
+        for occurrence in occurrences
+        if (key := _valid_room_key(occurrence.room)) is not None
+    }
+    if not room_keys and (key := _valid_room_key(component.room)) is not None:
+        room_keys.add(key)
+    return _ComponentSemanticProfile(
+        component=component,
+        occurrence_ids=occurrence_ids,
+        sheet_ids=frozenset(sheets),
+        source_file_ids=frozenset(occurrence.source_file_id for occurrence in occurrences),
+        drawing_numbers=frozenset(
+            sheet.drawing_number for sheet in sheets.values() if sheet.drawing_number
+        ),
+        name_keys=frozenset(name_keys),
+        room_keys=frozenset(room_keys),
+        title_labels=tuple(title_labels),
+        leader_targets=tuple(
+            sorted(
+                (occurrence.sheet_id, occurrence.leader_target)
+                for occurrence in occurrences
+                if occurrence.sheet_id and occurrence.leader_target is not None
+            )
+        ),
+    )
+
+
+def _aggregate_semantic_components(
+    components: Sequence[ComponentInstance],
+    occurrences: Sequence[MtOccurrence],
+    sheet_by_id: Mapping[str, Sheet],
+    edges: Sequence[EvidenceEdge],
+) -> list[ComponentInstance]:
+    """Merge only cross-view candidates that name the same physical assembly.
+
+    This deliberately does *not* group all same-code labels on one sheet.  A
+    merge needs either a named physical-object title appearing in at least two
+    view panels, an exact room+component identity across panels, or a duplicate
+    leader target projected into overlapping panels.  Missing semantics remain
+    separate REVIEW rows instead of being guessed into the human row count.
+    """
+
+    if len(components) < 2:
+        return list(components)
+    occurrence_by_id = {occurrence.id: occurrence for occurrence in occurrences}
+    profiles = [
+        _component_semantic_profile(component, occurrence_by_id, sheet_by_id)
+        for component in components
+    ]
+    linked_sheet_pairs = {
+        frozenset((edge.source_id, edge.target_id))
+        for edge in edges
+        if edge.relation == "plan_to_elevation"
+    }
+    groups = _UnionFind(len(profiles))
+    group_name_keys = [set(profile.name_keys) for profile in profiles]
+    group_room_keys = [set(profile.room_keys) for profile in profiles]
+
+    def union_if_compatible(left: int, right: int) -> None:
+        left_root = groups.find(left)
+        right_root = groups.find(right)
+        if left_root == right_root:
+            return
+        left_profile = profiles[left]
+        right_profile = profiles[right]
+        if left_profile.component.mt_code != right_profile.component.mt_code:
+            return
+        sources_are_disjoint = (
+            left_profile.source_file_ids
+            and right_profile.source_file_ids
+            and left_profile.source_file_ids.isdisjoint(right_profile.source_file_ids)
+        )
+        directly_linked = any(
+            frozenset((left_sheet_id, right_sheet_id)) in linked_sheet_pairs
+            for left_sheet_id in left_profile.sheet_ids
+            for right_sheet_id in right_profile.sheet_ids
+        )
+        if sources_are_disjoint and not directly_linked:
+            return
+        left_names = group_name_keys[left_root]
+        right_names = group_name_keys[right_root]
+        if left_names and right_names and left_names.isdisjoint(right_names):
+            return
+        left_rooms = group_room_keys[left_root]
+        right_rooms = group_room_keys[right_root]
+        if left_rooms and right_rooms and left_rooms.isdisjoint(right_rooms):
+            return
+        groups.union(left_root, right_root)
+        merged_root = groups.find(left_root)
+        other_root = right_root if merged_root == left_root else left_root
+        group_name_keys[merged_root].update(group_name_keys[other_root])
+        group_room_keys[merged_root].update(group_room_keys[other_root])
+
+    # A named object repeated in front/back/side/plan view panels is one
+    # assembly candidate.  Requiring at least two distinct panels prevents a
+    # generic same-sheet material fan-out from becoming one row.
+    title_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, profile in enumerate(profiles):
+        for title_key in profile.title_keys:
+            title_buckets[(profile.component.mt_code, title_key)].append(index)
+    for indexes in title_buckets.values():
+        if len({sheet_id for index in indexes for sheet_id in profiles[index].sheet_ids}) < 2:
+            continue
+        for left, right in zip(indexes, indexes[1:], strict=False):
+            union_if_compatible(left, right)
+
+    # Exact component+room labels are strong only when they occur in multiple
+    # panels.  Room alone is never sufficient: one room can contain many MT
+    # components.
+    labeled_buckets: dict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+    for index, profile in enumerate(profiles):
+        for source_file_id in profile.source_file_ids:
+            for name_key in profile.name_keys:
+                for room_key in profile.room_keys:
+                    labeled_buckets[
+                        (profile.component.mt_code, source_file_id, room_key, name_key)
+                    ].append(index)
+    for indexes in labeled_buckets.values():
+        if len({sheet_id for index in indexes for sheet_id in profiles[index].sheet_ids}) < 2:
+            continue
+        for left, right in zip(indexes, indexes[1:], strict=False):
+            union_if_compatible(left, right)
+
+    # An exact component label on split panels of the same drawing number is a
+    # weaker, but still auditable, cross-panel identity.
+    hint_buckets: dict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+    for index, profile in enumerate(profiles):
+        for source_file_id in profile.source_file_ids:
+            for drawing_number in profile.drawing_numbers:
+                for name_key in profile.name_keys:
+                    hint_buckets[
+                        (profile.component.mt_code, source_file_id, drawing_number, name_key)
+                    ].append(index)
+    for indexes in hint_buckets.values():
+        if len({sheet_id for index in indexes for sheet_id in profiles[index].sheet_ids}) < 2:
+            continue
+        for left, right in zip(indexes, indexes[1:], strict=False):
+            union_if_compatible(left, right)
+
+    # Finally collapse the same leader target only when it was projected into
+    # different panels of the same drawing.  Nearby targets are intentionally
+    # not merged; they may be two different physical pieces.
+    for left, left_profile in enumerate(profiles):
+        for right in range(left + 1, len(profiles)):
+            right_profile = profiles[right]
+            if left_profile.component.mt_code != right_profile.component.mt_code:
+                continue
+            common_drawings = left_profile.drawing_numbers & right_profile.drawing_numbers
+            if not common_drawings or left_profile.sheet_ids == right_profile.sheet_ids:
+                continue
+            target_pairs = [
+                (left_sheet_id, left_target, right_sheet_id, right_target)
+                for left_sheet_id, left_target in left_profile.leader_targets
+                for right_sheet_id, right_target in right_profile.leader_targets
+                if left_sheet_id != right_sheet_id
+            ]
+            if not target_pairs:
+                continue
+            tolerance = min(
+                (
+                    _dedupe_tolerance(sheet_by_id.get(sheet_id))
+                    for pair in target_pairs
+                    for sheet_id in (pair[0], pair[2])
+                ),
+                default=1e-6,
+            )
+            if any(
+                _distance(left_target, right_target) <= tolerance
+                for _, left_target, _, right_target in target_pairs
+            ):
+                union_if_compatible(left, right)
+
+    members_by_root: dict[int, list[_ComponentSemanticProfile]] = defaultdict(list)
+    for index, profile in enumerate(profiles):
+        members_by_root[groups.find(index)].append(profile)
+
+    aggregated: list[tuple[str, ComponentInstance]] = []
+    for members in members_by_root.values():
+        if len(members) == 1:
+            component = members[0].component
+            sort_key = min(members[0].occurrence_ids, default=component.id)
+            aggregated.append((sort_key, component))
+            continue
+        member_components = [member.component for member in members]
+        plan_occurrence_ids = sorted(
+            {
+                occurrence_id
+                for component in member_components
+                for occurrence_id in component.plan_occurrence_ids
+            }
+        )
+        elevation_occurrence_ids = sorted(
+            {
+                occurrence_id
+                for component in member_components
+                for occurrence_id in component.elevation_occurrence_ids
+            }
+        )
+        detail_sheet_ids = sorted(
+            {
+                sheet_id
+                for component in member_components
+                for sheet_id in component.detail_sheet_ids
+            }
+        )
+        title_labels = {
+            label for member in members for _, label in member.title_labels
+        }
+        component_id = _stable_id(
+            "component",
+            "semantic_aggregate",
+            member_components[0].mt_code,
+            plan_occurrence_ids,
+            elevation_occurrence_ids,
+            detail_sheet_ids,
+        )
+        aggregated_component = ComponentInstance(
+            id=component_id,
+            mt_code=member_components[0].mt_code,
+            raw_material_code=_consensus(
+                [component.raw_material_code for component in member_components]
+            ),
+            material_code_family=_consensus(
+                [component.material_code_family for component in member_components]
+            ),
+            name=(
+                _consensus([component.name for component in member_components])
+                or (next(iter(title_labels)) if len(title_labels) == 1 else None)
+            ),
+            room=_consensus([component.room for component in member_components]),
+            plan_occurrence_ids=plan_occurrence_ids,
+            elevation_occurrence_ids=elevation_occurrence_ids,
+            detail_sheet_ids=detail_sheet_ids,
+            status=ReviewStatus.REVIEW,
+        )
+        aggregated.append(
+            (
+                min(
+                    (*plan_occurrence_ids, *elevation_occurrence_ids),
+                    default=aggregated_component.id,
+                ),
+                aggregated_component,
+            )
+        )
+    return [component for _, component in sorted(aggregated, key=lambda value: value[0])]
+
+
 def _unique_semantic_elevation_group(
     plan_group: Sequence[MtOccurrence],
     candidates: Sequence[MtOccurrence],
@@ -892,7 +1324,15 @@ def build_component_instances(
                     ),
                 )
             )
-    return [component for _, component in sorted(component_records, key=lambda value: value[0])]
+    base_components = [
+        component for _, component in sorted(component_records, key=lambda value: value[0])
+    ]
+    return _aggregate_semantic_components(
+        base_components,
+        unique_occurrences,
+        sheet_by_id,
+        edges,
+    )
 
 
 def _component_points(
@@ -1088,6 +1528,7 @@ def collect_measurement_candidates(
         sheet_points = points.get(sheet_id, [])
         facts = measurement_index.facts_near(sheet_id, sheet_points)
         fallback_identities: set[tuple[str, str, str]] = set()
+        structured_fallback_identities: set[tuple[str, str, str]] = set()
         expected_labeled_roles = (
             {"length", "height", "quantity"}
             if sheet is not None and sheet.kind in {"elevation", "door"}
@@ -1116,6 +1557,32 @@ def collect_measurement_candidates(
                 )[:_MAX_MEASUREMENT_CANDIDATES_PER_ROLE]
                 facts.extend(ranked_fallbacks)
                 fallback_identities.update(fact.identity for fact in ranked_fallbacks)
+        if sheet_points and sheet is not None and sheet.kind in {"elevation", "door"}:
+            # Dynamic elevation blocks often put HT/WD/LEN attributes at the
+            # definition-line endpoint rather than next to the MT leader.  The
+            # tag is stronger structure than free text, so preserve the nearest
+            # bounded sheet candidates even when unrelated local dimensions
+            # already exist.  They remain REVIEW and are explicitly marked as
+            # linked-sheet fallbacks; this never chooses one automatically.
+            existing_fact_identities = {value.identity for value in facts}
+            structured_fallbacks = [
+                fact
+                for fact in measurement_index.facts_by_sheet.get(sheet_id, ())
+                if fact.basis_label == "structured_numeric_attribute"
+                and fact.identity not in existing_fact_identities
+            ]
+            ranked_structured_fallbacks = sorted(
+                structured_fallbacks,
+                key=lambda fact: (
+                    _proximity(fact.entity, sheet_points) is None,
+                    _proximity(fact.entity, sheet_points) or float("inf"),
+                    fact.entity.id,
+                ),
+            )[:_MAX_MEASUREMENT_CANDIDATES_PER_ROLE]
+            facts.extend(ranked_structured_fallbacks)
+            structured_fallback_identities.update(
+                fact.identity for fact in ranked_structured_fallbacks
+            )
         selected_facts = {fact.identity: fact for fact in facts}
         for fact in selected_facts.values():
             entity = fact.entity
@@ -1138,6 +1605,9 @@ def collect_measurement_candidates(
             is_fallback = fact.identity in fallback_identities
             if is_fallback:
                 basis.append("linked_sheet_labeled_fallback")
+            is_structured_fallback = fact.identity in structured_fallback_identities
+            if is_structured_fallback:
+                basis.append("linked_sheet_structured_attribute_fallback")
             confidence = _candidate_confidence(
                 distance,
                 radius,
@@ -1145,6 +1615,8 @@ def collect_measurement_candidates(
             )
             if is_fallback:
                 confidence = min(confidence, 0.52)
+            if is_structured_fallback:
+                confidence = min(confidence, 0.54)
             output.append(
                 MeasurementCandidate(
                     id=fact.candidate_id(component.id),
@@ -1194,14 +1666,285 @@ def collect_measurement_candidates(
     return sorted(bounded, key=lambda value: (value.role, -value.confidence, value.id))
 
 
+_DERIVED_SOURCE_ROLES: dict[str, frozenset[str]] = {
+    "length": frozenset({"length", "height", "width", "unfolded_spec"}),
+    "height": frozenset({"length", "height", "width", "unfolded_spec"}),
+    "width": frozenset({"length", "height", "width", "unfolded_spec"}),
+    "unfolded_spec": frozenset({"length", "height", "width", "unfolded_spec"}),
+    "quantity": frozenset({"quantity"}),
+}
+_DERIVED_SYMBOL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}\Z")
+
+
+def _evaluate_derived_expression(
+    expression: str,
+    values: Mapping[str, Decimal],
+    *,
+    require_linear_result: bool,
+) -> tuple[Decimal, set[str]]:
+    """Evaluate reviewer arithmetic while preserving dimensional consistency.
+
+    CAD-derived symbols have exponent one. Bare numeric literals are accepted
+    only as small integer multiplicities; therefore ``a*2`` is legal, while a
+    guessed literal such as ``7080`` or ``a+10`` is not.
+    """
+
+    normalized = expression.strip().replace("×", "*").replace("÷", "/")
+    if not normalized:
+        raise ValueError("empty derived expression")
+    try:
+        tree = ast.parse(normalized, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("invalid derived expression syntax") from exc
+
+    def walk(node: ast.AST) -> tuple[Decimal, set[str], int, bool]:
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.Name):
+            if node.id not in values:
+                raise ValueError(f"unknown derived symbol: {node.id}")
+            return values[node.id], {node.id}, 1, False
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+        ):
+            if not 1 <= abs(node.value) <= 100:
+                raise ValueError("numeric literals may only be multiplicities from 1 to 100")
+            return Decimal(node.value), set(), 0, True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value, names, exponent, literal_only = walk(node.operand)
+            return (
+                value if isinstance(node.op, ast.UAdd) else -value,
+                names,
+                exponent,
+                literal_only,
+            )
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)
+        ):
+            left, left_names, left_exponent, left_literal = walk(node.left)
+            right, right_names, right_exponent, right_literal = walk(node.right)
+            names = left_names | right_names
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                if left_exponent != right_exponent or left_literal or right_literal:
+                    raise ValueError(
+                        "addition/subtraction must combine CAD-derived terms of one dimension"
+                    )
+                value = left + right if isinstance(node.op, ast.Add) else left - right
+                return value, names, left_exponent, False
+            if isinstance(node.op, ast.Mult):
+                return left * right, names, left_exponent + right_exponent, not names
+            if right == 0:
+                raise ValueError("division by zero")
+            return left / right, names, left_exponent - right_exponent, not names
+        raise ValueError("unsupported derived expression operator")
+
+    result, used_names, exponent, _literal_only = walk(tree)
+    if not used_names:
+        raise ValueError("derived expression must cite at least one CAD candidate symbol")
+    if require_linear_result and exponent != 1:
+        raise ValueError("derived value expression must resolve to one length/count dimension")
+    if not result.is_finite() or result < 0:
+        raise ValueError("derived expression must produce a finite non-negative value")
+    return result, used_names
+
+
+def _render_derived_expression(
+    expression: str,
+    candidates_by_symbol: Mapping[str, MeasurementCandidate],
+) -> str:
+    normalized = expression.strip().replace("×", "*").replace("÷", "/")
+
+    def replace(match: re.Match[str]) -> str:
+        symbol = match.group(0)
+        candidate = candidates_by_symbol.get(symbol)
+        if candidate is None:
+            return symbol
+        raw = candidate.raw_value.strip()
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", raw):
+            normalized_number = format(Decimal(raw), "f")
+            raw = (
+                normalized_number.rstrip("0").rstrip(".")
+                if "." in normalized_number
+                else normalized_number
+            )
+        if normalized == symbol or not re.search(r"[+\-*/()]", raw):
+            return raw
+        return f"({raw})"
+
+    return re.sub(r"\b[A-Za-z][A-Za-z0-9_]{0,31}\b", replace, normalized)
+
+
+def _build_derived_candidate(
+    candidates: Sequence[MeasurementCandidate],
+    role: str,
+    selection: Mapping[str, Any],
+    *,
+    component_id: str,
+) -> MeasurementCandidate:
+    if selection.get("kind") != "derived_measurement":
+        raise ValueError("kind must be 'derived_measurement'")
+    expression = selection.get("expression")
+    value_expression = selection.get("value_expression", expression)
+    basis = selection.get("basis")
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("expression must be a non-empty symbolic expression")
+    if not isinstance(value_expression, str) or not value_expression.strip():
+        raise ValueError("value_expression must be a non-empty symbolic expression")
+    if not isinstance(basis, str) or not basis.strip():
+        raise ValueError("basis must explain the CAD derivation")
+    expected_unit = "count" if role == "quantity" else "mm"
+    if selection.get("unit", expected_unit) != expected_unit:
+        raise ValueError(f"unit must be {expected_unit!r} for {role}")
+
+    raw_terms = selection.get("terms")
+    if not isinstance(raw_terms, Sequence) or isinstance(raw_terms, (str, bytes)):
+        raise ValueError("terms must be a non-empty array")
+    candidate_by_id = {candidate.id: candidate for candidate in candidates}
+    candidates_by_symbol: dict[str, MeasurementCandidate] = {}
+    source_ids: list[str] = []
+    for index, raw_term in enumerate(raw_terms):
+        if not isinstance(raw_term, Mapping):
+            raise ValueError(f"terms[{index}] must be an object")
+        symbol = raw_term.get("symbol")
+        candidate_id = raw_term.get("candidate_id")
+        if not isinstance(symbol, str) or not _DERIVED_SYMBOL_RE.fullmatch(symbol.strip()):
+            raise ValueError(f"terms[{index}].symbol is invalid")
+        normalized_symbol = symbol.strip()
+        if normalized_symbol in candidates_by_symbol:
+            raise ValueError(f"duplicate derived symbol: {normalized_symbol}")
+        if not isinstance(candidate_id, str) or candidate_id not in candidate_by_id:
+            raise ValueError(f"source candidate does not exist: {candidate_id}")
+        candidate = candidate_by_id[candidate_id]
+        if candidate.component_id != component_id:
+            raise ValueError(f"source candidate belongs to another component: {candidate_id}")
+        if candidate.role not in _DERIVED_SOURCE_ROLES.get(role, frozenset()):
+            raise ValueError(
+                f"source candidate role {candidate.role!r} is incompatible with {role!r}"
+            )
+        if candidate.numeric_value is None:
+            raise ValueError(f"source candidate has no numeric value: {candidate_id}")
+        if candidate.unit != expected_unit:
+            raise ValueError(
+                f"source candidate unit {candidate.unit!r} is incompatible with {expected_unit!r}"
+            )
+        candidates_by_symbol[normalized_symbol] = candidate
+        source_ids.append(candidate.id)
+    if not candidates_by_symbol:
+        raise ValueError("terms must be a non-empty array")
+
+    decimal_values = {
+        symbol: Decimal(str(candidate.numeric_value))
+        for symbol, candidate in candidates_by_symbol.items()
+    }
+    _display_value, display_names = _evaluate_derived_expression(
+        expression,
+        decimal_values,
+        require_linear_result=False,
+    )
+    if display_names != set(candidates_by_symbol):
+        missing = sorted(set(candidates_by_symbol) - display_names)
+        raise ValueError(f"expression does not use declared symbols: {', '.join(missing)}")
+    numeric_value, _value_names = _evaluate_derived_expression(
+        value_expression,
+        decimal_values,
+        require_linear_result=True,
+    )
+
+    source_sheet_ids = sorted(
+        {
+            sheet_id
+            for candidate in candidates_by_symbol.values()
+            for sheet_id in ([*candidate.source_sheet_ids] or [candidate.sheet_id])
+            if sheet_id
+        }
+    )
+    source_file_ids = sorted(
+        {candidate.source_file_id for candidate in candidates_by_symbol.values()}
+    )
+    entity_ids = sorted(
+        {
+            entity_id
+            for candidate in candidates_by_symbol.values()
+            for entity_id in candidate.entity_ids
+        }
+    )
+    distances = [
+        candidate.distance
+        for candidate in candidates_by_symbol.values()
+        if candidate.distance is not None
+    ]
+    rendered = _render_derived_expression(expression, candidates_by_symbol)
+    stable_terms = json.dumps(
+        [
+            {"symbol": symbol, "candidate_id": candidates_by_symbol[symbol].id}
+            for symbol in candidates_by_symbol
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return MeasurementCandidate(
+        id=_stable_id(
+            "measurement-derived",
+            component_id,
+            role,
+            expression.strip(),
+            value_expression.strip(),
+            stable_terms,
+        ),
+        component_id=component_id,
+        role=role,
+        raw_value=rendered,
+        numeric_value=float(numeric_value),
+        unit=expected_unit,
+        source_file_id=source_file_ids[0],
+        sheet_id=source_sheet_ids[0] if len(source_sheet_ids) == 1 else None,
+        source_sheet_ids=source_sheet_ids,
+        entity_ids=entity_ids,
+        source_candidate_ids=source_ids,
+        derived_expression=expression.strip(),
+        value_expression=value_expression.strip(),
+        distance=min(distances) if distances else None,
+        basis=[
+            "explicit_reviewer_derived_measurement",
+            f"derived_expression:{expression.strip()}",
+            f"derived_value_expression:{value_expression.strip()}",
+            *(f"source_candidate:{candidate_id}" for candidate_id in source_ids),
+            f"review_basis:{basis.strip()}",
+        ],
+        confidence=1.0,
+        status=ReviewStatus.PASS,
+    )
+
+
 def _select_candidate(
     candidates: Sequence[MeasurementCandidate],
     role: str,
-    confirmed: Mapping[str, str],
+    confirmed: Mapping[str, Any],
+    *,
+    component_id: str,
 ) -> tuple[MeasurementCandidate | None, str | None]:
     values = [candidate for candidate in candidates if candidate.role == role]
-    explicit_id = confirmed.get(role)
+    explicit_selection = confirmed.get(role)
+    if isinstance(explicit_selection, Mapping):
+        try:
+            return (
+                _build_derived_candidate(
+                    candidates,
+                    role,
+                    explicit_selection,
+                    component_id=component_id,
+                ),
+                None,
+            )
+        except ValueError as exc:
+            return None, f"invalid derived {role}: {exc}"
+    explicit_id = explicit_selection
     if explicit_id:
+        if not isinstance(explicit_id, str):
+            return None, f"confirmed {role} must be a candidate ID or derived measurement"
         selected = next((candidate for candidate in values if candidate.id == explicit_id), None)
         if selected is None:
             return None, f"confirmed {role} candidate does not exist: {explicit_id}"
@@ -1274,6 +2017,95 @@ _ROLES_BY_UNIT: dict[str, tuple[str, ...]] = {
     "件": ("quantity",),
     "套": ("quantity",),
 }
+
+
+def _engineering_quantity_confirmation(
+    value: Any,
+    *,
+    entity_by_id: Mapping[str, CadEntity],
+    chain_sheet_ids: set[str],
+) -> tuple[str | None, str | None, list[str], list[str]]:
+    """Validate a custom billing expression against CAD entities on the selected chain."""
+
+    if value is None:
+        return None, None, [], []
+    reasons: list[str] = []
+    if not isinstance(value, Mapping):
+        return None, None, [], ["engineering_quantity confirmation must be an object"]
+    allowed = {"kind", "expression", "basis", "evidence_ids"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        reasons.append(
+            "engineering_quantity confirmation has unsupported keys: " + ", ".join(unknown)
+        )
+    if value.get("kind") != "engineering_quantity_expression":
+        reasons.append("engineering_quantity kind must be engineering_quantity_expression")
+    raw_expression = value.get("expression")
+    expression = raw_expression.strip() if isinstance(raw_expression, str) else None
+    if not expression:
+        reasons.append("engineering_quantity expression is missing")
+    else:
+        try:
+            engineering_quantity_expression_to_excel(expression, row=1)
+        except ValueError as exc:
+            reasons.append(f"engineering_quantity expression is invalid: {exc}")
+    raw_basis = value.get("basis")
+    basis = raw_basis.strip() if isinstance(raw_basis, str) else None
+    if not basis:
+        reasons.append("engineering_quantity basis is missing")
+    raw_ids = value.get("evidence_ids")
+    evidence_ids: list[str] = []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        reasons.append("engineering_quantity evidence_ids must be a non-empty array")
+    else:
+        for raw_id in raw_ids:
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                reasons.append("engineering_quantity evidence_ids contain an invalid CAD entity ID")
+                continue
+            entity_id = raw_id.strip()
+            if entity_id in evidence_ids:
+                continue
+            evidence_ids.append(entity_id)
+            entity = entity_by_id.get(entity_id)
+            if entity is None:
+                reasons.append(
+                    f"engineering_quantity evidence entity does not exist: {entity_id}"
+                )
+            elif not entity.sheet_id or entity.sheet_id not in chain_sheet_ids:
+                reasons.append(
+                    "engineering_quantity evidence entity is outside selected chain: "
+                    f"{entity_id} ({entity.sheet_id})"
+                )
+    return expression, basis, evidence_ids, reasons
+
+
+def _engineering_chain_sheet_ids(
+    plan_edge: EvidenceEdge | None,
+    detail_edge: EvidenceEdge | None,
+    selected: Mapping[str, MeasurementCandidate | None],
+) -> set[str]:
+    """Include exact relation sheets and validated same-drawing measurement panels."""
+
+    result = {
+        value
+        for value in (
+            plan_edge.source_id if plan_edge is not None else None,
+            plan_edge.target_id if plan_edge is not None else None,
+            detail_edge.target_id if detail_edge is not None else None,
+        )
+        if value
+    }
+    result.update(
+        sheet_id
+        for candidate in selected.values()
+        if candidate is not None
+        for sheet_id in (
+            candidate.source_sheet_ids
+            if candidate.source_sheet_ids
+            else ([candidate.sheet_id] if candidate.sheet_id else [])
+        )
+    )
+    return result
 
 
 def _parse_occurrence_confirmation(
@@ -1585,6 +2417,8 @@ def _component_chain_edges(
     occurrence_by_id: Mapping[str, MtOccurrence],
     edges: Sequence[EvidenceEdge],
     confirmed: Mapping[str, Any],
+    *,
+    detail_not_applicable: bool = False,
 ) -> tuple[
     EvidenceEdge | None,
     EvidenceEdge | None,
@@ -1592,11 +2426,12 @@ def _component_chain_edges(
     list[str],
     list[str],
 ]:
-    """Choose one coherent plan→elevation→detail path.
+    """Choose one coherent plan→elevation(→detail) path.
 
     Returned reason lists are respectively review-only and blocking failures.  An
     explicit edge ID always takes precedence: an invalid ID cannot silently fall
-    back to another PASS edge.
+    back to another PASS edge.  The detail stage may be omitted only after a
+    separately validated, audited ``detail_requirement=not_applicable`` choice.
     """
 
     plan_sheet_ids = {
@@ -1649,9 +2484,40 @@ def _component_chain_edges(
     plan_was_explicit = "plan_to_elevation_edge" in confirmed
     detail_was_explicit = "elevation_to_detail_edge" in confirmed
     plan_edge = explicit_edge("plan_to_elevation_edge", valid_plan_edges)
-    detail_edge = explicit_edge("elevation_to_detail_edge", valid_detail_edges)
+    detail_edge = (
+        None
+        if detail_not_applicable
+        else explicit_edge("elevation_to_detail_edge", valid_detail_edges)
+    )
+    if detail_not_applicable and detail_was_explicit:
+        block_reasons.append(
+            "detail_requirement not_applicable conflicts with elevation_to_detail_edge"
+        )
     if block_reasons:
         return plan_edge, detail_edge, False, review_reasons, block_reasons
+
+    if detail_not_applicable:
+        if not valid_plan_edges:
+            block_reasons.append("missing plan_to_elevation edge in component chain")
+            return plan_edge, None, False, review_reasons, block_reasons
+        candidate_plan_edges = [
+            edge for edge in valid_plan_edges if plan_edge is None or edge.id == plan_edge.id
+        ]
+        if not candidate_plan_edges:
+            block_reasons.append("selected plan_to_elevation edge is not coherent")
+            return plan_edge, None, False, review_reasons, block_reasons
+        if plan_edge is None:
+            plan_edge = candidate_plan_edges[0]
+        if len(candidate_plan_edges) > 1 and not plan_was_explicit:
+            review_reasons.append(
+                f"ambiguous plan_to_elevation edges: {len(candidate_plan_edges)} coherent paths"
+            )
+        plan_ok = plan_was_explicit or (
+            len(candidate_plan_edges) == 1 and plan_edge.status == ReviewStatus.PASS
+        )
+        if not plan_ok:
+            review_reasons.append(f"unconfirmed plan_to_elevation edge: {plan_edge.id}")
+        return plan_edge, None, plan_ok, review_reasons, block_reasons
 
     coherent_pairs = [
         (plan, detail)
@@ -1696,6 +2562,111 @@ def _component_chain_edges(
     return plan_edge, detail_edge, plan_ok and detail_ok, review_reasons, block_reasons
 
 
+def _validated_detail_not_applicable(
+    component: ComponentInstance,
+    occurrence_by_id: Mapping[str, MtOccurrence],
+    sheet_by_id: Mapping[str, Sheet],
+    entity_by_id: Mapping[str, CadEntity],
+    confirmed: Mapping[str, Any],
+) -> tuple[bool, list[str], list[str]]:
+    """Validate a reviewed negative-detail search against current CAD IDs.
+
+    Direct callers can bypass the JSON confirmation parser, so all shape and
+    ownership checks are repeated here.  Merely having no discovered detail
+    candidate never makes the decision valid.
+    """
+
+    if "detail_requirement" not in confirmed:
+        return False, [], []
+    raw = confirmed.get("detail_requirement")
+    if not isinstance(raw, Mapping):
+        return False, ["confirmed detail_requirement must be an object"], []
+    allowed_keys = {"kind", "basis", "searched_sheet_ids", "reference_entity_ids"}
+    unknown_keys = sorted(set(raw) - allowed_keys)
+    reasons = (
+        [f"confirmed detail_requirement has unsupported keys: {', '.join(unknown_keys)}"]
+        if unknown_keys
+        else []
+    )
+    if raw.get("kind") != "not_applicable":
+        reasons.append("confirmed detail_requirement.kind must be not_applicable")
+    basis = raw.get("basis")
+    if not isinstance(basis, str) or not basis.strip():
+        reasons.append("confirmed detail_requirement.basis is empty or invalid")
+
+    raw_sheet_ids = raw.get("searched_sheet_ids")
+    if not isinstance(raw_sheet_ids, Sequence) or isinstance(raw_sheet_ids, (str, bytes)):
+        searched_sheet_ids: list[str] = []
+    else:
+        searched_sheet_ids = [
+            value.strip()
+            for value in raw_sheet_ids
+            if isinstance(value, str) and value.strip()
+        ]
+    searched_sheet_ids = sorted(set(searched_sheet_ids))
+    if not searched_sheet_ids:
+        reasons.append("confirmed detail_requirement.searched_sheet_ids is empty or invalid")
+    missing_sheet_ids = sorted(
+        sheet_id for sheet_id in searched_sheet_ids if sheet_id not in sheet_by_id
+    )
+    if missing_sheet_ids:
+        reasons.append(
+            "confirmed detail search references missing sheets: " + ", ".join(missing_sheet_ids)
+        )
+
+    elevation_sheet_ids = {
+        occurrence_by_id[value].sheet_id
+        for value in component.elevation_occurrence_ids
+        if value in occurrence_by_id and occurrence_by_id[value].sheet_id
+    }
+    unsearched_elevation_ids = sorted(elevation_sheet_ids - set(searched_sheet_ids))
+    if not elevation_sheet_ids:
+        reasons.append("detail not_applicable requires a selected elevation occurrence")
+    elif unsearched_elevation_ids:
+        reasons.append(
+            "detail search does not cover selected elevation sheets: "
+            + ", ".join(unsearched_elevation_ids)
+        )
+
+    raw_reference_ids = raw.get("reference_entity_ids", [])
+    if not isinstance(raw_reference_ids, Sequence) or isinstance(
+        raw_reference_ids, (str, bytes)
+    ):
+        reference_entity_ids: list[str] = []
+        reasons.append("confirmed detail_requirement.reference_entity_ids must be an array")
+    else:
+        reference_entity_ids = [
+            value.strip()
+            for value in raw_reference_ids
+            if isinstance(value, str) and value.strip()
+        ]
+    reference_entity_ids = sorted(set(reference_entity_ids))
+    missing_entity_ids = sorted(
+        entity_id for entity_id in reference_entity_ids if entity_id not in entity_by_id
+    )
+    if missing_entity_ids:
+        reasons.append(
+            "confirmed detail search references missing entities: "
+            + ", ".join(missing_entity_ids)
+        )
+    wrong_sheet_entity_ids = sorted(
+        entity_id
+        for entity_id in reference_entity_ids
+        if entity_id in entity_by_id
+        and entity_by_id[entity_id].sheet_id not in searched_sheet_ids
+    )
+    if wrong_sheet_entity_ids:
+        reasons.append(
+            "confirmed detail reference entities are outside searched sheets: "
+            + ", ".join(wrong_sheet_entity_ids)
+        )
+    if "elevation_to_detail_edge" in confirmed:
+        reasons.append(
+            "detail_requirement not_applicable conflicts with elevation_to_detail_edge"
+        )
+    return not reasons, reasons, reference_entity_ids
+
+
 def _material_for_component(
     mt_code: str,
     materials_by_code: Mapping[str, Sequence[MaterialSpec]],
@@ -1727,7 +2698,9 @@ def build_takeoff(
     """Assemble auditable rows with an explicit, unit-aware confirmation loop."""
 
     confirmations = confirmations or {}
+    entity_values = list(entities)
     sheet_by_id = {sheet.id: sheet for sheet in sheets}
+    entity_by_id = {entity.id: entity for entity in entity_values}
     occurrence_by_id = {occurrence.id: occurrence for occurrence in occurrences}
     materials_by_code: dict[str, list[MaterialSpec]] = defaultdict(list)
     for material in materials:
@@ -1760,7 +2733,7 @@ def build_takeoff(
     components, merge_confirmation_errors, merge_evidence_edges = _apply_component_merges(
         elevation_resolved_components, confirmations
     )
-    measurement_index = _MeasurementIndex.build(sheets, entities, occurrences)
+    measurement_index = _MeasurementIndex.build(sheets, entity_values, occurrences)
     result = TakeoffBuildResult(
         components=components,
         evidence_edges=[*relation_edges, *merge_evidence_edges],
@@ -1805,7 +2778,7 @@ def build_takeoff(
         measurements = collect_measurement_candidates(
             component,
             sheets,
-            entities,
+            entity_values,
             occurrences,
             relation_edges=relation_edges,
             confirmed_detail_edge_id=confirmed_detail_edge_id,
@@ -1845,6 +2818,19 @@ def build_takeoff(
         if raw_confirmations and not isinstance(raw_confirmations, Mapping):
             block_reasons.append("component confirmation must be an object")
 
+        (
+            detail_not_applicable,
+            detail_requirement_reasons,
+            detail_requirement_evidence_ids,
+        ) = _validated_detail_not_applicable(
+            component,
+            occurrence_by_id,
+            sheet_by_id,
+            entity_by_id,
+            component_confirmations,
+        )
+        block_reasons.extend(detail_requirement_reasons)
+
         unit, pricing_method, commercial_reasons = _resolve_unit_and_pricing_method(
             component_confirmations
         )
@@ -1860,7 +2846,15 @@ def build_takeoff(
                 measurements,
                 role,
                 component_confirmations,
+                component_id=component.id,
             )
+            if (
+                candidate is not None
+                and candidate.derived_expression is not None
+                and all(candidate.id != existing.id for existing in measurements)
+            ):
+                measurements.append(candidate)
+                result.measurements.append(candidate)
             selected[role] = candidate
             if reason:
                 if reason.startswith("unconfirmed "):
@@ -1873,27 +2867,70 @@ def build_takeoff(
             occurrence_by_id,
             relation_edges,
             component_confirmations,
+            detail_not_applicable=detail_not_applicable,
         )
         review_reasons.extend(chain_review)
         block_reasons.extend(chain_block)
-        if plan_edge is not None and detail_edge is not None:
-            expected_sheet_by_role = {
-                "length": plan_edge.target_id,
-                "height": plan_edge.target_id,
-                "quantity": plan_edge.target_id,
-                "unfolded_spec": detail_edge.target_id,
-                "width": detail_edge.target_id,
-            }
+        if plan_edge is not None and (detail_edge is not None or detail_not_applicable):
+            expected_sheet_by_role = (
+                {
+                    "length": plan_edge.target_id,
+                    "height": plan_edge.target_id,
+                    "quantity": plan_edge.target_id,
+                    "unfolded_spec": plan_edge.target_id,
+                    "width": plan_edge.target_id,
+                }
+                if detail_not_applicable
+                else {
+                    "length": plan_edge.target_id,
+                    "height": plan_edge.target_id,
+                    "quantity": plan_edge.target_id,
+                    "unfolded_spec": detail_edge.target_id,
+                    "width": detail_edge.target_id,
+                }
+            )
             for role, candidate in selected.items():
                 expected_sheet = expected_sheet_by_role.get(role)
+                candidate_sheet_ids = (
+                    candidate.source_sheet_ids
+                    if candidate is not None and candidate.source_sheet_ids
+                    else (
+                        [candidate.sheet_id]
+                        if candidate is not None and candidate.sheet_id
+                        else []
+                    )
+                )
+
+                def same_drawing_panel(source_sheet_id: str, expected_sheet_id: str) -> bool:
+                    if source_sheet_id == expected_sheet_id:
+                        return True
+                    source_sheet = sheet_by_id.get(source_sheet_id)
+                    expected = sheet_by_id.get(expected_sheet_id)
+                    return bool(
+                        source_sheet is not None
+                        and expected is not None
+                        and source_sheet.source_file_id == expected.source_file_id
+                        and source_sheet.drawing_number
+                        and expected.drawing_number
+                        and source_sheet.drawing_number.strip().casefold()
+                        == expected.drawing_number.strip().casefold()
+                        and source_sheet.kind == expected.kind
+                    )
+
                 if (
                     candidate is not None
                     and expected_sheet is not None
-                    and candidate.sheet_id != expected_sheet
+                    and (
+                        not candidate_sheet_ids
+                        or any(
+                            not same_drawing_panel(sheet_id, expected_sheet)
+                            for sheet_id in candidate_sheet_ids
+                        )
+                    )
                 ):
                     block_reasons.append(
                         f"confirmed {role} candidate is outside selected chain: "
-                        f"{candidate.id} ({candidate.sheet_id} != {expected_sheet})"
+                        f"{candidate.id} ({candidate_sheet_ids} != {expected_sheet})"
                     )
         if plan_edge is not None and "plan_to_elevation_edge" in component_confirmations:
             confirmed_relation_edge_ids.add(plan_edge.id)
@@ -1937,8 +2974,25 @@ def build_takeoff(
         material, material_reasons = _material_for_component(component.mt_code, materials_by_code)
         block_reasons.extend(material_reasons)
         unfolded = selected.get("unfolded_spec")
+        width = selected.get("width")
         length = selected.get("length")
         quantity = selected.get("quantity")
+        chain_sheet_ids = _engineering_chain_sheet_ids(
+            plan_edge,
+            detail_edge,
+            selected,
+        )
+        (
+            engineering_expression,
+            engineering_basis,
+            engineering_evidence_ids,
+            engineering_reasons,
+        ) = _engineering_quantity_confirmation(
+            component_confirmations.get("engineering_quantity"),
+            entity_by_id=entity_by_id,
+            chain_sheet_ids=chain_sheet_ids,
+        )
+        block_reasons.extend(engineering_reasons)
         confirmed_roles = all(
             selected.get(role) is not None and selected[role].status == ReviewStatus.PASS
             for role in required_roles
@@ -1955,7 +3009,15 @@ def build_takeoff(
             candidate for candidate in selected.values() if candidate is not None
         ]
         evidence_ids = sorted(
-            {entity_id for candidate in selected_candidates for entity_id in candidate.entity_ids}
+            {
+                *detail_requirement_evidence_ids,
+                *engineering_evidence_ids,
+                *(
+                    entity_id
+                    for candidate in selected_candidates
+                    for entity_id in candidate.entity_ids
+                ),
+            }
         )
         item = TakeoffItem(
             sequence=sequence,
@@ -1967,11 +3029,18 @@ def build_takeoff(
             )
             or None,
             elevation=_sheet_label(elevation_sheet),
-            detail=_sheet_label(detail_sheet),
+            detail="无" if detail_not_applicable else _sheet_label(detail_sheet),
             unfolded_spec=unfolded.raw_value if unfolded else None,
-            width_mm=unfolded.numeric_value if unfolded else None,
+            width_mm=(
+                width.numeric_value
+                if engineering_expression is not None and width is not None
+                else unfolded.numeric_value if unfolded else None
+            ),
             length_mm=length.numeric_value if length else None,
             quantity=quantity.numeric_value if quantity else None,
+            engineering_quantity_expression=engineering_expression,
+            engineering_quantity_basis=engineering_basis,
+            engineering_quantity_evidence_ids=engineering_evidence_ids,
             unit=unit,
             pricing_method=pricing_method,
             note="；".join(reasons) or None,
@@ -1989,6 +3058,45 @@ def build_takeoff(
                 }
             )
         result.items.append(calculated)
+        engineering_edge_status = (
+            ReviewStatus.PASS
+            if (
+                not engineering_reasons
+                and chain_pass
+                and confirmed_roles
+                and calculated.status != ReviewStatus.BLOCK
+                and calculated.engineering_quantity is not None
+            )
+            else ReviewStatus.REVIEW
+        )
+        for entity_id in engineering_evidence_ids:
+            entity = entity_by_id.get(entity_id)
+            if entity is None or not engineering_expression or not engineering_basis:
+                continue
+            result.evidence_edges.append(
+                EvidenceEdge(
+                    id=_stable_id(
+                        "edge",
+                        component.id,
+                        "engineering_quantity",
+                        entity_id,
+                        engineering_expression,
+                    ),
+                    relation="component_to_engineering_quantity_evidence",
+                    source_id=component.id,
+                    target_id=entity_id,
+                    basis=[
+                        f"expression:{engineering_expression}",
+                        f"basis:{engineering_basis}",
+                        f"source_file:{entity.source_file_id}",
+                        f"sheet:{entity.sheet_id or ''}",
+                        f"handle:{entity.handle or ''}",
+                        f"bbox:{entity.bbox or ''}",
+                    ],
+                    confidence=1.0 if engineering_edge_status == ReviewStatus.PASS else 0.5,
+                    status=engineering_edge_status,
+                )
+            )
         confirmed_measurement_ids = {
             candidate.id
             for candidate in selected_candidates

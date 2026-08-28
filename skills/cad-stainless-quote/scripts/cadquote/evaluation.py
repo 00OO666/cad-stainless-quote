@@ -228,10 +228,17 @@ def _match_rows(
     for signature in sorted(set(predicted_signatures) & set(gold_signatures), key=str):
         predicted_values = sorted(predicted_signatures[signature], key=_record_sort_key)
         gold_values = sorted(gold_signatures[signature], key=_record_sort_key)
-        for predicted_record, gold_record in zip(predicted_values, gold_values, strict=False):
-            matches.append(_Match(predicted_record, gold_record, "diagnostic_signature"))
-            unmatched_predicted.pop(predicted_record.index, None)
-            unmatched_gold.pop(gold_record.index, None)
+        # A categorical signature is an identity only when it is unique on both
+        # sides.  Pairing duplicate groups by sequence/order would leak workbook
+        # row order into the score and could manufacture correct rows when two
+        # physical components share the same labels.
+        if len(predicted_values) != 1 or len(gold_values) != 1:
+            continue
+        predicted_record = predicted_values[0]
+        gold_record = gold_values[0]
+        matches.append(_Match(predicted_record, gold_record, "diagnostic_signature"))
+        unmatched_predicted.pop(predicted_record.index, None)
+        unmatched_gold.pop(gold_record.index, None)
 
     # Conservative fallback for one wrong categorical field. A match must share a
     # non-empty material code, agree on at least two other categorical anchors, and

@@ -417,10 +417,13 @@ def test_batch_does_not_pair_ambiguous_rows_by_nearest_engineering_quantity(
         (output_dir / summary["projects"][0]["report_path"]).read_text(encoding="utf-8")
     )
 
-    assert report["matched_count"] == 2
+    assert report["matched_count"] == 0
+    assert report["missing_count"] == 2
+    assert report["unexpected_count"] == 2
     assert report["correct_rows"] == 0
     assert report["overall_gate"] == "FAIL"
     assert all(
-        row["field_results"]["engineering_quantity"]["status"] == "FAIL"
+        row["field_results"]["engineering_quantity"]["reason"]
+        == "predicted_row_missing"
         for row in report["row_results"]
     )

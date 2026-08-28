@@ -66,10 +66,16 @@ _ROOM_RE = re.compile(
 )
 _COMPONENT_RE = re.compile(
     r"踢脚|脚线|顶线|线条|门套|窗套|包板|收口|嵌条|墙面|顶面|天花|屏风|柜|台|"
-    r"造型|设备带|壁炉|层架|挂衣杆|栏杆|栏板|压条|雕花"
+    r"造型|设备带|壁炉|壁龛|灯槽|镜框|吊架|挂架|按钮板|旋转门|推拉门|门扇|"
+    r"背景板|背景墙|背板|侧板|层板|酒柜|隔断|包边|扶手|层架|挂衣杆|栏杆|"
+    r"栏板|压条|雕花|镜子|银镜|玻璃"
 )
 _DRAWING_TITLE_RE = re.compile(
     r"(?:平面|立面|剖面|大样|节点|示意|索引|放样|天花)[^,，。；;]{0,12}图|图纸目录"
+)
+_DRAWING_TITLE_SUFFIX_RE = re.compile(
+    r"(?:正|背|侧|左|右)?(?:平面|立面|剖面|大样|节点|示意|索引|放样|天花)"
+    r"[^,，。；;]{0,12}图$"
 )
 
 
@@ -111,6 +117,25 @@ def clean_cad_text(value: Any) -> str:
 
 def contains_material_keyword(value: Any) -> bool:
     return bool(_MATERIAL_KEYWORD_RE.search(clean_cad_text(value)))
+
+
+def _component_label(value: Any) -> str | None:
+    """Return a component phrase, including the semantic part of a view title."""
+
+    text = clean_cad_text(value)
+    if not text or len(text) > 36:
+        return None
+    text = re.sub(
+        r"\s*SCALE\s*[:：]?\s*1\s*[/：:]\s*\d+\s*$",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    if _DRAWING_TITLE_RE.search(text):
+        text = _DRAWING_TITLE_SUFFIX_RE.sub("", text).strip()
+    if not text or not _COMPONENT_RE.search(text):
+        return None
+    return text
 
 
 def _point(value: Any) -> tuple[float, float] | None:
@@ -371,6 +396,50 @@ def _nearest_descriptor(
     return min(candidates)[2] if candidates else None
 
 
+def _same_callout_component_descriptor(
+    seed_entities: Sequence[CadEntity],
+    text_entities: Sequence[CadEntity],
+    material_family: str,
+) -> CadEntity | None:
+    """Return a component description stored in the same attributed callout block.
+
+    CAD callout blocks often place the material code and its visible description
+    in sibling ``ATTRIB`` entities.  Their drawing coordinates can be much farther
+    apart than the normal text-clustering radius after viewport projection, while
+    ``parent_insert_handle`` is an exact annotation identity.  Prefer this
+    structural binding, but still require a component noun so a finish such as
+    ``古铜色不锈钢`` is not mislabeled as the physical object.
+    """
+
+    parent_handles = {
+        str(entity.geometry.get("parent_insert_handle") or "").strip()
+        for entity in seed_entities
+        if str(entity.geometry.get("parent_insert_handle") or "").strip()
+    }
+    if not parent_handles:
+        return None
+    seed_ids = {entity.id for entity in seed_entities}
+    candidates: list[tuple[str, CadEntity]] = []
+    for entity in text_entities:
+        if entity.id in seed_ids:
+            continue
+        parent = str(entity.geometry.get("parent_insert_handle") or "").strip()
+        label = _component_label(entity.text)
+        # Attributed annotation blocks are often copied without updating every
+        # default field.  A bare mirror/glass description is strong for its own
+        # material family but is unsafe for a stainless-steel callout; phrases
+        # such as 镜框 or 玻璃包边 remain valid because they name the metal part.
+        incompatible_bare_finish = (
+            material_family in DEFAULT_STAINLESS_CODE_FAMILIES
+            and label is not None
+            and re.fullmatch(r"(?:灰色)?镜子(?:\(加防爆膜\))?|(?:渐变|长虹|艺术)*玻璃", label)
+            is not None
+        )
+        if parent in parent_handles and label is not None and not incompatible_bare_finish:
+            candidates.append((entity.id, entity))
+    return min(candidates)[1] if candidates else None
+
+
 def _nearest_room(
     anchor: tuple[float, float] | None,
     text_entities: Sequence[CadEntity],
@@ -478,6 +547,11 @@ def _occurrence_from_seed(
     entities = list(seed.entities)
     if descriptor is not None and descriptor.id not in {entity.id for entity in entities}:
         entities.append(descriptor)
+    callout_component = _same_callout_component_descriptor(
+        seed.entities,
+        text_entities,
+        seed.family,
+    )
     leaders = [entity for entity in group if entity.entity_type.upper() in _LEADER_TYPES]
     leader, target = _bind_leader(
         entities,
@@ -496,6 +570,10 @@ def _occurrence_from_seed(
     # actually names a component; retain the material descriptor only when it
     # also contains a component noun such as 踢脚/门套/收口.
     component_candidates: list[tuple[float, str, str]] = []
+    if callout_component is not None:
+        callout_label = _component_label(callout_component.text)
+        if callout_label is not None:
+            component_candidates.append((-1.0, callout_component.id, callout_label))
     # The arrow endpoint is often closer to the physical component label than
     # the MT text itself. Search it first, then the annotation anchor. A wider
     # but still local radius recovers labels such as “社区门厅顶线” without
@@ -505,23 +583,23 @@ def _occurrence_from_seed(
             continue
         for entity in text_entities:
             text = clean_cad_text(entity.text)
+            component_label = _component_label(text)
             distance = _distance(search_point, entity_center(entity))
             if (
-                not text
-                or len(text) > 36
-                or not _COMPONENT_RE.search(text)
-                or _DRAWING_TITLE_RE.search(text)
+                component_label is None
                 or distance > radius * 6.0
             ):
                 continue
-            component_candidates.append((distance + priority * radius * 0.15, entity.id, text))
+            component_candidates.append(
+                (distance + priority * radius * 0.15, entity.id, component_label)
+            )
     component_hint = min(component_candidates)[2] if component_candidates else None
     if (
         component_hint is None
         and descriptor is not None
-        and _COMPONENT_RE.search(clean_cad_text(descriptor.text))
+        and _component_label(descriptor.text) is not None
     ):
-        component_hint = clean_cad_text(descriptor.text)
+        component_hint = _component_label(descriptor.text)
 
     confidence = seed.confidence
     if descriptor is not None:

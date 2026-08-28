@@ -250,6 +250,7 @@ class EvidenceEdge(StrictModel):
         "material_mention_to_material",
         "occurrence_to_component",
         "component_to_dimension",
+        "component_to_engineering_quantity_evidence",
         "component_to_price",
     ]
     source_id: str
@@ -268,7 +269,11 @@ class MeasurementCandidate(StrictModel):
     unit: str | None = None
     source_file_id: str
     sheet_id: str | None = None
+    source_sheet_ids: list[str] = Field(default_factory=list)
     entity_ids: list[str] = Field(default_factory=list)
+    source_candidate_ids: list[str] = Field(default_factory=list)
+    derived_expression: str | None = None
+    value_expression: str | None = None
     distance: float | None = Field(default=None, ge=0)
     basis: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -316,6 +321,9 @@ class TakeoffItem(StrictModel):
     length_mm: float | None = Field(default=None, ge=0)
     quantity: float | None = Field(default=None, ge=0)
     engineering_quantity: float | None = Field(default=None, ge=0)
+    engineering_quantity_expression: str | None = None
+    engineering_quantity_basis: str | None = None
+    engineering_quantity_evidence_ids: list[str] = Field(default_factory=list)
     unit: Literal["m", "㎡", "件", "套"] | None = None
     pricing_method: str | None = None
     unit_price: float | None = Field(default=None, ge=0)

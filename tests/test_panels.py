@@ -135,6 +135,105 @@ def test_viewport_expansion_assigns_model_entities_to_virtual_sheet():
     assert selected_entities == expansion.entities
 
 
+def test_same_model_region_keeps_distinct_paper_viewports_and_plan_callouts():
+    source_id = "file:paired-views"
+    sheets = [
+        Sheet(id="model", source_file_id=source_id, layout="Model"),
+        Sheet(id="paper", source_file_id=source_id, layout="L1"),
+    ]
+    entities = [
+        CadEntity(
+            id="model-line",
+            source_file_id=source_id,
+            sheet_id="model",
+            entity_type="LINE",
+            space="model",
+            bbox=(10, 10, 90, 90),
+        ),
+        CadEntity(
+            id="view-plan",
+            source_file_id=source_id,
+            sheet_id="paper",
+            handle="VP-PLAN",
+            entity_type="VIEWPORT",
+            space="paper:L1",
+            bbox=(0, 0, 100, 100),
+            geometry={"viewport_id": 2, "model_bbox": [0, 0, 100, 100]},
+        ),
+        CadEntity(
+            id="view-ceiling",
+            source_file_id=source_id,
+            sheet_id="paper",
+            handle="VP-CEILING",
+            entity_type="VIEWPORT",
+            space="paper:L1",
+            bbox=(120, 0, 220, 100),
+            geometry={"viewport_id": 3, "model_bbox": [0, 0, 100, 100]},
+        ),
+        CadEntity(
+            id="callout-plan",
+            source_file_id=source_id,
+            sheet_id="paper",
+            handle="CO-P",
+            entity_type="INSERT",
+            space="paper:L1",
+            bbox=(30, 30, 40, 40),
+            geometry={"attribute_handles": ["VIEW-NO", "TARGET"]},
+        ),
+        CadEntity(
+            id="view-number",
+            source_file_id=source_id,
+            sheet_id="paper",
+            handle="VIEW-NO",
+            entity_type="ATTRIB",
+            space="paper:L1",
+            text="01",
+            insert=(34, 34),
+            bbox=(33, 33, 35, 35),
+            geometry={"parent_insert_handle": "CO-P"},
+        ),
+        CadEntity(
+            id="target-sheet",
+            source_file_id=source_id,
+            sheet_id="paper",
+            handle="TARGET",
+            entity_type="ATTRIB",
+            space="paper:L1",
+            text="9F-E-97",
+            insert=(36, 36),
+            bbox=(35, 35, 39, 37),
+            geometry={"parent_insert_handle": "CO-P"},
+        ),
+        CadEntity(
+            id="shared-title",
+            source_file_id=source_id,
+            sheet_id="paper",
+            entity_type="TEXT",
+            space="paper:L1",
+            text="1F平面、天花布置图",
+            insert=(50, 90),
+            bbox=(20, 88, 80, 92),
+        ),
+    ]
+
+    expansion = expand_viewport_panels(sheets, entities)
+
+    assert {sheet.viewport_handle for sheet in expansion.sheets} == {
+        "VP-PLAN",
+        "VP-CEILING",
+    }
+    plan = next(sheet for sheet in expansion.sheets if sheet.viewport_handle == "VP-PLAN")
+    assert plan.kind == "plan"
+    assert "structured_plan_references:9F-E-97" in plan.evidence
+    projected_targets = [
+        entity
+        for entity in expansion.entities
+        if entity.geometry.get("original_entity_id") == "target-sheet"
+    ]
+    assert len(projected_targets) == 1
+    assert projected_targets[0].sheet_id == plan.id
+
+
 def test_analysis_view_retains_model_entities_outside_all_viewports():
     source_id = "file:sample"
     model_sheet = Sheet(

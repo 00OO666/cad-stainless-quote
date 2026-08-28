@@ -23,6 +23,7 @@ from ezdxf import bbox as ezbbox
 from ezdxf import recover
 
 from .classifier import classify_sheet
+from .dxf_text_encoding import DxfTextRepairPlan, plan_utf8_text_repairs
 from .io import sha256_file, write_json_atomic
 from .models import CadEntity, Sheet
 
@@ -473,6 +474,63 @@ def _union_bboxes(
     )
 
 
+def _apply_text_repairs(
+    entities: Sequence[CadEntity],
+    plan: DxfTextRepairPlan,
+) -> tuple[list[CadEntity], int]:
+    """Apply only handle-backed repairs admitted by the file-level detector."""
+
+    if not plan.active:
+        return list(entities), 0
+    output: list[CadEntity] = []
+    changed = 0
+
+    def obviously_corrupt(value: str | None) -> bool:
+        if not value:
+            return True
+        return any(
+            character == "\ufffd"
+            or 0xD800 <= ord(character) <= 0xDFFF
+            or 0xE000 <= ord(character) <= 0xF8FF
+            or (ord(character) < 32 and character not in "\t\r\n")
+            for character in value
+        ) or any(marker in value for marker in ("锟斤拷", "烫烫烫", "屯屯屯"))
+
+    for entity in entities:
+        source_handle = entity.handle or entity.geometry.get("source_block_entity_handle")
+        repair = plan.repairs.get(str(source_handle).upper()) if source_handle else None
+        if (
+            repair is None
+            or repair.entity_type != entity.entity_type
+            or repair.text == entity.text
+            or not obviously_corrupt(entity.text)
+        ):
+            output.append(entity)
+            continue
+        provenance = {
+            "method": "raw_ascii_dxf_handle_utf8",
+            "declared_codepage": plan.declared_codepage,
+            "dxf_version": plan.dxf_version,
+            "source_handle": repair.handle,
+            "raw_sha256": repair.raw_sha256,
+            "file_level_non_ascii_text_count": plan.non_ascii_text_count,
+            "file_level_utf8_cjk_text_count": plan.utf8_cjk_text_count,
+        }
+        output.append(
+            entity.model_copy(
+                update={
+                    "text": repair.text,
+                    "geometry": {
+                        **entity.geometry,
+                        "text_encoding_repair": provenance,
+                    },
+                }
+            )
+        )
+        changed += 1
+    return output, changed
+
+
 def _read_document(path: Path) -> tuple[Any, Any, bool]:
     try:
         document = ezdxf.readfile(path)
@@ -747,6 +805,7 @@ def index_dxf(
     source_path = Path(path).expanduser().resolve()
     source_hash = sha256_file(source_path)
     resolved_source_id = source_file_id or f"file:{source_hash}"
+    text_repair_plan = plan_utf8_text_repairs(source_path)
     document, auditor, recovered = _read_document(source_path)
     cache = ezbbox.Cache()
     sheets: list[Sheet] = []
@@ -758,6 +817,7 @@ def index_dxf(
         raise ValueError("max_virtual_entities must be at least 1")
     expansion_state = _BlockExpansionState(max_virtual_entities)
     semantic_block_cache: dict[str, bool] = {}
+    repaired_text_record_count = 0
 
     for layout in document.layouts:
         layout_name = str(layout.name)
@@ -828,6 +888,11 @@ def index_dxf(
                         )
                     )
 
+        layout_records, repaired_count = _apply_text_repairs(
+            layout_records,
+            text_repair_plan,
+        )
+        repaired_text_record_count += repaired_count
         title_texts = [record.text for record in layout_records if record.text]
         classification = classify_sheet(
             source_path.name,
@@ -869,6 +934,14 @@ def index_dxf(
         for entity in entities
     ]
     counts = Counter(entity.entity_type for entity in entities)
+    if repaired_text_record_count:
+        warnings.append(
+            "raw UTF-8 text recovery applied to "
+            f"{repaired_text_record_count} indexed records "
+            f"(declared_codepage={text_repair_plan.declared_codepage or 'unknown'}, "
+            f"utf8_cjk={text_repair_plan.utf8_cjk_text_count}/"
+            f"{text_repair_plan.non_ascii_text_count})"
+        )
     return CadIndexResult(
         source_path=str(source_path),
         source_file_id=resolved_source_id,

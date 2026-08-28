@@ -4,6 +4,22 @@
     "merge_component_ids": [
       "component:REPLACE_WITH_SOURCE_COMPONENT_ID"
     ],
+    "detail_requirement_when_reviewed_as_absent": {
+      "kind": "not_applicable",
+      "basis": "REPLACE_WITH_NEGATIVE_SEARCH_BASIS",
+      "searched_sheet_ids": [
+        "panel:REPLACE_WITH_SELECTED_ELEVATION_ID"
+      ],
+      "reference_entity_ids": []
+    },
+    "engineering_quantity_when_cad_proves_a_nonstandard_billing_axis": {
+      "kind": "engineering_quantity_expression",
+      "expression": "length_mm*quantity*2/1000",
+      "basis": "REPLACE_WITH_PHYSICAL_TOPOLOGY_AND_BILLING_AXIS_BASIS",
+      "evidence_ids": [
+        "entity:REPLACE_WITH_SELECTED_CHAIN_ENTITY_ID"
+      ]
+    },
     "note": "Only copy merge_component_ids into selected when a reviewer explicitly confirms that the source rows are one physical component."
   },
   "components": {

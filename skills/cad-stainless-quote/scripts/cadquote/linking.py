@@ -384,6 +384,14 @@ def _rank_relation(
                 continue
             target_aliases = _sheet_aliases(target)
             explicit_codes = sorted(set(source_refs) & target_aliases)
+            # A reference to the target drawing number is stronger candidate
+            # retrieval evidence than a coincidental code in a sub-panel
+            # title.  One referenced drawing commonly contains many detail
+            # panels; all of those panels must survive the weak top-k cut so a
+            # later component-level selector can choose the right physical
+            # detail.  This marker never promotes an edge to PASS by itself.
+            target_drawing_codes = extract_reference_codes(target.drawing_number)
+            explicit_drawing_codes = sorted(set(source_refs) & target_drawing_codes)
             pair = (source.id, target.id)
             is_confirmed = pair in confirmed
             basis: list[str] = []
@@ -397,6 +405,8 @@ def _rank_relation(
                 for code in explicit_codes:
                     handles = ",".join(sorted(source_refs[code]))
                     basis.append(f"explicit_reference:{code}@{handles}")
+                    if code in explicit_drawing_codes:
+                        basis.append(f"drawing_sheet_reference:{code}@{handles}")
                     basis.extend(
                         sorted(source_reference_context.get(source.id, {}).get(code, ()))
                     )
@@ -484,6 +494,7 @@ def _rank_relation(
             for edge in ranked
             if edge.status == ReviewStatus.PASS
             or any(value.startswith("view_reference:") for value in edge.basis)
+            or any(value.startswith("drawing_sheet_reference:") for value in edge.basis)
             or any(value.startswith("confirmed:") for value in edge.basis)
         ]
         weak_candidates = [

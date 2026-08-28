@@ -21,11 +21,14 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Uses exact or unique distinctive material aliases; ambiguous shared aliases remain unresolved.
 - Builds reviewable plan → elevation → detail relationships without treating annotation count as quantity.
 - Extracts bounded length, height, quantity, and unfolded-width candidates with unit and paper-space safeguards.
+- Separates lettered casework variants by exact CAD plan/elevation titles, same-view material codes, and multi-view native dimensions instead of reusing the first shared-material candidate.
+- Applies optional, external versioned estimator-convention profiles as non-mutating `REVIEW`/`CONFIRMED` candidates; no bundled customer convention is required or trusted.
 - Revisits raw DXF polylines near leader targets to surface conservative repeated-instance quantity candidates; they remain `REVIEW` and never auto-fill the bill.
 - Rejects sheet-wide detail dimensions unless an explicit detail relation and a unique component-local material anchor exist.
 - Generates component-bound locator and close-up images directly from vector CAD for plan, elevation, and detail stages; missing images stay visible as review rows.
 - Generates numbered dark-CAD candidate boards for repeated same-sheet/same-MT occurrences and forbids selecting the first rendered occurrence by default.
 - Suggests component/dimension envelopes for better framing while keeping algorithmic bboxes explicitly `REVIEW`.
+- Overlays stable `G1`, `G2`, ... labels for high-value bounded primitives and connected paths while preserving their CAD/block provenance and refusing to infer measurement roles.
 - Renders bounded `cad-dark-full` panel catalogs (including no-MT details), overlays projected paper annotations, and stores plan/elevation/detail as distinct stage candidates.
 - Preserves every evidence candidate instead of silently displaying only the first image bundle.
 - Audits screenshot evidence for missing files, cross-component reuse, one image masquerading as multiple stages, near-blank renders, and unreadably small spreadsheet embedding.
@@ -33,6 +36,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Builds candidate-recall diagnostics and conservative multi-project held-out evaluation summaries.
 - Applies audited reviewer confirmations and resumes without re-running immutable upstream stages.
 - Computes `m`, `m²`, piece, and set quantities deterministically.
+- Supports a strictly parsed, CAD-evidence-bound engineering-quantity expression when a proven billing axis or internal topology multiplier cannot be represented by the visible width/length/quantity columns; the standard formula remains the default.
 - Matches only approved, versioned, specification-compatible prices.
 - Exports a five-sheet Excel workbook when evidence rendering is enabled: quotation, provenance, pending review, run metadata, and screenshot evidence. Debug runs with evidence disabled retain the legacy four-sheet layout.
 - Separates PASS precision from automation rate when evaluating against a reviewed gold set.
@@ -46,7 +50,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 5. A price requires an approved source, version, date, currency, tax basis, material, thickness, finish, process, unit, and pricing method.
 6. Human benchmark spreadsheets are imported as candidate truth and audited before use.
 7. Repeated linework is only a review candidate; a reviewer must prove that it represents independent billable components.
-8. A `PASS` item must have rendered locator and close-up images for the same sequence and `component_id` at plan, elevation, and detail stages; otherwise its amount is cleared and it returns to `REVIEW`.
+8. A `PASS` item must have rendered locator and close-up images for the same sequence and `component_id` at plan, elevation, and detail stages. The sole exception is an audited `detail=NOT_APPLICABLE` negative search covering the selected elevation; missing detail candidates never qualify automatically.
 9. Different component names cannot reuse one occurrence image, and one image cannot stand in for multiple evidence stages.
 
 ## Requirements
@@ -110,6 +114,102 @@ close-up frames that geometry together with the selected MT leader; otherwise
 the row remains REVIEW. Use `component-frames`, `panel-catalog`,
 `annotate-panel-catalog`, and `stage-evidence` to build the auditable three-stage
 review pack; none of those commands chooses a relation merely because it ranks first.
+
+If a close-up inherited too few pixels from a whole-panel raster, re-render its bounded CAD
+region directly from the DXF instead of enlarging the PNG:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 component-closeups `
+  "D:\cadquote-runs\project\index\cad_index.json" `
+  "D:\cadquote-runs\project\analysis\panels.json" `
+  "D:\cadquote-runs\project\analysis\component-frames\component_frames.json" `
+  --out "D:\cadquote-runs\project\analysis\component-closeups" `
+  --target-px 3200
+```
+
+The vector re-render is easier to inspect but remains REVIEW until its physical-component bbox
+and drawing chain are explicitly confirmed.
+
+When important outlines are inside anonymous, dynamic, or nested blocks, expand geometry only
+inside those rendered component bboxes:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 component-geometry `
+  "D:\cadquote-runs\project\index\cad_index.json" `
+  "D:\cadquote-runs\project\analysis\component-closeups\component_closeups.json" `
+  --out "D:\cadquote-runs\project\analysis\component-geometry"
+```
+
+The probe preserves transformed world coordinates, root/block provenance, exact or declared-
+tolerance approximate curve length, and same-layer endpoint-connected width/height/path-length
+candidates. All results remain `REVIEW`; they do not assign a length or quantity role. Limit or
+recursion truncation is explicit and makes the affected region incomplete.
+
+Create a numbered geometry board to inspect those candidates on the exact vector close-up:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 geometry-boards `
+  "D:\cadquote-runs\project\analysis\component-closeups\component_closeups.json" `
+  "D:\cadquote-runs\project\analysis\component-geometry\component_geometry.json" `
+  --out "D:\cadquote-runs\project\analysis\geometry-boards"
+```
+
+`G1`, `G2`, ... are deterministic review ordinals, not length/width/quantity roles. The manifest
+retains primitive/path IDs, bbox width and height, path length, layer, block provenance, image
+hashes, and explicit source/candidate truncation. Missing or identity-mismatched close-ups produce
+no board, and every surviving candidate remains `measurement_role=null`. Capped boards use a
+stable balanced round-robin across closed primitives, connected paths, handle-backed primitives,
+largest bboxes, and region-center candidates so a single geometry class cannot consume the board.
+
+Label each visible native dimension with an auditable CAD entity reference before choosing it:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 measurement-boards `
+  "D:\cadquote-runs\project\analysis\panels.json" `
+  "D:\cadquote-runs\project\analysis\component-closeups\component_closeups.json" `
+  --takeoff "D:\cadquote-runs\project\analysis\takeoff_draft.json" `
+  --out "D:\cadquote-runs\project\analysis\measurement-boards"
+```
+
+The `D1`, `D2`, ... overlay is a review aid. It binds a visible value to an entity/handle but does
+not decide its role, component ownership, or physical quantity.
+
+Keep lettered sibling counters/cabinets in separate physical buckets before applying an estimator
+convention:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 variant-bindings `
+  "D:\review\target-free-row-tasks.json" `
+  "D:\cadquote-runs\project\analysis\panels.json" `
+  --out "D:\cadquote-runs\project\analysis\variant-bindings.json"
+```
+
+The task JSON may contain row name, material code, and candidate sheet IDs, but H/J/K/L target
+fields are rejected. A suffix such as `A` or `B` must match exact CAD plan/elevation titles; the
+material code must appear in every selected view, and plan width/depth plus elevation height need
+independent native dimension handles. Opposite variants are retained as negative evidence. The
+output is target-free but still `REVIEW`, never a direct quotation update.
+
+After component and measurement facts exist, an estimator convention profile can propose a
+quantity role, calculation basis, unfolded-profile suggestion, or deterministic area/linear/set
+formula without editing the takeoff:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 convention-candidates `
+  "D:\cadquote-runs\project\analysis\takeoff_draft.json" `
+  "D:\review\estimator-conventions.json" `
+  --out "D:\cadquote-runs\project\analysis\convention-candidates.json"
+```
+
+Start from `assets/estimator-convention-profile-template.json`; the machine-readable contract is
+`assets/estimator-convention-profile-schema-v1.json`. A rule match is `REVIEW` unless the profile
+and rule are both explicitly `APPROVED`, profile approval includes reviewer/timezone-aware
+timestamp/reason, the physical component is `PASS`, every formula input is an auditable `PASS`
+measurement entity, and no input or existing takeoff value conflicts. Even `CONFIRMED` convention
+candidates have `commercial_effect=NONE`: they do not mutate the takeoff, promote a quotation row,
+set a price, or release an amount. Quantity never defaults to one. Outer quantity `1` is proposed
+only when an audited expression explicitly contains its own multiplication factor, preventing
+double multiplication.
 
 These staged-evidence commands are currently explicit review steps. The standard
 `run`/`resume` commands do not yet invoke them or merge their manifest into the
