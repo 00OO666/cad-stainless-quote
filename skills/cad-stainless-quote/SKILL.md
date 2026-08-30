@@ -12,6 +12,14 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 - Resolve the installed skill root and run commands from that directory; do not assume the user's project is the current directory.
 - On first use on Windows, run `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`, then run `scripts/run.ps1 doctor`. Install any DWG converter and 7-Zip yourself and comply with their licenses; DXF and ZIP input do not require those external tools.
 - For a new drawing package, run `scripts/run.ps1 run <input> --out <run-dir>`.
+- The full run also writes `index/drawing_catalog.json` and
+  `index/drawing_catalog.sqlite`, a reusable lookup layer for sheet metadata,
+  MT/drawing-code/room text, and native dimension candidates.  To pre-build or
+  refresh cached sheet previews from an existing index, run
+  `scripts/run.ps1 preindex <index-json> --out <catalog-dir> --render-previews`;
+  use `scripts/run.ps1 catalog-search <catalog-json> <query>` for exact lookup.
+  The catalog accelerates navigation only and never confirms component
+  ownership or measurement roles.
 - When a sheet contains repeated occurrences of the same MT code, run `scripts/run.ps1 candidate-boards <index-json> <occurrences-json> --panels <panels-json> --out <board-dir>`. Use the numbered dark-CAD boards to assign one or more occurrences to a physical `component_id`; never select the first available occurrence by default.
 - After writing explicit row/component occurrence selections, run `scripts/run.ps1 component-frames <panels-json> <candidate-boards-json> <selections-json> --out <frame-dir>`. Its geometry envelopes improve framing only; they carry `object_bbox_state=REVIEW` and never confirm a component.
 - When a raster crop is too small to read, run `scripts/run.ps1 component-closeups <index-json> <panels-json> <component-frames-json> --out <closeup-dir> --target-px 3200 --render-profile cad-dark-full`. This re-renders the bounded region from the original DXF; it never enlarges an existing PNG and remains REVIEW until the component bbox and chain are confirmed.

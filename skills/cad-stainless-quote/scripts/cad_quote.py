@@ -24,6 +24,12 @@ from cadquote.convention_candidates import (
 )
 from cadquote.converter import convert_dwgs
 from cadquote.doctor import run_doctor
+from cadquote.drawing_catalog import (
+    build_drawing_catalog,
+    render_sheet_previews,
+    search_drawing_catalog,
+    write_drawing_catalog_sqlite,
+)
 from cadquote.evaluation import (
     evaluate_takeoff,
     evaluation_batch_markdown,
@@ -480,6 +486,65 @@ def command_index(args: argparse.Namespace) -> int:
             "sqlite": str(output / "cad_index.sqlite"),
         }
     )
+    return 0
+
+
+def command_preindex(args: argparse.Namespace) -> int:
+    """Build the reusable sheet/text/dimension catalog from an immutable CAD index."""
+
+    index_path = Path(args.index).expanduser().resolve()
+    output = Path(args.out).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    payload = _load_json(index_path)
+    catalog = build_drawing_catalog(payload)
+    json_path = output / "drawing_catalog.json"
+    sqlite_path = output / "drawing_catalog.sqlite"
+    write_json_atomic(json_path, catalog)
+    write_drawing_catalog_sqlite(catalog, sqlite_path)
+    if args.render_previews:
+        catalog = render_sheet_previews(
+            catalog,
+            output,
+            maximum=args.maximum,
+            target_px=args.target_px,
+            margin_ratio=args.margin_ratio,
+            render_profile=args.render_profile,
+        )
+        # render_sheet_previews writes the JSON snapshot; refresh SQLite so both
+        # query surfaces describe the same preview-bearing catalog.
+        write_drawing_catalog_sqlite(catalog, sqlite_path)
+    _print(
+        {
+            "schema_version": catalog.get("schema_version"),
+            "source_count": catalog.get("source_count", 0),
+            "sheet_count": catalog.get("sheet_count", 0),
+            "entity_count": catalog.get("entity_count", 0),
+            "dimension_count": catalog.get("dimension_count", 0),
+            "term_count": catalog.get("term_count", 0),
+            "mt_code_count": catalog.get("mt_code_count", 0),
+            "drawing_code_count": catalog.get("drawing_code_count", 0),
+            "preview_count": catalog.get("preview_count", 0),
+            "json": str(json_path),
+            "sqlite": str(sqlite_path),
+            "preview_index": (
+                str(output / "preview_index.json") if args.render_previews else None
+            ),
+        }
+    )
+    return 0
+
+
+def command_catalog_search(args: argparse.Namespace) -> int:
+    """Search exact terms/codes in a pre-index without making a component match."""
+
+    catalog = _load_json(Path(args.catalog).expanduser().resolve())
+    results = search_drawing_catalog(
+        catalog,
+        args.query,
+        kind=args.kind,
+        limit=args.limit,
+    )
+    _print({"query": args.query, "count": len(results), "results": results})
     return 0
 
 
@@ -1597,6 +1662,37 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("dxf", type=Path, nargs="+")
     index.add_argument("--out", type=Path, required=True)
     index.set_defaults(handler=command_index)
+
+    preindex = subparsers.add_parser(
+        "preindex",
+        help="从既有CAD索引建立可搜索图纸目录、MT/图号/尺寸索引和可选预览缓存",
+    )
+    preindex.add_argument("index", type=Path, help="既有cad_index.json")
+    preindex.add_argument("--out", type=Path, required=True)
+    preindex.add_argument(
+        "--render-previews",
+        action="store_true",
+        help="按图纸范围生成可复用的整页/面板预览；缺失源文件或范围时保留UNAVAILABLE",
+    )
+    preindex.add_argument("--maximum", type=int, default=500)
+    preindex.add_argument("--target-px", type=int, default=1_800)
+    preindex.add_argument("--margin-ratio", type=float, default=0.02)
+    preindex.add_argument(
+        "--render-profile",
+        choices=("white-fast", "cad-dark", "cad-dark-full"),
+        default="cad-dark",
+    )
+    preindex.set_defaults(handler=command_preindex)
+
+    catalog_search = subparsers.add_parser(
+        "catalog-search",
+        help="在图纸预索引中搜索MT、图号、房间文字或尺寸候选",
+    )
+    catalog_search.add_argument("catalog", type=Path, help="drawing_catalog.json")
+    catalog_search.add_argument("query")
+    catalog_search.add_argument("--kind", help="按图纸类型过滤，例如plan/elevation/detail")
+    catalog_search.add_argument("--limit", type=int, default=50)
+    catalog_search.set_defaults(handler=command_catalog_search)
 
     panels = subparsers.add_parser(
         "panels",

@@ -19,6 +19,7 @@ from .calculation import (
     validate_engineering_quantity_expression,
 )
 from .converter import ConversionAudit, convert_dwgs
+from .drawing_catalog import build_drawing_catalog, write_drawing_catalog_sqlite
 from .evidence_images import build_excel_evidence_targets, render_excel_evidence
 from .exporter import build_quote_workbook
 from .ingest import IngestLimits, IngestResult, ingest_input
@@ -2399,6 +2400,14 @@ def run_pipeline(
 
     bundle, index_issues = _index_inputs(dxf_paths, source_ids, index_dir)
     issues.extend(index_issues)
+    # Build the reusable lookup layer once per immutable CAD index. Downstream
+    # stages still consume the typed index directly, while review tools and
+    # future runs can query this catalog without reparsing every source file.
+    drawing_catalog = build_drawing_catalog(bundle.to_dict())
+    drawing_catalog_path = index_dir / "drawing_catalog.json"
+    drawing_catalog_sqlite_path = index_dir / "drawing_catalog.sqlite"
+    write_json_atomic(drawing_catalog_path, drawing_catalog)
+    write_drawing_catalog_sqlite(drawing_catalog, drawing_catalog_sqlite_path)
     source_names = {file.id: file.relative_path for file in ingest.files}
     panel_expansion = expand_viewport_panels(
         bundle.sheets,
@@ -2699,6 +2708,16 @@ def run_pipeline(
         issues=issues,
         metadata={
             "conversion": conversion.to_dict(),
+            "drawing_catalog": {
+                "schema_version": drawing_catalog.get("schema_version"),
+                "json": str(drawing_catalog_path),
+                "sqlite": str(drawing_catalog_sqlite_path),
+                "source_count": drawing_catalog.get("source_count", 0),
+                "sheet_count": drawing_catalog.get("sheet_count", 0),
+                "entity_count": drawing_catalog.get("entity_count", 0),
+                "dimension_count": drawing_catalog.get("dimension_count", 0),
+                "term_count": drawing_catalog.get("term_count", 0),
+            },
             "confirmation_audit": confirmation_bundle.audit,
             "confirmation_schema_version": confirmation_bundle.schema_version,
             "confirmation_source": confirmation_bundle.source_path,
@@ -2713,6 +2732,8 @@ def run_pipeline(
                 "cad_sources": len(bundle.results),
                 "sheets": len(sheets),
                 "entities": len(entities),
+                "catalog_terms": drawing_catalog.get("term_count", 0),
+                "catalog_dimensions": drawing_catalog.get("dimension_count", 0),
                 "materials": len(materials),
                 "mt_occurrences": len(occurrences),
                 "material_mentions": len(material_mentions),
@@ -2742,6 +2763,8 @@ def run_pipeline(
         "conversion": str(root / "conversion.json"),
         "index_json": str(index_dir / "cad_index.json"),
         "index_sqlite": str(index_dir / "cad_index.sqlite"),
+        "drawing_catalog": str(drawing_catalog_path),
+        "drawing_catalog_sqlite": str(drawing_catalog_sqlite_path),
         "materials": str(analysis_dir / "materials.json"),
         "panels": str(analysis_dir / "panels.json"),
         "mt_occurrences": str(analysis_dir / "mt_occurrences.json"),
@@ -3193,5 +3216,11 @@ def resume_pipeline(
         result.paths["vector_quantity_probes"] = str(vector_probe_path)
     if excel_evidence_index is not None:
         result.paths["excel_evidence"] = str(excel_evidence_index)
+    resumed_catalog_path = root / "index" / "drawing_catalog.json"
+    resumed_catalog_sqlite_path = root / "index" / "drawing_catalog.sqlite"
+    if resumed_catalog_path.is_file():
+        result.paths["drawing_catalog"] = str(resumed_catalog_path)
+    if resumed_catalog_sqlite_path.is_file():
+        result.paths["drawing_catalog_sqlite"] = str(resumed_catalog_sqlite_path)
     write_json_atomic(root / "run.json", result.to_dict())
     return result

@@ -209,6 +209,8 @@ def test_pipeline_single_dxf_produces_auditable_review_package(tmp_path: Path):
     assert Path(result.manifest_path).is_file()
     assert Path(result.paths["review_pack"]).is_file()
     assert Path(result.paths["vector_quantity_probes"]).is_file()
+    assert Path(result.paths["drawing_catalog"]).is_file()
+    assert Path(result.paths["drawing_catalog_sqlite"]).is_file()
     workbook = load_workbook(result.quote_path)
     assert workbook.sheetnames == ["报价表", "来源追踪", "待确认", "运行信息"]
     assert workbook["待确认"].max_row >= 2

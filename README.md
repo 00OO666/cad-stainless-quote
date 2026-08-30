@@ -15,6 +15,7 @@ No customer drawings, quotations, private paths, or proprietary runtime packages
 - Safely inventories directories and ZIP/RAR/7z archives with traversal, link, encryption, collision, size, and archive-bomb checks.
 - Converts DWG to DXF through an installed ODA File Converter and records conversion/audit results.
 - Indexes layouts, viewports, block-expanded text, dimensions, leaders, and coordinates into JSON plus SQLite.
+- Builds a reusable drawing catalog with searchable MT/drawing-code/room text, dimension candidates, and optional content-addressed sheet-preview caching, so later review does not repeatedly reopen every source drawing.
 - Detects normalized `MT` annotations and conservative material-table candidates.
 - Splits multi-view sheets into local drawing panels and keeps leader text attached to the arrow-target panel.
 - Resolves explicit view-number → target-sheet callouts and preserves the supporting entity IDs.
@@ -74,6 +75,29 @@ powershell -ExecutionPolicy Bypass -File .\skills\cad-stainless-quote\scripts\se
 & .\skills\cad-stainless-quote\scripts\run.ps1 run `
   "D:\drawings\project.zip" `
   --out "D:\cadquote-runs\project"
+```
+
+The full run writes `index\drawing_catalog.json` and
+`index\drawing_catalog.sqlite` after the immutable CAD index.  To build or
+refresh the lookup layer from an existing run, optionally render one cached
+preview per eligible sheet:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 preindex `
+  "D:\cadquote-runs\project\index\cad_index.json" `
+  --out "D:\cadquote-runs\project\index\drawing-catalog" `
+  --render-previews
+```
+
+The preview cache is keyed by source hash, sheet/layout/bbox, render profile,
+target pixels, margin, and renderer version.  A preview is a navigation aid,
+not proof of physical component ownership; the later candidate/selection and
+evidence stages still have to confirm the plan → elevation → detail chain.
+Search the catalog without reopening CAD:
+
+```powershell
+& .\skills\cad-stainless-quote\scripts\run.ps1 catalog-search `
+  "D:\cadquote-runs\project\index\drawing-catalog\drawing_catalog.json" MT-01
 ```
 
 For DWG files, configure ODA File Converter, AutoCAD Core Console, or `dwg2dxf` separately. ODA states that non-members may use its File Converter for non-commercial applications only; commercial users must choose and license a suitable backend. The converter is not bundled with this repository.
