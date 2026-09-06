@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -127,6 +128,7 @@ def _render_with_matplotlib(
     target_px: int,
     mark_center: bool,
     render_profile: str,
+    viewport_handles: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     import matplotlib
 
@@ -189,6 +191,15 @@ def _render_with_matplotlib(
             super().draw_entities(entities, filter_func=evidence_filter)
 
     for label, region in regions.items():
+        viewport_handle = (viewport_handles or {}).get(label)
+        region_context = context
+        frozen_layers = []
+        if viewport_handle:
+            viewport = document.entitydb.get(viewport_handle)
+            if viewport is None or viewport.dxftype() != 'VIEWPORT':
+                raise ValueError(f'Invalid source viewport: {viewport_handle}')
+            region_context = context.from_viewport(viewport)
+            frozen_layers = list(viewport.frozen_layers)
         x0, y0, x1, y1 = region
         margin_x = (x1 - x0) * margin_ratio
         margin_y = (y1 - y0) * margin_ratio
@@ -218,7 +229,7 @@ def _render_with_matplotlib(
         axes = figure.add_axes((0, 0, 1, 1))
         backend = MatplotlibBackend(axes, adjust_figure=False)
         backend.set_background(background)
-        EvidenceFrontend(context, backend, config=configuration).draw_entities(entities)
+        EvidenceFrontend(region_context, backend, config=configuration).draw_entities(entities)
         backend.finalize()
         if mark_center:
             center_x = (region[0] + region[2]) / 2
@@ -283,6 +294,9 @@ def _render_with_matplotlib(
             "entity_count": len(entities),
             "backend": "matplotlib-agg",
             "render_profile": profile["name"],
+            "source_viewport_handle": viewport_handle,
+            "viewport_frozen_layers": frozen_layers,
+            "viewport_layer_overrides_applied": bool(viewport_handle),
         }
     return rendered, dict(sorted(skipped_type_counts.items()))
 
@@ -297,6 +311,7 @@ def render_regions(
     target_px: int = 2_200,
     mark_center: bool = True,
     render_profile: str = "white-fast",
+    viewport_handles: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Render named regions and save an index that maps every image back to CAD coordinates."""
 
@@ -323,6 +338,7 @@ def render_regions(
         target_px,
         mark_center,
         profile["name"],
+        viewport_handles,
     )
     result = {
         "schema_version": "1.1",
@@ -636,7 +652,13 @@ def render_panel_occurrence_crops(
     panel_records: dict[str, dict[str, Any]] = {}
     skipped_counts: Counter[str] = Counter()
     for source_id, source_sheets in sorted(grouped_sheets.items()):
-        group_dir = panel_root / _safe_label(source_id)
+        # Source ids commonly contain a full SHA-256 plus a conversion suffix.
+        # Reusing that value verbatim makes otherwise ordinary workspace paths
+        # exceed the classic Windows MAX_PATH limit once the panel filename is
+        # appended.  A short content digest is deterministic, collision-safe for
+        # this local cache, and the source id remains recorded in panel_records.
+        source_digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:20]
+        group_dir = panel_root / f"source_{source_digest}"
         # Never reuse a PNG by filename alone.  Older implementations could
         # render ``cad-dark`` and then falsely label the same bytes as
         # ``cad-dark-full`` because profile, source digest, bbox and target_px

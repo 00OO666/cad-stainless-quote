@@ -19,6 +19,7 @@ from typing import Any
 from PIL import Image
 
 from .io import sha256_file, write_json_atomic
+from .native_paper_render import render_native_paper_regions
 from .render import _safe_label, render_regions
 
 
@@ -75,9 +76,7 @@ def _request_label(
     group_id: str,
     index: int,
 ) -> str:
-    digest = hashlib.sha256(
-        f"{selection_key}\0{group_id}\0{index}".encode()
-    ).hexdigest()[:12]
+    digest = hashlib.sha256(f"{selection_key}\0{group_id}\0{index}".encode()).hexdigest()[:12]
     return f"{sequence}-{_safe_label(selection_key)}-{digest}"
 
 
@@ -91,6 +90,7 @@ def render_component_frame_closeups(
     render_profile: str = "cad-dark-full",
     margin_ratio: float = 0.04,
     maximum: int = 500,
+    native_paper: bool = True,
 ) -> dict[str, Any]:
     """Render one crisp CAD region for every component-frame suggestion.
 
@@ -111,9 +111,12 @@ def render_component_frame_closeups(
     source_paths = {
         str(value["source_file_id"]): Path(str(value["source_path"])).resolve()
         for value in index_payload.get("sources", [])
-        if isinstance(value, Mapping)
-        and value.get("source_file_id")
-        and value.get("source_path")
+        if isinstance(value, Mapping) and value.get("source_file_id") and value.get("source_path")
+    }
+    source_hashes = {
+        str(v.get("source_file_id")): v.get("source_sha256")
+        for v in index_payload.get("sources", [])
+        if isinstance(v, Mapping)
     }
     sheets = {
         str(value["id"]): value
@@ -145,9 +148,7 @@ def render_component_frame_closeups(
             "evidence": [],
         }
         raw_frames = raw_record.get("frames", [])
-        if not isinstance(raw_frames, Sequence) or isinstance(
-            raw_frames, (str, bytes, bytearray)
-        ):
+        if not isinstance(raw_frames, Sequence) or isinstance(raw_frames, (str, bytes, bytearray)):
             raw_frames = []
         for frame_index, raw_frame in enumerate(raw_frames, start=1):
             if requested_count >= maximum:
@@ -176,6 +177,15 @@ def render_component_frame_closeups(
                 if (value := _bbox(raw_value)) is not None
             ]
             combined = _union([object_bbox, *dimension_bboxes])
+            context_points = [
+                p
+                for p in raw_frame.get("annotation_context_points", [])
+                if isinstance(p, (list, tuple))
+                and len(p) == 2
+                and all(isinstance(v, (int, float)) and math.isfinite(v) for v in p)
+            ]
+            if context_points:
+                combined = _union([combined, *[(p[0], p[1], p[0], p[1]) for p in context_points]])
             region = _clip(combined, panel_bbox)
             if region is None:
                 output_record["reason_codes"].append("FRAME_OUTSIDE_PANEL")
@@ -197,8 +207,13 @@ def render_component_frame_closeups(
                 "source_file_id": source_file_id,
                 "drawing_number": sheet.get("drawing_number"),
                 "kind": sheet.get("kind"),
+                "viewport_handle": sheet.get("viewport_handle"),
+                "selected_occurrence_ids": list(raw_frame.get("selected_occurrence_ids", [])),
+                "source_branch_ids": list(raw_frame.get("source_branch_ids", [])),
+                "entity_ids": list(raw_frame.get("entity_ids", [])),
                 "object_bbox": list(object_bbox),
                 "dimension_bboxes": [list(value) for value in dimension_bboxes],
+                "annotation_context_points": context_points,
                 "render_bbox": list(region),
                 "frame_state": raw_frame.get("state", "REVIEW"),
                 "frame_reason_codes": list(raw_frame.get("reason_codes", [])),
@@ -214,16 +229,56 @@ def render_component_frame_closeups(
         source_token = hashlib.sha256(source_file_id.encode()).hexdigest()[:16]
         source_dir = destination / "images" / f"source_{source_token}"
         try:
-            rendered = render_regions(
-                source_paths[source_file_id],
-                regions,
-                source_dir,
-                layout="Model",
-                margin_ratio=margin_ratio,
-                target_px=target_px,
-                mark_center=False,
-                render_profile=render_profile,
-            )
+            actual_hash = sha256_file(source_paths[source_file_id])
+            expected_hash = source_hashes.get(source_file_id)
+            if expected_hash and actual_hash != expected_hash:
+                raise ValueError("SOURCE_SHA256_MISMATCH")
+            rendered = {"regions": {}}
+            native_regions = {
+                k: v
+                for k, v in regions.items()
+                if native_paper and request_meta[k].get("viewport_handle")
+            }
+            ordinary = {k: v for k, v in regions.items() if k not in native_regions}
+            for subset, folder in [(native_regions, "native"), (ordinary, "model-only")]:
+                if not subset:
+                    continue
+                viewports = {
+                    k: request_meta[k]["viewport_handle"]
+                    for k in subset
+                    if request_meta[k].get("viewport_handle")
+                }
+                if folder == "native":
+                    part = render_native_paper_regions(
+                        source_paths[source_file_id],
+                        subset,
+                        source_dir / folder,
+                        viewport_handles=viewports,
+                        margin_ratio=margin_ratio,
+                        target_px=target_px,
+                    )
+                    for failure in part.get("failures", []):
+                        failures.append({"source_file_id": source_file_id, **failure})
+                else:
+                    part = render_regions(
+                        source_paths[source_file_id],
+                        subset,
+                        source_dir / folder,
+                        layout="Model",
+                        margin_ratio=margin_ratio,
+                        target_px=target_px,
+                        mark_center=False,
+                        render_profile=render_profile,
+                        viewport_handles=viewports,
+                    )
+                for label, image_record in part.get("regions", {}).items():
+                    rendered["regions"][label] = {
+                        **image_record,
+                        "file": folder + "/" + image_record["file"],
+                        "source_sha256": actual_hash,
+                    }
+            if sha256_file(source_paths[source_file_id]) != actual_hash:
+                raise ValueError("SOURCE_CHANGED_DURING_RENDER")
         except Exception as exc:  # pragma: no cover - external CAD boundary
             failures.append(
                 {
@@ -261,9 +316,18 @@ def render_component_frame_closeups(
                     "absolute_path": str(image_path.resolve()),
                     "relative_path": str(image_path.relative_to(destination)).replace("\\", "/"),
                     "image_sha256": sha256_file(image_path),
+                    "source_sha256": image_record.get("source_sha256"),
+                    "requested_render_bbox": meta["render_bbox"],
+                    "render_bbox": image_record.get("bbox", meta["render_bbox"]),
+                    "native_paper_transform": image_record.get("native_paper_transform"),
+                    "paper_entities": image_record.get("paper_entities", []),
+                    "paper_entity_types": image_record.get("paper_entity_types", {}),
+                    "paper_scan_issues": image_record.get("paper_scan_issues", []),
+                    "annotation_fidelity": image_record.get("annotation_fidelity", "MODEL_ONLY"),
+                    "limitations": image_record.get("limitations", []),
                     "pixel_size": pixel_size,
                     "target_px": target_px,
-                    "render_profile": render_profile,
+                    "render_profile": image_record.get("render_profile", render_profile),
                     "margin_ratio": margin_ratio,
                     "backend": image_record.get("backend"),
                     "entity_count": image_record.get("entity_count"),
@@ -288,6 +352,7 @@ def render_component_frame_closeups(
         ),
         "target_px": target_px,
         "render_profile": render_profile,
+        "native_paper_requested": native_paper,
         "margin_ratio": margin_ratio,
         "selection_count": len(records),
         "requested_count": requested_count,
