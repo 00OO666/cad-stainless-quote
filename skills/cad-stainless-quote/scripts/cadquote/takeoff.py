@@ -73,9 +73,9 @@ _STRUCTURED_ATTRIBUTE_NUMBER_RE = re.compile(
 _HEIGHT_ATTRIBUTE_TAGS = frozenset({"HT", "H", "HEIGHT", "高度", "高"})
 _LENGTH_ATTRIBUTE_TAGS = frozenset({"LEN", "LENGTH", "L", "长度", "长"})
 _WIDTH_ATTRIBUTE_TAGS = frozenset({"WD", "WIDTH", "W", "宽度", "宽"})
-_QUANTITY_ATTRIBUTE_TAGS = frozenset(
-    {"QTY", "QUANTITY", "COUNT", "NUM", "NUMBER", "数量", "件数"}
-)
+# NUM/NUMBER commonly encode material, view, or detail identifiers, not counts.
+# An ambiguous tag needs an explicit quantity label or separate topology evidence.
+_QUANTITY_ATTRIBUTE_TAGS = frozenset({"QTY", "QUANTITY", "COUNT", "数量", "件数"})
 _LEADER_TYPES = {"LEADER", "MLEADER", "MULTILEADER"}
 _HEIGHT_RE = re.compile(r"(?:高度|高\s*[:=：]?|\bH\s*[:=])", re.IGNORECASE)
 _DIMENSION_TYPES = {"DIMENSION", "ARC_DIMENSION", "LARGE_RADIAL_DIMENSION"}
@@ -631,7 +631,7 @@ class _MeasurementIndex:
                         attribute_role = "width"
                         attribute_semantic = "width"
                     elif attribute_tag in _QUANTITY_ATTRIBUTE_TAGS:
-                        if value.is_integer():
+                        if value.is_integer() and not re.search(r"mm|毫米", text, re.IGNORECASE):
                             attribute_role = "quantity"
                             attribute_semantic = "quantity"
                             attribute_unit = "count"
