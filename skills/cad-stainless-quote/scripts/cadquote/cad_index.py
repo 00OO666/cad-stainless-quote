@@ -25,6 +25,7 @@ from ezdxf import recover
 from .classifier import classify_sheet
 from .dxf_text_encoding import DxfTextRepairPlan, plan_utf8_text_repairs
 from .io import sha256_file, write_json_atomic
+from .materials import find_material_codes
 from .models import CadEntity, Sheet
 
 INDEXED_ENTITY_TYPES = frozenset(
@@ -484,7 +485,7 @@ def _viewport_geometry(entity: Any) -> dict[str, Any]:
 
 
 def _insert_geometry(entity: Any) -> dict[str, Any]:
-    return {
+    geometry = {
         "name": _dxf_get(entity, "name"),
         "rotation": _finite(_dxf_get(entity, "rotation")),
         "xscale": _finite(_dxf_get(entity, "xscale")),
@@ -494,6 +495,56 @@ def _insert_geometry(entity: Any) -> dict[str, Any]:
         "column_count": _dxf_get(entity, "column_count"),
         "attribute_handles": [_dxf_get(attribute, "handle") for attribute in entity.attribs],
     }
+    tags = {str(_dxf_get(a, "tag", "")).upper() for a in entity.attribs}
+    # Designers also put a complete material code into custom-named attributes.
+    # The attribute value, not a project-specific tag name, identifies that family.
+    coded_attributes = [
+        a for a in entity.attribs
+        if not _dxf_get(a, "invisible", 0)
+        and find_material_codes(_dxf_get(a, "text", ""))
+    ]
+    legacy_label = "ITEM" in tags and "NUM" in tags
+    if legacy_label or coded_attributes:
+        boundaries = []
+        for child in entity.virtual_entities():
+            if child.dxftype() != "LWPOLYLINE" or not child.closed:
+                continue
+            points = list(child.get_points("xyb"))
+            if len(points) == 4 and all(abs(p[2]) < 1e-12 for p in points):
+                # LWPOLYLINE xy coordinates are OCS, including after virtual
+                # INSERT expansion. Mirrored extrusion must be mapped to WCS.
+                vertices = [list(p) for p in child.vertices_in_wcs()]
+                if any(not all(math.isfinite(v) for v in p) or abs(p[2]) > 1e-6
+                       for p in vertices):
+                    continue
+                edges = [(vertices[(i + 1) % 4][0] - p[0],
+                          vertices[(i + 1) % 4][1] - p[1]) for i, p in enumerate(vertices)]
+                if all(math.hypot(*v) > 1e-9 for v in edges) and all(
+                    abs(v[0] * w[0] + v[1] * w[1])
+                    <= 1e-8 * math.hypot(*v) * math.hypot(*w)
+                    for v, w in zip(edges, edges[1:] + edges[:1], strict=True)
+                ):
+                    # A custom material attribute must belong to the rectangle;
+                    # do not adopt an unrelated physical outline in the block.
+                    if not legacy_label:
+                        from shapely.geometry import Point, Polygon
+
+                        polygon = Polygon([p[:2] for p in vertices])
+                        # Text insertion can precede its glyphs (alignment or
+                        # bearing). Bind the real text box center, not a radius
+                        # around the insertion or a nearest-label heuristic.
+                        text_boxes = [_entity_bbox(a, ezbbox.Cache()) for a in coded_attributes]
+                        if not polygon.is_valid or not any(
+                            box and polygon.buffer(1e-8).covers(
+                                Point((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+                            )
+                            for box in text_boxes
+                        ):
+                            continue
+                    boundaries.append(vertices)
+        if len(boundaries) == 1:
+            geometry["annotation_boundary"] = boundaries[0]
+    return geometry
 
 
 def _record_entity(

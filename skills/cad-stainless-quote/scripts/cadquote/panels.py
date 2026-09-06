@@ -196,6 +196,11 @@ class _PaperToModelTransform:
             "defpoint3",
             "defpoint4",
             "text_midpoint",
+            "text_location",
+            "text_point",
+            "label_point",
+            "landing",
+            "landing_point",
             "start",
             "end",
             "center",
@@ -210,10 +215,30 @@ class _PaperToModelTransform:
             mapped = self.point(output.get(key))
             if mapped is not None:
                 output[key] = mapped
-        vertices = output.get("vertices")
-        if isinstance(vertices, Sequence) and not isinstance(vertices, (str, bytes)):
-            mapped_vertices = [self.point(vertex) for vertex in vertices]
-            output["vertices"] = [point for point in mapped_vertices if point is not None]
+        # All redundant leader representations must use the same coordinate
+        # system. MT binding prefers leader_targets over leader_target/vertices;
+        # projecting only the latter silently leaves its arrow in paper space.
+        for key in (
+            "vertices",
+            "points",
+            "leader_vertices",
+            "line_points",
+            "leader_targets",
+            "landing_points",
+            "dogleg_end_points",
+            "annotation_boundary",
+        ):
+            points = output.get(key)
+            if isinstance(points, Sequence) and not isinstance(points, (str, bytes)):
+                mapped_points = [self.point(point) for point in points]
+                output[key] = [point for point in mapped_points if point is not None]
+        paths = output.get("leader_paths")
+        if isinstance(paths, Sequence) and not isinstance(paths, (str, bytes)):
+            # Recurse through the indexed path record, preserving leader/line
+            # indices and copying rather than changing the raw source geometry.
+            output["leader_paths"] = [
+                self.geometry(path) if isinstance(path, Mapping) else path for path in paths
+            ]
         try:
             height = float(output.get("height"))
         except (TypeError, ValueError):
