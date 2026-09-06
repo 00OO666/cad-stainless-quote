@@ -140,8 +140,15 @@ def render_component_frame_closeups(
         if not isinstance(raw_record, Mapping):
             continue
         selection_key = _selection_key(raw_record, record_index)
+        raw_component_id = raw_record.get("component_id")
+        component_id = (
+            raw_component_id
+            if isinstance(raw_component_id, str) and raw_component_id.strip()
+            else None
+        )
         output_record = {
             "selection_key": selection_key,
+            "component_id": component_id,
             "sequence": raw_record.get("sequence", record_index),
             "state": "MISSING",
             "reason_codes": [],
@@ -201,6 +208,7 @@ def render_component_frame_closeups(
             request_meta[label] = {
                 "record": output_record,
                 "selection_key": selection_key,
+                "component_id": component_id,
                 "sequence": output_record["sequence"],
                 "group_id": group_id,
                 "sheet_id": sheet_id,

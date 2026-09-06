@@ -254,6 +254,12 @@ def suggest_component_frames(
     augmented: list[dict[str, Any]] = []
     for index, selection in enumerate(selections, start=1):
         key = _selection_key(selection, index)
+        raw_component_id = selection.get("component_id")
+        component_id = (
+            raw_component_id
+            if isinstance(raw_component_id, str) and raw_component_id.strip()
+            else None
+        )
         updated = dict(selection)
         object_bboxes: dict[str, list[float]] = {}
         dimension_bboxes: dict[str, list[list[float]]] = {}
@@ -337,9 +343,7 @@ def suggest_component_frames(
                         "dimension_bboxes": local_dimensions,
                         "entity_ids": local_entity_ids,
                         "state": "REVIEW",
-                        "reason_codes": [
-                            "LOCAL_LEADER_FRAME_DOES_NOT_PROVE_PHYSICAL_INSTANCE"
-                        ],
+                        "reason_codes": ["LOCAL_LEADER_FRAME_DOES_NOT_PROVE_PHYSICAL_INSTANCE"],
                     }
                     local_frames.append(local_frame)
                     row_frames.append(local_frame)
@@ -366,6 +370,7 @@ def suggest_component_frames(
         records.append(
             {
                 "selection_key": key,
+                "component_id": component_id,
                 "sequence": selection.get("sequence", index),
                 "state": "REVIEW" if row_frames else "MISSING",
                 "reason_codes": (
