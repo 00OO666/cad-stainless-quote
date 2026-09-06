@@ -10,6 +10,8 @@ This project is experimental. The engineering pipeline is operational and safety
 
 No customer drawings, quotations, private paths, or proprietary runtime packages are included in this repository.
 
+See [Project progress and handoff / 项目进度与接管](PROGRESS.md) for the current development checkpoint, unresolved work, validation scope, and the distinction between unpublished development changes and the public source baseline. The latest progress update is documentation-only; it does not claim that the development fixes have shipped or that the 95% accuracy target has been achieved.
+
 ## What it does
 
 - Safely inventories directories and ZIP/RAR/7z archives with traversal, link, encryption, collision, size, and archive-bomb checks.
