@@ -143,7 +143,9 @@ class _PaperToModelTransform:
             twist = float(viewport.geometry.get("view_twist_angle") or 0.0)
         except (TypeError, ValueError):
             return None
-        if not math.isfinite(twist) or abs(math.remainder(twist, 2 * math.pi)) > 1e-7:
+        # Native DXF VIEWPORT group 51 is in degrees (ezdxf also converts it
+        # with math.radians). A full turn is unrotated; 2*pi degrees is not.
+        if not math.isfinite(twist) or abs(math.remainder(twist, 360.0)) > 1e-7:
             return None
         paper_width = paper_box[2] - paper_box[0]
         paper_height = paper_box[3] - paper_box[1]
