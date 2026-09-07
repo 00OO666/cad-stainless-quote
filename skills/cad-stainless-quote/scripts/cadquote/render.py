@@ -159,6 +159,16 @@ def _render_with_matplotlib(
         if entity_type in skipped_types:
             skipped_type_counts[entity_type] += 1
             continue
+        if entity_type == "VIEWPORT" and layout_name != "Model":
+            # A paper viewport's footprint is its paper rectangle, not the
+            # extents of the model visible through it. Expanding every viewport
+            # here scans remote drawings before the requested crop is selected.
+            if entity.dxf.id <= 1:
+                continue
+            c, w, h = entity.dxf.center, entity.dxf.width, entity.dxf.height
+            if w > 0 and h > 0 and all(math.isfinite(v) for v in (c.x, c.y, w, h)):
+                bounded.append((entity, (c.x-w/2, c.y-h/2, c.x+w/2, c.y+h/2)))
+            continue
         try:
             extents = ezbbox.extents([entity], fast=True, cache=cache)
         except Exception:
@@ -229,7 +239,9 @@ def _render_with_matplotlib(
         axes = figure.add_axes((0, 0, 1, 1))
         backend = MatplotlibBackend(axes, adjust_figure=False)
         backend.set_background(background)
-        EvidenceFrontend(region_context, backend, config=configuration).draw_entities(entities)
+        EvidenceFrontend(
+            region_context, backend, config=configuration, bbox_cache=cache
+        ).draw_entities(entities)
         backend.finalize()
         if mark_center:
             center_x = (region[0] + region[2]) / 2

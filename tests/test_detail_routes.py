@@ -182,37 +182,158 @@ def test_graph_integration_never_promotes_candidate():
 
 def test_native_frame_recovers_wrong_panel_classification_without_mutating_sheet():
     sheets, entities, native = fixture()
-    sheets[1].drawing_number = 'B3-E-08'
-    sheets[1].kind = 'elevation'
-    native.extend([
-        ent('FRAME', kind='INSERT', parent=None, bbox=(-10,-20,110,110)),
-        ent('frame-page', text='B3-QS-09', parent='FRAME'),
-    ])
+    sheets[1].drawing_number = "B3-E-08"
+    sheets[1].kind = "elevation"
+    native.extend(
+        [
+            ent("FRAME", kind="INSERT", parent=None, bbox=(-10, -20, 110, 110)),
+            ent("frame-page", text="B3-QS-09", parent="FRAME"),
+        ]
+    )
     result = build_detail_routes(sheets, entities, native)
-    r = result['records'][0]
-    assert r['suggested_detail_sheet_id'] == 'node'
-    assert r['candidates'][0]['page_recovery']['code_entity_ids'] == ['frame-page']
-    assert sheets[1].drawing_number == 'B3-E-08' and sheets[1].kind == 'elevation'
+    r = result["records"][0]
+    assert r["suggested_detail_sheet_id"] == "node"
+    assert r["candidates"][0]["page_recovery"]["code_entity_ids"] == ["frame-page"]
+    assert sheets[1].drawing_number == "B3-E-08" and sheets[1].kind == "elevation"
+
+
+def test_section_title_is_accepted_as_detail():
+    sheets, entities, native = fixture()
+    native[3].text = "剖面图 SCALE:1/8"
+    r = build_detail_routes(sheets, entities, native)["records"][0]
+    assert r["suggested_detail_sheet_id"] == "node"
+
+
+def test_plan_navigation_is_not_falsely_reported_missing_or_selected_as_detail():
+    sheets, entities, native = fixture()
+    sheets[1].kind = "plan"
+    native[3].text = "平面图"
+    r = build_detail_routes(sheets, entities, native)["records"][0]
+    assert r["suggested_target_sheet_id"] == "node"
+    assert r["suggested_detail_sheet_id"] is None
+    assert r["candidates"][0]["matching_titles"][0]["title_kind"] == "plan"
+
+
+def test_title_outside_native_page_cannot_attach_across_pages():
+    sheets, entities, native = fixture()
+    native.extend(
+        [
+            ent("FRAME", kind="INSERT", parent=None, bbox=(-5, -5, 110, 110)),
+            ent("page", text="B3-QS-09", parent="FRAME"),
+        ]
+    )
+    r = build_detail_routes(sheets, entities, native)["records"][0]
+    assert r["navigation_state"] == "PAGE_ONLY"
+
+
+def test_native_frame_wins_over_stale_source_page_guess():
+    sheets, entities, native = fixture()
+    sheets[0].drawing_number = "B3-E-99"
+    sheets[0].layout = "Layout2#viewport:EVP"
+    sheets[0].viewport_handle = "EVP"
+    native.extend(
+        [
+            ent("EVP", kind="VIEWPORT", parent=None, space="paper:Layout2", bbox=(0, 0, 100, 100)),
+            ent(
+                "EFRAME",
+                kind="INSERT",
+                parent=None,
+                space="paper:Layout2",
+                bbox=(-5, -20, 110, 110),
+            ),
+            ent("epage", text="B3-E-08", space="paper:Layout2", parent="EFRAME"),
+        ]
+    )
+    r = build_detail_routes(sheets, entities, native)["records"][0]
+    assert r["suggested_detail_sheet_id"] == "node" and r["resolved_source_page"] == "B3-E-08"
+    assert sheets[0].drawing_number == "B3-E-99"
+
+
+def back_reference_fixture():
+    sheets, entities, native = fixture()
+    sheets[0].layout = "Layout2"
+    sheets[1].drawing_number = "B3-P-01"
+    sheets[1].kind = "plan"
+    entities[0].text = "B3-P-01"
+    native.extend(
+        [
+            ent("heading-code", text="B3-P-01", parent="CALL", space="paper:Layout2"),
+            ent("heading-no", text="07", parent="CALL", space="paper:Layout2"),
+            ent("heading-text", text="立面图", parent="CALL", space="paper:Layout2"),
+        ]
+    )
+    entities.extend(
+        [
+            ent("plan-index-code", text="B3-E-08", parent="INDEX", sheet="node"),
+            ent("plan-index-no", text="07", parent="INDEX", sheet="node"),
+        ]
+    )
+    return sheets, entities, native
+
+
+def test_elevation_heading_resolves_reciprocal_plan_index_not_detail_title():
+    r = build_detail_routes(*back_reference_fixture())["records"][0]
+    assert r["reference_role"] == "VIEW_TITLE_BACK_REFERENCE"
+    assert r["navigation_state"] == "UNIQUE_PLAN_INDEX_CANDIDATE"
+    assert r["suggested_target_sheet_id"] == "node" and r["suggested_detail_sheet_id"] is None
+    assert r["physical_quantity"] is None and not r["physical_component_confirmed"]
+
+
+def test_duplicate_plan_bubbles_do_not_pick_first_or_count_as_quantity():
+    sheets, entities, native = back_reference_fixture()
+    entities.extend(
+        [
+            e.model_copy(
+                update={
+                    "id": e.id + "-copy",
+                    "geometry": {**e.geometry, "parent_insert_handle": "INDEX2"},
+                }
+            )
+            for e in entities[-2:]
+        ]
+    )
+    r = build_detail_routes(sheets, entities, native)["records"][0]
+    assert r["navigation_state"] == "AMBIGUOUS_PLAN_INDEX"
+    assert r["plan_index_candidate_count"] == 2
+    assert r["suggested_target_sheet_id"] is None and r["physical_quantity"] is None
+
+
+def test_wrong_plan_index_number_never_matches():
+    sheets, entities, native = back_reference_fixture()
+    entities[-1].text = "08"
+    r = build_detail_routes(sheets, entities, native)["records"][0]
+    assert r["navigation_state"] == "PAGE_ONLY"
+
+
+def test_review_markdown_retains_missing_and_backreference_rows():
+    from cadquote.detail_routes import detail_routes_markdown
+
+    routes = build_detail_routes(*back_reference_fixture())
+    report = detail_routes_markdown(routes)
+    assert "图名回指" in report and "平面索引 INDEX" in report
+    assert "不是算量表" in report and "B3-P-01 / 07" in report
 
 
 def test_full_run_writes_navigation_snapshot_and_resume_does_not_recompute(tmp_path, monkeypatch):
     import ezdxf
     from cadquote.pipeline import resume_pipeline, run_pipeline
 
-    source = tmp_path / 'simple.dxf'
+    source = tmp_path / "simple.dxf"
     doc = ezdxf.new()
-    doc.modelspace().add_text('TEST')
+    doc.modelspace().add_text("TEST")
     doc.saveas(source)
-    out = tmp_path / 'run'
+    out = tmp_path / "run"
     result = run_pipeline(source, out, render_evidence=False)
-    path = out / 'analysis/detail_routes.json'
+    path = out / "analysis/detail_routes.json"
     before = path.read_bytes()
-    assert result.paths['detail_routes'] == str(path)
+    assert result.paths["detail_routes"] == str(path)
+
     def forbidden(*args, **kwargs):
-        raise AssertionError('resume must not replace routing snapshot')
-    monkeypatch.setattr('cadquote.pipeline.build_detail_routes', forbidden)
+        raise AssertionError("resume must not replace routing snapshot")
+
+    monkeypatch.setattr("cadquote.pipeline.build_detail_routes", forbidden)
     resumed = resume_pipeline(out, render_evidence=False)
-    assert resumed.paths['detail_routes'] == str(path) and path.read_bytes() == before
+    assert resumed.paths["detail_routes"] == str(path) and path.read_bytes() == before
 
 
 def test_cli_is_source_preserving_and_uses_no_workbook(tmp_path):

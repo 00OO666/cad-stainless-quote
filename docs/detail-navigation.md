@@ -43,3 +43,28 @@ arrows remain unresolved; a resolved arrow vector is not a confirmed view bindin
 Tests use synthetic CAD only. Runtime manifests and drawing images are private;
 none belong in this repository. Navigation success is not end-to-end accuracy or
 evidence of a particular percentage of human time saved.
+
+## Native frame context and reciprocal plan navigation
+
+Use `detail-routes index.json --panels panels.json --out routes.json
+--refresh-native-frames --review-out routes.md` to revisit immutable native
+paper frames and produce a human-readable ledger. The original index is not
+overwritten. Frame recovery uses source hashes and same-layout native handles,
+not the INSERT origin or a nearby text guess. Only catalogued/referenced page
+codes are in this refresh scope; source/frame caps and errors are explicit.
+
+Numbered view headings are classified separately from outgoing callouts. Their
+page/view reference is resolved against reciprocal plan index attributes, not
+against a numbered detail title. `UNIQUE_PLAN_INDEX_CANDIDATE` and
+`AMBIGUOUS_PLAN_INDEX` never establish physical ownership or quantity. Duplicate
+plan bubbles, conflicting back-references and all page-only results remain in
+the ledger. The original drawing number and recovered page code are both kept.
+
+Full `run` now refreshes native frame context for its navigation snapshot. The
+optional `link` annotation output remains indexed-only. Native material probes
+remain opt-in. A node can span multiple broken viewports; one matching title
+and viewport does not establish its complete visual or physical scope.
+
+Paper rendering filters viewport footprints using native paper rectangles and
+shares a bounding-box cache with the drawing frontend. It still preserves
+unsupported/proxy diagnostics, and image rendering is not screenshot approval.

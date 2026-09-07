@@ -36,9 +36,21 @@ def _is_detail_title(members):
             or "节点图" in e.text
             or "大样图" in e.text
             or "详图" in e.text
+            or "剖面图" in e.text
         )
         for e in members
     )
+
+
+def _view_title_kind(members):
+    if _is_detail_title(members):
+        return "detail"
+    values = " ".join(e.text or "" for e in members)
+    if re.search(r"平面图|平面布置图|\bPLAN\b", values, re.I):
+        return "plan"
+    if re.search(r"立面图|\bELEVATION\b", values, re.I):
+        return "elevation"
+    return None
 
 
 def _contains(outer, inner):
@@ -56,12 +68,8 @@ def _native_page_frames(native, groups, viewports):
         members = groups.get(
             (entity.source_file_id, entity.sheet_id, entity.space, entity.handle), []
         )
-        codes = {normalize_reference_code(e.text) for e in members}
-        codes = {
-            c
-            for c in codes
-            if c and re.fullmatch(r"(?:[A-Z0-9]+-)*(?:QS|GS|DL|DE|DT|DZ|DS|TD|CD)-\d+", c)
-        }
+        codes = {normalize_reference_code(e.text) for e in members if e.entity_type == "ATTRIB"}
+        codes.discard(None)
         if len(codes) != 1:
             continue
         contained = [
@@ -114,14 +122,19 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
             viewports[key] = e
     for e in projected:
         panel_entities[e.sheet_id].append(e)
+    projected_refs = extract_structured_reference_callouts(projected)
+    refs_by_panel = defaultdict(list)
+    for ref in projected_refs:
+        refs_by_panel[ref.sheet_id].append(ref)
     native_titles = []
     for ref in extract_structured_reference_callouts(native):
         members = _title_members(ref, by_id, groups)
-        if _is_detail_title(members):
+        kind = _view_title_kind(members)
+        if kind:
             anchor = by_id[ref.entity_ids[0]]
             points = [by_id[i].insert for i in ref.entity_ids]
             if all(p is not None for p in points):
-                native_titles.append((ref, anchor, points))
+                native_titles.append((ref, anchor, points, kind))
 
     details_by_code = defaultdict(list)
     page_recovery = {}
@@ -142,6 +155,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                 "original_kind": s.kind,
                 "candidate_page_codes": sorted(codes),
                 "frame_handles": sorted(f["entity"].handle for f in frame_matches),
+                "frame_bboxes": [list(f["entity"].bbox) for f in frame_matches],
                 "code_entity_ids": sorted({i for f in frame_matches for i in f["code_entity_ids"]}),
                 "state": "CANDIDATE",
                 "conflict": len(codes) != 1,
@@ -149,7 +163,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
             }
             for code in sorted(codes):
                 details_by_code[code].append(s)
-        elif s.kind == "detail" and s.drawing_number:
+        elif s.drawing_number:
             code = normalize_reference_code(s.drawing_number)
             if code:
                 details_by_code[code].append(s)
@@ -158,7 +172,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
     # vertical-column neighbour is framing evidence only, not physical proof.
     titles_by_panel = defaultdict(list)
     for code, panels in details_by_code.items():
-        for ref, anchor, points in native_titles:
+        for ref, anchor, points, title_kind in native_titles:
             eligible = []
             for p in panels:
                 if p.source_file_id != anchor.source_file_id or not p.viewport_handle:
@@ -166,6 +180,12 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                 layout = (p.layout or "").split("#viewport:")[0]
                 vp = viewports.get((p.source_file_id, "paper:" + layout, p.viewport_handle))
                 if vp is None or anchor.space != vp.space:
+                    continue
+                recovery = page_recovery.get(p.id)
+                if recovery and not any(
+                    all(b[0] <= pt[0] <= b[2] and b[1] <= pt[1] <= b[3] for pt in points)
+                    for b in recovery["frame_bboxes"]
+                ):
                     continue
                 x0, y0, x1, y1 = vp.bbox
                 if all(
@@ -187,6 +207,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                             "page_code": code,
                             "view_number": ref.view_number,
                             "back_reference": ref.code,
+                            "title_kind": title_kind,
                             "native_title_entity_ids": list(ref.entity_ids),
                             "title_parent_handle": ref.parent_insert_handle,
                             "viewport_handle": vp.handle,
@@ -198,16 +219,37 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                     )
 
     records = []
-    for ref in extract_structured_reference_callouts(projected):
+    for ref in projected_refs:
         source = sheet_map.get(ref.sheet_id)
         if source is None or source.kind != "elevation":
             continue
         # Include outgoing references even if the target page was not recovered.
-        source_code = normalize_reference_code(source.drawing_number)
-        if ref.code == source_code:
+        source_recovery = page_recovery.get(source.id)
+        source_code = (
+            source_recovery["candidate_page_codes"][0]
+            if source_recovery and not source_recovery["conflict"]
+            else normalize_reference_code(source.drawing_number)
+        )
+        original_source_code = normalize_reference_code(source.drawing_number)
+        if ref.code == original_source_code:
             continue
+        source_parent_titles = [
+            t
+            for t in native_titles
+            if t[1].source_file_id == source.source_file_id
+            and t[0].parent_insert_handle == ref.parent_insert_handle
+            and t[1].space == "paper:" + (source.layout or "").split("#viewport:")[0]
+        ]
+        reference_role = "VIEW_TITLE_BACK_REFERENCE" if source_parent_titles else "OUTGOING_CALLOUT"
         alternatives = []
         for target in sorted(details_by_code.get(ref.code, []), key=lambda s: s.id):
+            plan_refs = [
+                p
+                for p in refs_by_panel[target.id]
+                if reference_role == "VIEW_TITLE_BACK_REFERENCE"
+                and p.code == source_code
+                and p.view_number == ref.view_number
+            ]
             titles = titles_by_panel.get(target.id, [])
             matching = [
                 t
@@ -219,6 +261,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                 for t in titles
                 if t["view_number"] == ref.view_number and t["back_reference"] != source_code
             ]
+            numbered = [t for t in titles if t["view_number"] == ref.view_number]
             materials = []
             for e in sorted(panel_entities[target.id], key=lambda e: e.id):
                 codes = {m.normalized_code for m in find_material_codes(e.text or "")}
@@ -244,21 +287,42 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                     "sheet_id": target.id,
                     "source_file_id": target.source_file_id,
                     "drawing_number": target.drawing_number,
+                    "original_kind": target.kind,
                     "resolved_page_code": ref.code,
                     "page_recovery": page_recovery.get(target.id),
                     "layout": target.layout,
                     "model_bbox": list(target.bbox) if target.bbox else None,
                     "viewport_handle": target.viewport_handle,
                     "matching_titles": matching,
+                    "matching_plan_callouts": [
+                        {
+                            "parent_handle": p.parent_insert_handle,
+                            "entity_ids": list(p.entity_ids),
+                            "target_page": p.code,
+                            "view_number": p.view_number,
+                        }
+                        for p in plan_refs
+                    ],
+                    "numbered_title_candidates": numbered,
                     "conflicting_titles": conflicts,
                     "all_title_candidates": titles,
                     "material_candidates": materials,
                     "reciprocal_candidate": len(matching) == 1 and not conflicts,
                 }
             )
-        matches = [p for p in alternatives if p["reciprocal_candidate"]]
+        matches = [
+            p
+            for p in alternatives
+            if p["reciprocal_candidate"] and reference_role == "OUTGOING_CALLOUT"
+        ]
+        plan_matches = [p for p in alternatives if p["matching_plan_callouts"]]
+        unique_plan = len(plan_matches) == 1 and len(plan_matches[0]["matching_plan_callouts"]) == 1
         state = (
-            "UNIQUE_RECIPROCAL_CANDIDATE"
+            "UNIQUE_PLAN_INDEX_CANDIDATE"
+            if unique_plan
+            else "AMBIGUOUS_PLAN_INDEX"
+            if plan_matches
+            else "UNIQUE_RECIPROCAL_CANDIDATE"
             if len(matches) == 1
             else "AMBIGUOUS_RECIPROCAL"
             if matches
@@ -278,11 +342,26 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                 **identity,
                 "source_file_id": source.source_file_id,
                 "source_drawing_number": source.drawing_number,
+                "resolved_source_page": source_code,
+                "source_page_recovery": source_recovery,
+                "reference_role": reference_role,
                 "source_reference_entity_ids": list(ref.entity_ids),
                 "navigation_state": state,
-                "suggested_detail_sheet_id": matches[0]["sheet_id"] if len(matches) == 1 else None,
+                "suggested_target_sheet_id": plan_matches[0]["sheet_id"]
+                if unique_plan
+                else matches[0]["sheet_id"]
+                if len(matches) == 1 and not plan_matches
+                else None,
+                "suggested_detail_sheet_id": matches[0]["sheet_id"]
+                if len(matches) == 1
+                and matches[0]["matching_titles"][0]["title_kind"] == "detail"
+                and reference_role == "OUTGOING_CALLOUT"
+                else None,
                 "page_candidate_count": len(alternatives),
                 "reciprocal_candidate_count": len(matches),
+                "plan_index_candidate_count": sum(
+                    len(p["matching_plan_callouts"]) for p in plan_matches
+                ),
                 "candidates": alternatives,
                 "state": "REVIEW",
                 "physical_component_confirmed": False,
@@ -291,7 +370,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
             }
         )
     return {
-        "schema_version": "numbered-detail-routes/1.0",
+        "schema_version": "numbered-detail-routes/1.1",
         "path_scope": "local_run_diagnostics",
         "state": "REVIEW",
         "mutates_takeoff": False,
@@ -302,6 +381,8 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
             "native_entities": len(native_entities),
         },
         "summary": dict(Counter(r["navigation_state"] for r in records)),
+        "reference_role_summary": dict(Counter(r["reference_role"] for r in records)),
+        "page_recovery": page_recovery,
         "records": records,
         "limitations": [
             "Only visible same-parent numbered references are supported; no negative search claim.",
@@ -338,3 +419,61 @@ def annotate_detail_route_edges(edges, routes):
         else:
             result.append(edge)
     return result
+
+
+def detail_routes_markdown(routes):
+    """Human-readable full ledger. No missing/back-reference rows are discarded."""
+
+    def cell(value):
+        return str(value or "—").replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "# CAD 编号导航核对表",
+        "",
+        "这是找图候选清单，不是算量表，也不代表报价正确率。",
+        "原始编号引用全部保留；图名回指与真正的外引标记分列。回指矛盾不会自动纠正。",
+        "",
+        "| 来源页（原识别→图框） | 标记性质 | 目标页 / 小图号 | 导航状态 | "
+        "候选小图（视口；标题回指） |",
+        "|---|---|---|---|---|",
+    ]
+    for r in routes["records"]:
+        candidates = []
+        for c in r["candidates"]:
+            for p in c.get("matching_plan_callouts", []):
+                candidates.append(
+                    f"平面索引 {p['parent_handle']} → {p['target_page']} / {p['view_number']}"
+                )
+            for t in c.get("numbered_title_candidates", []):
+                candidates.append(f"{c['viewport_handle']}；{t['back_reference']}")
+        lines.append(
+            "| "
+            + " | ".join(
+                map(
+                    cell,
+                    [
+                        f"{r['source_drawing_number']} → {r.get('resolved_source_page')}",
+                        "图名回指"
+                        if r.get("reference_role") == "VIEW_TITLE_BACK_REFERENCE"
+                        else "外引标记",
+                        f"{r['target_page']} / {r['target_view']}",
+                        r["navigation_state"],
+                        "；".join(candidates)
+                        or f"仅找到 {r['page_candidate_count']} 个页级视口候选",
+                    ],
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 未闭合的范围",
+            "",
+            "上述匹配没有自动确定钢层、展开尺寸、实际长度、数量或工程量。",
+            "同页同号但回指不同的标题只供核对，不替代双向一致的候选。",
+            "原生读取失败或扫描截断时，不能把未发现的项目认定为不存在。",
+            "",
+        ]
+    )
+    return "\n".join(lines)

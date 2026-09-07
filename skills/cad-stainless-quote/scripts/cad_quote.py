@@ -722,20 +722,33 @@ def command_link(args: argparse.Namespace) -> int:
 
 
 def command_detail_routes(args: argparse.Namespace) -> int:
-    from cadquote.detail_routes import build_detail_routes
+    from cadquote.detail_routes import build_detail_routes, detail_routes_markdown
 
     if args.out.resolve() in {args.index.resolve(), args.panels.resolve()} or \
             args.out.suffix.lower() != ".json":
         raise ValueError("detail routes require a separate JSON output")
+    if args.review_out and (args.review_out.suffix.lower() != ".md" or args.review_out.resolve()
+                           in {args.index.resolve(), args.panels.resolve(), args.out.resolve()}):
+        raise ValueError("route review requires a separate Markdown output")
     sheets, native = _load_index(args.index)
     sheets, entities = _apply_panels(sheets, native, args.panels)
+    context = None
+    if args.refresh_native_frames:
+        from cadquote.route_context import refresh_native_route_frames
+
+        native, context = refresh_native_route_frames(_load_json(args.index), native)
     result = build_detail_routes(sheets, entities, native)
+    if context is not None:
+        result["native_frame_context"] = context
     if args.probe_native:
         from cadquote.detail_materials import probe_routed_details
 
         result["native_material_probes"] = probe_routed_details(
             _load_json(args.index), result, max_nodes=args.max_native_nodes)
     write_json_atomic(args.out, result)
+    if args.review_out:
+        args.review_out.parent.mkdir(parents=True, exist_ok=True)
+        args.review_out.write_text(detail_routes_markdown(result), encoding="utf-8")
     _print({"summary": result["summary"], "state": "REVIEW_ONLY",
             "output": str(args.out.resolve())})
     return 0
@@ -1825,6 +1838,9 @@ def build_parser() -> argparse.ArgumentParser:
     detail_routes.add_argument("--probe-native", action="store_true",
                                help="继续核对候选节点原生材料引线和轮廓，不确认算量")
     detail_routes.add_argument("--max-native-nodes", type=int, default=20)
+    detail_routes.add_argument("--refresh-native-frames", action="store_true",
+                               help="从哈希校验的原始DXF恢复图框真实范围，不改旧索引")
+    detail_routes.add_argument("--review-out", type=Path, help="输出逐条编号导航Markdown核对表")
     detail_routes.set_defaults(handler=command_detail_routes)
 
     index_directions = subparsers.add_parser("index-directions", help="读取原生索引箭头方向")

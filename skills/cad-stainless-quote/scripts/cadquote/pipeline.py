@@ -2418,7 +2418,12 @@ def run_pipeline(
     write_json_atomic(analysis_dir / "panels.json", panel_expansion.to_dict())
     sheets, entities = choose_analysis_view(bundle.sheets, bundle.entities, panel_expansion)
     detail_route_path = analysis_dir / "detail_routes.json"
-    write_json_atomic(detail_route_path, build_detail_routes(sheets, entities, bundle.entities))
+    from .route_context import refresh_native_route_frames
+
+    route_native, route_context = refresh_native_route_frames(bundle.to_dict(), bundle.entities)
+    detail_routes = build_detail_routes(sheets, entities, route_native)
+    detail_routes["native_frame_context"] = route_context
+    write_json_atomic(detail_route_path, detail_routes)
 
     workbook_materials, material_issues = _load_materials(
         ingest.files,
