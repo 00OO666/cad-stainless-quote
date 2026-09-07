@@ -12,7 +12,7 @@ import math
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 
 def _point(value):
@@ -38,11 +38,33 @@ def _id(*parts):
     return "material-branch:" + hashlib.sha256(payload).hexdigest()[:24]
 
 
+def _terminal_entry(vertices, polygon, tolerance):
+    """An explicit last segment crosses the border once and ends inside it.
+
+    Do not extend a line, snap an endpoint or infer connection from proximity.
+    Earlier vertices/segments must not enter this label. This is connectivity
+    evidence only, not proof of a physical component or material surface.
+    """
+    landing = Point(vertices[-1])
+    previous = Point(vertices[-2])
+    if not polygon.contains(landing) or polygon.boundary.distance(landing) <= tolerance:
+        return None
+    if polygon.distance(previous) <= tolerance:
+        return None
+    if len(vertices) > 2 and LineString(vertices[:-1]).intersects(polygon):
+        return None
+    crossing = LineString(vertices[-2:]).intersection(polygon.boundary)
+    if crossing.geom_type != "Point":
+        return None
+    return list(crossing.coords[0])
+
+
 def discover_material_leader_branches(
     entities,
     occurrences,
     *,
     contact_tolerance=1e-6,
+    allow_terminal_entry=False,
     max_entities=200_000,
     max_occurrences=10_000,
     max_contact_checks=500_000,
@@ -50,12 +72,15 @@ def discover_material_leader_branches(
 ):
     """Return all same-source/sheet/space contacts on native annotation borders.
 
+    Opt-in terminal entry also accepts one native final-segment border crossing.
     Supports indexed native LEADER vertices, not proximity, inferred text centers,
     or arbitrary MULTILEADER path/landing reconstruction. Coincident competing
     label borders remain explicitly ambiguous. Input limits fail closed.
     """
     if not math.isfinite(contact_tolerance) or contact_tolerance <= 0:
         raise ValueError("positive finite contact tolerance required")
+    if not isinstance(allow_terminal_entry, bool):
+        raise ValueError("allow_terminal_entry must be a boolean")
     limits = {
         "max_entities": max_entities,
         "max_occurrences": max_occurrences,
@@ -72,6 +97,7 @@ def discover_material_leader_branches(
         "physical_quantity": None,
         "measurement_role": None,
         "limits": {**limits, "contact_tolerance_drawing_units": contact_tolerance},
+        "allow_terminal_entry": allow_terminal_entry,
         "records": [],
         "issues": [],
         "truncated": False,
@@ -117,7 +143,7 @@ def discover_material_leader_branches(
             if not poly.is_valid or poly.area <= contact_tolerance**2:
                 result["issues"].append({"entity_id": e.id, "reason": "INVALID_ANNOTATION_BORDER"})
                 continue
-            local_frames.append((e, poly.boundary))
+            local_frames.append((e, poly))
         frames[scope] = [e for e, _ in local_frames]
         for leader in sorted(group, key=lambda e: e.id):
             if leader.entity_type not in {"LEADER", "MLEADER", "MULTILEADER"}:
@@ -142,18 +168,28 @@ def discover_material_leader_branches(
                 p is None or math.dist(p, tip) > contact_tolerance for p in targets
             )
             owners = []
-            for frame, boundary in local_frames:
+            crossed_frames = set()
+            terminal = LineString(vertices[-2:]) if allow_terminal_entry else None
+            for frame, polygon in local_frames:
                 checks += 1
                 if checks > max_contact_checks:
                     result["truncated"] = True
                     result["issues"].append({"reason": "CONTACT_CHECK_CAP"})
                     break
-                if boundary.distance(Point(landing)) <= contact_tolerance:
-                    owners.append(frame)
+                if allow_terminal_entry and terminal.intersects(polygon):
+                    crossed_frames.add(frame.id)
+                if polygon.boundary.distance(Point(landing)) <= contact_tolerance:
+                    owners.append((frame, "NATIVE_LEADER_LANDING_ON_ANNOTATION_BORDER", None))
+                elif allow_terminal_entry:
+                    crossing = _terminal_entry(vertices, polygon, contact_tolerance)
+                    if crossing is not None:
+                        owners.append(
+                            (frame, "NATIVE_TERMINAL_SEGMENT_ENTERS_ANNOTATION", crossing)
+                        )
             if result["truncated"]:
                 break
             attached = leader.geometry.get("annotation_handle")
-            for frame in owners:
+            for frame, connection_basis, crossing in owners:
                 reasons = []
                 if len(owners) != 1:
                     reasons.append("AMBIGUOUS_ANNOTATION_OWNER")
@@ -163,6 +199,8 @@ def discover_material_leader_branches(
                     reasons.append("CONFLICTING_ARROW_TARGETS")
                 if math.dist(landing, tip) <= contact_tolerance:
                     reasons.append("ZERO_SPAN_LEADER")
+                if crossing is not None and crossed_frames - {frame.id}:
+                    reasons.append("TERMINAL_SEGMENT_INTERSECTS_OTHER_ANNOTATION")
                 contacts[(scope, frame.id)].append(
                     {
                         "leader_entity_id": leader.id,
@@ -171,8 +209,9 @@ def discover_material_leader_branches(
                         "landing_point": list(landing),
                         "leader_target": None if target_conflict else list(tip),
                         "native_vertices": [list(p) for p in vertices],
-                        "competing_annotation_entity_ids": sorted(e.id for e in owners),
-                        "connection_basis": "NATIVE_LEADER_LANDING_ON_ANNOTATION_BORDER",
+                        "competing_annotation_entity_ids": sorted(e.id for e, _, _ in owners),
+                        "connection_basis": connection_basis,
+                        "terminal_border_intersection": crossing,
                         "reason_codes": reasons,
                         "geometry_routing_eligible": not reasons,
                         "state": "REVIEW",
