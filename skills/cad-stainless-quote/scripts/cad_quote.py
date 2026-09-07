@@ -693,6 +693,7 @@ def command_detect_mt(args: argparse.Namespace) -> int:
 
 def command_link(args: argparse.Namespace) -> int:
     sheets, entities = _load_index(args.index)
+    native_entities = entities
     sheets, entities = _apply_panels(sheets, entities, args.panels)
     occurrences = [MtOccurrence.model_validate(value) for value in _load_json(args.occurrences)]
     values = rank_evidence_edges(
@@ -702,10 +703,63 @@ def command_link(args: argparse.Namespace) -> int:
         promote_explicit=args.promote_explicit,
         top_k=args.top_k,
     )
+    if getattr(args, "detail_routes_out", None):
+        from cadquote.detail_routes import annotate_detail_route_edges, build_detail_routes
+
+        target = args.detail_routes_out.resolve()
+        inputs = {args.index.resolve(), args.occurrences.resolve(), args.out.resolve()}
+        if args.panels:
+            inputs.add(args.panels.resolve())
+        if target in inputs or target.suffix.lower() != ".json":
+            raise ValueError("detail routes require a separate JSON output")
+        routes = build_detail_routes(sheets, entities, native_entities)
+        write_json_atomic(target, routes)
+        values = annotate_detail_route_edges(values, routes)
     payload = [value.model_dump(mode="json") for value in values]
     write_json_atomic(Path(args.out), payload)
     _print({"edge_count": len(values), "output": str(Path(args.out).resolve())})
     return 0
+
+
+def command_detail_routes(args: argparse.Namespace) -> int:
+    from cadquote.detail_routes import build_detail_routes
+
+    if args.out.resolve() in {args.index.resolve(), args.panels.resolve()} or \
+            args.out.suffix.lower() != ".json":
+        raise ValueError("detail routes require a separate JSON output")
+    sheets, native = _load_index(args.index)
+    sheets, entities = _apply_panels(sheets, native, args.panels)
+    result = build_detail_routes(sheets, entities, native)
+    if args.probe_native:
+        from cadquote.detail_materials import probe_routed_details
+
+        result["native_material_probes"] = probe_routed_details(
+            _load_json(args.index), result, max_nodes=args.max_native_nodes)
+    write_json_atomic(args.out, result)
+    _print({"summary": result["summary"], "state": "REVIEW_ONLY",
+            "output": str(args.out.resolve())})
+    return 0
+
+
+def command_index_directions(args: argparse.Namespace) -> int:
+    import ezdxf
+    from cadquote.index_directions import extract_index_directions
+
+    if args.dxf.resolve() == args.out.resolve() or args.out.suffix.lower() != ".json":
+        raise ValueError("index-directions requires a separate JSON output")
+    if args.dxf.suffix.lower() != ".dxf":
+        raise ValueError("index-directions expects a converted native DXF")
+    source_hash = sha256_file(args.dxf)
+    result = extract_index_directions(
+        ezdxf.readfile(args.dxf), source_file_id=args.source_file_id,
+        layout_name=args.layout, max_inserts=args.max_inserts,
+        max_block_entities=args.max_block_entities,
+    )
+    result.update(source_path=str(args.dxf.resolve()), source_sha256=source_hash)
+    write_json_atomic(args.out, result)
+    _print({**result["summary"], "truncated": result["truncated"],
+            "state": "REVIEW_ONLY", "output": str(args.out.resolve())})
+    return 2 if result["truncated"] or result["summary"].get("UNRESOLVED") else 0
 
 
 def command_takeoff(args: argparse.Namespace) -> int:
@@ -1754,6 +1808,8 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--panels", type=Path)
     link.add_argument("--out", type=Path, required=True)
     link.add_argument("--promote-explicit", action="store_true")
+    link.add_argument("--detail-routes-out", type=Path,
+                      help="写编号节点候选记录，并给对应关系边增加导航标记")
     link.add_argument(
         "--top-k",
         type=int,
@@ -1761,6 +1817,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个源图保留的弱关系候选数；显式图号关系不受此上限截断",
     )
     link.set_defaults(handler=command_link)
+
+    detail_routes = subparsers.add_parser("detail-routes", help="按页号、节点号及回指立面查找节点")
+    detail_routes.add_argument("index", type=Path)
+    detail_routes.add_argument("--panels", type=Path, required=True)
+    detail_routes.add_argument("--out", type=Path, required=True)
+    detail_routes.add_argument("--probe-native", action="store_true",
+                               help="继续核对候选节点原生材料引线和轮廓，不确认算量")
+    detail_routes.add_argument("--max-native-nodes", type=int, default=20)
+    detail_routes.set_defaults(handler=command_detail_routes)
+
+    index_directions = subparsers.add_parser("index-directions", help="读取原生索引箭头方向")
+    index_directions.add_argument("dxf", type=Path)
+    index_directions.add_argument("--source-file-id", required=True)
+    index_directions.add_argument("--layout", required=True)
+    index_directions.add_argument("--out", type=Path, required=True)
+    index_directions.add_argument("--max-inserts", type=int, default=2000)
+    index_directions.add_argument("--max-block-entities", type=int, default=256)
+    index_directions.set_defaults(handler=command_index_directions)
 
     takeoff = subparsers.add_parser("takeoff", help="组装构件并生成尺寸候选/算量草稿")
     takeoff.add_argument("index", type=Path)

@@ -19,6 +19,7 @@ from .calculation import (
     validate_engineering_quantity_expression,
 )
 from .converter import ConversionAudit, convert_dwgs
+from .detail_routes import build_detail_routes
 from .drawing_catalog import build_drawing_catalog, write_drawing_catalog_sqlite
 from .evidence_images import build_excel_evidence_targets, render_excel_evidence
 from .exporter import build_quote_workbook
@@ -2416,6 +2417,8 @@ def run_pipeline(
     )
     write_json_atomic(analysis_dir / "panels.json", panel_expansion.to_dict())
     sheets, entities = choose_analysis_view(bundle.sheets, bundle.entities, panel_expansion)
+    detail_route_path = analysis_dir / "detail_routes.json"
+    write_json_atomic(detail_route_path, build_detail_routes(sheets, entities, bundle.entities))
 
     workbook_materials, material_issues = _load_materials(
         ingest.files,
@@ -2772,6 +2775,7 @@ def run_pipeline(
         "material_mention_matches": str(analysis_dir / "material_mention_matches.json"),
         "vector_quantity_probes": str(vector_probe_path),
         "relation_edges": str(analysis_dir / "relation_edges.json"),
+        "detail_routes": str(detail_route_path),
         "takeoff": str(output_dir / "takeoff.json"),
         "evidence_graph": str(output_dir / "evidence_graph.json"),
         "review_pack": str(review_pack_path),
@@ -3217,6 +3221,9 @@ def resume_pipeline(
     if excel_evidence_index is not None:
         result.paths["excel_evidence"] = str(excel_evidence_index)
     resumed_catalog_path = root / "index" / "drawing_catalog.json"
+    detail_route_path = analysis_dir / "detail_routes.json"
+    if detail_route_path.is_file():
+        result.paths["detail_routes"] = str(detail_route_path)
     resumed_catalog_sqlite_path = root / "index" / "drawing_catalog.sqlite"
     if resumed_catalog_path.is_file():
         result.paths["drawing_catalog"] = str(resumed_catalog_path)
