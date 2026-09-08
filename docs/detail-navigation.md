@@ -3,6 +3,30 @@
 This stage separates a local detail number from its containing drawing page.
 It uses only CAD inputs and produces navigation candidates, not accepted quote rows.
 
+## Closed strip outlines
+
+With `--probe-native`, each native group probe now also includes
+`closed_strip_profiles`. It separates an already leader-contacted, top-level,
+straight closed model polyline into paired skins and thickness end caps. Full
+constant-offset strip reconstruction is required; a perimeter is never treated
+as a single unfolded path. Competing contacts remain unresolved even if their
+shapes each satisfy strip geometry (a nearby backing board can also be a strip).
+
+`analyze_strip_geometry` retains raw units. The existing millimetre-only
+`analyze_strip_outline` and native wrapper retain their unit gate and schema.
+No missing INSUNITS value is silently converted to millimetres. Geometric middle
+paths are not manufacturing neutral axes or bend allowances.
+
+The group adapter checks the current native entity, full viewport containment,
+layer visibility, source/group/viewport dimension scope and projection. A unique
+skin requires at least two nonparallel segments supported by native dimension
+endpoints, consistent displayed values, unity factor and zero known rounding.
+It retains both skins, unsupported segments and conflicting dimensions. Multiple
+contacts, ambiguity, clipping or truncation cannot create a selected boundary.
+This output remains REVIEW: billable scope, elevation run, physical instances,
+unfolded width, screenshot confirmation and pricing are separate gates. It does
+not fill a quotation workbook or upgrade the locally installed Skill.
+
 ```powershell
 scripts/run.ps1 detail-routes run/index/cad_index.json --panels run/analysis/panels.json --out review/detail-routes.json --probe-native
 ```

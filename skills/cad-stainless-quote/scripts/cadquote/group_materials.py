@@ -11,6 +11,7 @@ from ezdxf import bbox
 from ezdxf.math import Vec3
 
 from .cad_index import _record_entity
+from .closed_profiles import probe_closed_group_profiles
 from .detail_materials import probe_detail_materials
 from .io import sha256_file
 from .profile_dimensions import resolve_group_profile_dimensions
@@ -188,6 +189,8 @@ def probe_node_view_group(doc, group, *, max_model_entities=200000):
         doc, result, max_model_entities=max_model_entities
     )
     result["truncated"] = result["truncated"] or result["dimension_supported_profiles"]["truncated"]
+    result["closed_strip_profiles"] = probe_closed_group_profiles(doc, result)
+    result["truncated"] = result["truncated"] or result["closed_strip_profiles"]["truncated"]
     return result
 
 

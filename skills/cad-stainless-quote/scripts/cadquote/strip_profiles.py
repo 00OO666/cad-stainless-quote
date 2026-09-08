@@ -12,12 +12,11 @@ import math
 from shapely.geometry import LineString, Polygon
 
 
-def analyze_strip_outline(
+def analyze_strip_geometry(
     points,
     *,
     source_file_id,
     entity_handle,
-    units="millimeters",
     tolerance=1e-4,
     max_vertices=256,
     max_cap_pairs=64,
@@ -33,15 +32,15 @@ def analyze_strip_outline(
     if not math.isfinite(tolerance) or tolerance <= 0 or min(max_vertices, max_cap_pairs) < 1:
         raise ValueError("positive finite tolerance and resource limits required")
     result = {
-        "schema_version": "native-strip-profile/1.0",
+        "schema_version": "native-strip-geometry/1.0",
         "state": "REVIEW",
         "source_file_id": source_file_id,
         "entity_handle": entity_handle,
         "mutates_takeoff": False,
         "measurement_role": None,
         "physical_quantity": None,
-        "unfolded_width_mm": None,
-        "manufacturing_blank_width_mm": None,
+        "unfolded_width_raw": None,
+        "manufacturing_blank_width_raw": None,
         "profile_state": "UNRESOLVED",
         "candidates": [],
         "issues": [],
@@ -49,7 +48,7 @@ def analyze_strip_outline(
         "limits": {
             "max_vertices": max_vertices,
             "max_cap_pairs": max_cap_pairs,
-            "tolerance_mm": tolerance,
+            "tolerance_raw": tolerance,
         },
         "limitations": [
             "Geometry only: does not prove metal, ownership or quantity.",
@@ -58,9 +57,6 @@ def analyze_strip_outline(
             "end caps are supported.",
         ],
     }
-    if units != "millimeters":
-        result["issues"].append("MILLIMETRE_UNITS_NOT_VERIFIED")
-        return result
     if len(points) > max_vertices + 1:
         result["truncated"] = True
         result["issues"].append("VERTEX_CAP")
@@ -94,9 +90,9 @@ def analyze_strip_outline(
         result["issues"].append("INVALID_POLYGON_OR_ZERO_SEGMENT")
         return result
     result["source_outline_points"] = [list(p) for p in pts]
-    result["outline_perimeter_mm"] = shape.length
-    result["outline_area_mm2"] = shape.area
-    result["projection_bbox_mm"] = list(shape.bounds)
+    result["outline_perimeter_raw"] = shape.length
+    result["outline_area_raw2"] = shape.area
+    result["projection_bbox_raw"] = list(shape.bounds)
     shortest = min(lengths)
     caps = [i for i, length in enumerate(lengths) if abs(length - shortest) <= tolerance]
     result["shortest_edge_indices"] = caps
@@ -133,10 +129,10 @@ def analyze_strip_outline(
             pairs.append(
                 {
                     "segment_index": i,
-                    "skin_a_length_mm": la,
-                    "skin_b_length_mm": lb,
-                    "normal_separation_mm": offset,
-                    "middle_length_mm": math.dist(middle[i], middle[i + 1]),
+                    "skin_a_length_raw": la,
+                    "skin_b_length_raw": lb,
+                    "normal_separation_raw": offset,
+                    "middle_length_raw": math.dist(middle[i], middle[i + 1]),
                 }
             )
         if not valid:
@@ -155,15 +151,15 @@ def analyze_strip_outline(
         result["candidates"].append(
             {
                 "end_cap_edge_indices": [first, second],
-                "geometric_thickness_mm": thickness,
+                "geometric_thickness_raw": thickness,
                 "skin_a_points": [list(p) for p in inner],
                 "skin_b_points": [list(p) for p in outer],
                 "middle_path_points": [list(p) for p in middle],
-                "skin_a_length_mm": sum(p["skin_a_length_mm"] for p in pairs),
-                "skin_b_length_mm": sum(p["skin_b_length_mm"] for p in pairs),
-                "geometric_middle_path_length_mm": line.length,
+                "skin_a_length_raw": sum(p["skin_a_length_raw"] for p in pairs),
+                "skin_b_length_raw": sum(p["skin_b_length_raw"] for p in pairs),
+                "geometric_middle_path_length_raw": line.length,
                 "segment_pairs": pairs,
-                "polygon_reconstruction_difference_mm2": difference,
+                "polygon_reconstruction_difference_raw2": difference,
                 "state": "REVIEW",
                 "measurement_role": None,
             }
@@ -175,6 +171,37 @@ def analyze_strip_outline(
         if result["candidates"]
         else "UNSUPPORTED_STRIP_TOPOLOGY"
     )
+    return result
+
+
+def analyze_strip_outline(points, *, source_file_id, entity_handle, units="millimeters", **limits):
+    """Backward-compatible millimetre API; unknown-unit input remains refused."""
+    raw = analyze_strip_geometry(
+        points if units == "millimeters" else [],
+        source_file_id=source_file_id,
+        entity_handle=entity_handle,
+        **limits,
+    )
+
+    def mm_keys(value):
+        if isinstance(value, list):
+            return [mm_keys(v) for v in value]
+        if isinstance(value, dict):
+            return {
+                k.removesuffix("_raw2") + "_mm2"
+                if k.endswith("_raw2")
+                else k.removesuffix("_raw") + "_mm"
+                if k.endswith("_raw")
+                else k: mm_keys(v)
+                for k, v in value.items()
+            }
+        return value
+
+    result = mm_keys(raw)
+    result["schema_version"] = "native-strip-profile/1.0"
+    if units != "millimeters":
+        result["issues"] = ["MILLIMETRE_UNITS_NOT_VERIFIED"]
+        result["profile_state"] = "UNRESOLVED"
     return result
 
 
