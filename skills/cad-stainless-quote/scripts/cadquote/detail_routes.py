@@ -465,6 +465,20 @@ def detail_routes_markdown(routes):
             )
             + " |"
         )
+    if "node_view_groups" in routes:
+        lines.extend(["", "## 完整节点视图组（独立于旧单视口判断）", "",
+                      "组图不等于一个物理构件；编号/回指矛盾与新歧义不会沿用旧单视口选择。", "",
+                      "| 来源页 | 目标页/小图 | 组导航状态 | 视口组；标题回指 |",
+                      "|---|---|---|---|"])
+        for r in routes["records"]:
+            if r.get("reference_role") != "OUTGOING_CALLOUT":
+                continue
+            candidates = "；".join(
+                ",".join(c["viewport_handles"]) + " / " + c["back_reference"]
+                for c in r.get("detail_group_candidates", []))
+            lines.append("| " + " | ".join(map(cell, [r.get("resolved_source_page"),
+                f"{r['target_page']} / {r['target_view']}", r.get("group_navigation_state"),
+                candidates])) + " |")
     lines.extend(
         [
             "",

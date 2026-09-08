@@ -2422,6 +2422,10 @@ def run_pipeline(
 
     route_native, route_context = refresh_native_route_frames(bundle.to_dict(), bundle.entities)
     detail_routes = build_detail_routes(sheets, entities, route_native)
+    from .viewport_groups import attach_node_group_routes, build_node_view_groups
+
+    detail_routes = attach_node_group_routes(
+        detail_routes, build_node_view_groups(sheets, route_native))
     detail_routes["native_frame_context"] = route_context
     write_json_atomic(detail_route_path, detail_routes)
 

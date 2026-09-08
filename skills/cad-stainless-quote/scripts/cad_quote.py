@@ -724,6 +724,9 @@ def command_link(args: argparse.Namespace) -> int:
 def command_detail_routes(args: argparse.Namespace) -> int:
     from cadquote.detail_routes import build_detail_routes, detail_routes_markdown
 
+    if args.group_images_dir and not args.probe_native:
+        raise ValueError("group images require --probe-native")
+
     if args.out.resolve() in {args.index.resolve(), args.panels.resolve()} or \
             args.out.suffix.lower() != ".json":
         raise ValueError("detail routes require a separate JSON output")
@@ -738,6 +741,9 @@ def command_detail_routes(args: argparse.Namespace) -> int:
 
         native, context = refresh_native_route_frames(_load_json(args.index), native)
     result = build_detail_routes(sheets, entities, native)
+    from cadquote.viewport_groups import attach_node_group_routes, build_node_view_groups
+
+    result = attach_node_group_routes(result, build_node_view_groups(sheets, native))
     if context is not None:
         result["native_frame_context"] = context
     if args.probe_native:
@@ -745,13 +751,29 @@ def command_detail_routes(args: argparse.Namespace) -> int:
 
         result["native_material_probes"] = probe_routed_details(
             _load_json(args.index), result, max_nodes=args.max_native_nodes)
+        from cadquote.group_materials import probe_routed_groups
+
+        result["native_group_probes"] = probe_routed_groups(
+            _load_json(args.index), result, max_groups=args.max_native_nodes)
+        if args.group_images_dir:
+            from cadquote.group_evidence import render_probed_groups
+
+            result["group_images"] = render_probed_groups(
+                _load_json(args.index), result, result["native_group_probes"],
+                args.group_images_dir)
+    result["incomplete"] = bool(
+        (context and context.get("incomplete")) or any(
+            result.get(key, {}).get("truncated") or result.get(key, {}).get("issues")
+            for key in ("native_material_probes", "native_group_probes", "group_images")))
     write_json_atomic(args.out, result)
     if args.review_out:
         args.review_out.parent.mkdir(parents=True, exist_ok=True)
         args.review_out.write_text(detail_routes_markdown(result), encoding="utf-8")
-    _print({"summary": result["summary"], "state": "REVIEW_ONLY",
+    _print({"summary": result["summary"], "group_summary": result["group_navigation_summary"],
+            "state": "REVIEW_INCOMPLETE" if result["incomplete"] else "REVIEW_ONLY",
+            "incomplete": result["incomplete"],
             "output": str(args.out.resolve())})
-    return 0
+    return 2 if result["incomplete"] else 0
 
 
 def command_index_directions(args: argparse.Namespace) -> int:
@@ -1838,6 +1860,8 @@ def build_parser() -> argparse.ArgumentParser:
     detail_routes.add_argument("--probe-native", action="store_true",
                                help="继续核对候选节点原生材料引线和轮廓，不确认算量")
     detail_routes.add_argument("--max-native-nodes", type=int, default=20)
+    detail_routes.add_argument("--group-images-dir", type=Path,
+                               help="可选导出完整节点视图组原CAD图像，需--probe-native")
     detail_routes.add_argument("--refresh-native-frames", action="store_true",
                                help="从哈希校验的原始DXF恢复图框真实范围，不改旧索引")
     detail_routes.add_argument("--review-out", type=Path, help="输出逐条编号导航Markdown核对表")

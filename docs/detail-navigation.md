@@ -68,3 +68,61 @@ and viewport does not establish its complete visual or physical scope.
 Paper rendering filters viewport footprints using native paper rectangles and
 shares a bounding-box cache with the drawing frontend. It still preserves
 unsupported/proxy diagnostics, and image rendering is not screenshot approval.
+
+## Broken-view groups and native group evidence
+
+`detail-routes` and full `run` now add a separate `node_view_groups` catalogue.
+It groups only collinear, close-gap, same-frame viewports with consistent
+top-view scale and transverse model alignment. Paper and model gaps remain
+separate diagnostics; neither is an unfolded dimension. Inactive, unsupported,
+overlapping or multiply framed viewports cannot silently establish complete scope.
+
+Below-view and bottom-right numbered captions compete in a bounded bipartite
+matching. A connected component must have exactly one complete caption/group
+assignment; missing, duplicate, ambiguous or capped matches remain unresolved.
+The original single-viewport navigation ledger is preserved. Group navigation
+can flag a formerly selected viewport as unresolved: this is not a reason to
+fall back silently or to report the two ledgers as cumulative matches.
+
+`--probe-native` also probes unique reciprocal groups. Material annotation
+search uses the native containing page, but exact leader tip membership routes
+each branch through exactly one native viewport inverse matrix. Source hashes,
+caps, raw units, visibility and unsupported geometry remain explicit. Paper and
+model dimensions are extension-point-owned candidates, with no automatic length,
+unfolded-width or physical-count role. Repeated view fragments are not pieces.
+
+Add `--group-images-dir review/group-images` to export the successfully probed
+groups directly from the CAD source. This requires `--probe-native`. Each image
+records native viewport selection, explicitly excluded neighbouring numbered
+title handles, source/image hashes, natural pixel size and REVIEW state. Images
+retain other context annotations and native renderer/proxy limitations; they
+are not verified quotation screenshots. Exporting a group never approves quantity.
+
+```powershell
+scripts/run.ps1 detail-routes run/index/cad_index.json --panels run/analysis/panels.json --out review/routes.json --refresh-native-frames --probe-native --max-native-nodes 20 --review-out review/routes.md --group-images-dir review/group-images
+```
+
+Native reads/probes and optional image export are bounded separately. Full `run`
+adds the indexed group catalogue, not automatic probes/images or quote acceptance.
+The installed personal skill copy is not upgraded by modifying this repository.
+If native context, probing or image export is incomplete, `detail-routes` now
+reports `REVIEW_INCOMPLETE` and exits with code 2. Inspect the retained issues;
+an inaccessible source is not evidence that its drawings or components are absent.
+
+## Dimension-supported profile hypothesis
+
+Native group probing now includes `dimension_supported_profiles`. Within each
+leader's exact viewport it checks open straight polyline skins for constant
+signed offset, matching turns and full polygon reconstruction. A unique pair
+must have one uniquely supported skin, backed by native dimension endpoints in
+at least two nonparallel directions. Projection is allowed only when both
+extension points are vertices of that same skin. Equal values, nearest labels
+and a matching human answer never supply ownership.
+
+Conflicting text overrides, non-unit DIMLFAC, rounding, competing skins,
+multiple contacted boundaries, clipped paths and scan truncation cannot select
+a nominal boundary. Model dimensions must retain the same source/group/viewport
+identity. The output preserves the contact skin, both raw lengths, normal
+separation, dimension handles, segment bindings and undimensioned segments.
+It remains REVIEW and does not fill a takeoff field: unknown units, physical
+count, billable run and manufacturing bend allowance are separate questions.

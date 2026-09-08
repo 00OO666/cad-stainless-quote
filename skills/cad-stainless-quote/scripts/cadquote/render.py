@@ -129,6 +129,8 @@ def _render_with_matplotlib(
     mark_center: bool,
     render_profile: str,
     viewport_handles: Mapping[str, str] | None = None,
+    paper_viewport_sets: Mapping[str, Sequence[str]] | None = None,
+    paper_excluded_handles: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     import matplotlib
 
@@ -201,6 +203,21 @@ def _render_with_matplotlib(
             super().draw_entities(entities, filter_func=evidence_filter)
 
     for label, region in regions.items():
+        excluded = set((paper_excluded_handles or {}).get(label, []))
+        for handle in excluded:
+            native = document.entitydb.get(handle)
+            if (layout_name == "Model" or native is None or native.get_layout() is not space
+                    or native.dxftype() == "VIEWPORT"):
+                raise ValueError("excluded annotation must be a native same-layout paper entity")
+        paper_selection = (paper_viewport_sets or {}).get(label)
+        if paper_selection is not None:
+            if layout_name == "Model" or not paper_selection:
+                raise ValueError("nonempty paper viewport selection requires a paper layout")
+            for handle in paper_selection:
+                selected = document.entitydb.get(handle)
+                if (selected is None or selected.dxftype() != "VIEWPORT"
+                        or selected.get_layout() is not space or selected.dxf.id <= 1):
+                    raise ValueError("native same-layout paper viewport required")
         viewport_handle = (viewport_handles or {}).get(label)
         region_context = context
         frozen_layers = []
@@ -218,8 +235,11 @@ def _render_with_matplotlib(
             entity
             for entity, box in bounded
             if box[0] <= expanded[2]
+            and entity.dxf.handle not in excluded
             and box[2] >= expanded[0]
             and box[1] <= expanded[3]
+            and (paper_selection is None or entity.dxftype() != "VIEWPORT"
+                 or entity.dxf.handle in paper_selection)
             and box[3] >= expanded[1]
         ]
         if not entities:
@@ -307,6 +327,9 @@ def _render_with_matplotlib(
             "backend": "matplotlib-agg",
             "render_profile": profile["name"],
             "source_viewport_handle": viewport_handle,
+            "excluded_paper_annotation_handles": sorted(excluded),
+            "paper_viewport_selection": sorted(paper_selection)
+            if paper_selection is not None else None,
             "viewport_frozen_layers": frozen_layers,
             "viewport_layer_overrides_applied": bool(viewport_handle),
         }
@@ -324,6 +347,8 @@ def render_regions(
     mark_center: bool = True,
     render_profile: str = "white-fast",
     viewport_handles: Mapping[str, str] | None = None,
+    paper_viewport_sets: Mapping[str, Sequence[str]] | None = None,
+    paper_excluded_handles: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     """Render named regions and save an index that maps every image back to CAD coordinates."""
 
@@ -351,6 +376,8 @@ def render_regions(
         mark_center,
         profile["name"],
         viewport_handles,
+        paper_viewport_sets,
+        paper_excluded_handles,
     )
     result = {
         "schema_version": "1.1",

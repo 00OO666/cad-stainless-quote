@@ -77,3 +77,11 @@ def test_source_hash_mismatch_cannot_open_as_valid_candidate(tmp_path):
     result = probe_routed_details(index, routes)
     assert result["completed_nodes"] == 0
     assert "hash mismatch" in result["issues"][0]["reason"]
+
+
+def test_hidden_paper_leader_does_not_supply_material_evidence():
+    doc, args, leader, _ = fixture()
+    layer = doc.layers.new("hidden-leader")
+    layer.off()
+    leader.dxf.layer = layer.dxf.name
+    assert probe_detail_materials(doc, **args)["probes"] == []

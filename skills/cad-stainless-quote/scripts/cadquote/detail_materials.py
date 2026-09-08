@@ -62,14 +62,18 @@ def probe_detail_materials(
     def inside(point):
         return x0 <= point[0] <= x1 and y0 <= point[1] <= y1
 
+    def visible(entity):
+        layer = doc.layers.get(entity.dxf.layer)
+        return not entity.dxf.get("invisible", 0) and not layer.is_off() and not layer.is_frozen()
+
     for ins in layout.query("INSERT"):
-        if ins.dxf.get("invisible", 0):
+        if not visible(ins):
             continue
         codes = [
             (a, m)
             for a in ins.attribs
             for m in find_material_codes(a.dxf.text)
-            if not a.dxf.get("invisible", 0) and not a.dxf.flags & 1
+            if visible(a) and not a.dxf.flags & 1
         ]
         if not codes or not any(inside(a.dxf.insert) for a, _ in codes):
             continue
@@ -90,6 +94,8 @@ def probe_detail_materials(
                 )
             )
     for leader in layout.query("LEADER"):
+        if not visible(leader):
+            continue
         vertices = list(leader.vertices)
         if vertices and inside(vertices[0]) and inside(vertices[-1]):
             entities.append(_record_entity(leader, source_file_id, sheet_id, space, cache))
@@ -120,6 +126,8 @@ def probe_detail_materials(
                     "material_code": record["mt_code"],
                     "leader_handle": branch["leader_handle"],
                     "branch_id": branch["branch_id"],
+                    "paper_tip": list(paper_tip),
+                    "viewport_handle": viewport_handle,
                     "model_tip": [tip.x, tip.y],
                     "roundtrip_residual": residual,
                     "profile_candidates": [],
@@ -128,7 +136,7 @@ def probe_detail_materials(
                 }
             )
     examined, truncated = 0, False
-    for entity in doc.modelspace():
+    for entity in doc.modelspace() if probes else ():
         examined += 1
         if examined > max_model_entities:
             truncated = True
@@ -179,6 +187,8 @@ def probe_detail_materials(
         "model_entities_examined": min(examined, max_model_entities),
         "truncated": truncated or branches["truncated"],
         "contact_tolerance_raw": tolerance,
+        "native_model_to_paper_matrix": list(forward),
+        "native_paper_to_model_matrix": list(inverse),
         "limitations": [
             "Straight top-level model polylines only; nested/arc paths unsupported.",
             "Geometric contact is not confirmed steel-face or unfolded-width ownership.",
