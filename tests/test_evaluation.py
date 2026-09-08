@@ -78,6 +78,35 @@ def test_all_enabled_fields_correct_passes_project_gate():
     assert len(report["policy_hash"]) == 64  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("commercial_status", [ReviewStatus.REVIEW, ReviewStatus.BLOCK])
+def test_takeoff_field_score_is_not_commercial_approval(commercial_status):
+    predicted = item(status=commercial_status, unit=None, unit_price=None, amount=None)
+    report = evaluate_takeoff([predicted], [item()], policy=confirmed_policy())
+    assert report["correct_rows"] == 1
+    assert row(report)["row_correct"] is True
+    assert predicted.status == commercial_status
+    assert predicted.unit_price is None
+
+
+def test_numeric_match_does_not_hide_missing_reference_gold():
+    report = evaluate_takeoff([item()], [item(detail=None)], policy=confirmed_policy())
+    assert report["correct_rows"] == 0
+    assert report["overall_gate"] == "BLOCKED"
+    results = row(report)["field_results"]
+    assert results["engineering_quantity"]["status"] == "PASS"
+    assert results["detail"]["status"] == "UNRESOLVED"
+
+
+def test_exact_piece_count_not_relaxed_when_linear_quantity_matches():
+    values = confirmed_policy().model_dump(mode="json")
+    values["quantity"]["relative_tolerance"] = 0
+    report = evaluate_takeoff([item(quantity=10.01)], [item()], policy=values)
+    assert report["correct_rows"] == 0
+    results = row(report)["field_results"]
+    assert results["engineering_quantity"]["status"] == "PASS"
+    assert results["quantity"]["status"] == "FAIL"
+
+
 @pytest.mark.parametrize(
     ("field", "wrong_value"),
     [
