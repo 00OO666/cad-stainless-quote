@@ -166,3 +166,69 @@ def test_legacy_or_non_linear_dimension_metadata_cannot_supply_proof(mode):
             g["dimtype"] = 34
     out = resolve_group_profile_dimensions(doc, group)
     assert all(r["selected_boundary_handle"] is None for r in out["records"])
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_native_axis_binds_interior_boundary_origin_without_larger_tolerance(reverse):
+    _, group, a, _, dim = fixture()
+    native = dim((9, 12), (89, 11.7))
+    xy = list(a.get_points("xy"))
+    if reverse:
+        xy.reverse()
+    out = bind_boundary_dimensions(xy, group["dimension_candidates"])
+    proof = next(b for b in out["bindings"] if b["dimension_handle"] == native.dxf.handle)
+    assert proof["binding"] == "PROFILE_BOUNDARY_AXIS_PROJECTION"
+    assert proof["segment_length_raw"] == pytest.approx(80)
+    assert proof["native_measurement_axis"] == pytest.approx([1, 0])
+    assert max(proof["extension_origin_boundary_distances_raw"]) < 1e-8
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "outside",
+        "missing_axis",
+        "wrong_axis",
+        "nonunit_axis",
+        "nonfinite_axis",
+        "aligned",
+        "override",
+        "rounding",
+        "scale",
+    ],
+)
+def test_boundary_projection_rejects_foreign_origins_or_untrusted_axis(mode):
+    _, group, a, _, dim = fixture()
+    native = dim((9, 12), (89.01 if mode == "outside" else 89, 11.7))
+    record = group["dimension_candidates"][-1]
+    geometry = record["entity"]["geometry"]
+    if mode == "missing_axis":
+        geometry.pop("native_measurement_axis")
+    elif mode == "wrong_axis":
+        geometry["native_measurement_axis"] = [0, 1]
+    elif mode == "nonunit_axis":
+        geometry["native_measurement_axis"] = [2, 0]
+    elif mode == "nonfinite_axis":
+        geometry["native_measurement_axis"] = [float("nan"), 0]
+    elif mode == "aligned":
+        geometry["dimtype"] = 33
+    elif mode == "override":
+        record["entity"]["text_override"] = "81"
+    elif mode == "rounding":
+        geometry["rounding_increment"] = 1
+    elif mode == "scale":
+        geometry["measurement_factor"] = 2
+    out = bind_boundary_dimensions(list(a.get_points("xy")), group["dimension_candidates"])
+    assert not any(b["dimension_handle"] == native.dxf.handle for b in out["bindings"])
+
+
+def test_interior_projection_does_not_promote_one_axis_to_complete_profile():
+    doc, group, a, _, dim = fixture()
+    group["dimension_candidates"].clear()
+    dim((9, 12), (89, 11.7))
+    out = resolve_group_profile_dimensions(doc, group)["records"][0]
+    assert out["selected_boundary_handle"] is None
+    selected_skin = next(
+        s for c in out["candidates"] for s in c["skins"] if s["handle"] == a.dxf.handle
+    )
+    assert len(selected_skin["bindings"]) == 1 and not selected_skin["supported"]

@@ -22,6 +22,14 @@ def native_group_dimension_record(dim, source_file_id, group_id, space, cache):
     """Refresh profile-proof metadata even with the earlier public index schema."""
     record = _record_entity(dim, source_file_id, group_id, space, cache)
     record.geometry["rounding_increment"] = float(dim.override().get("dimrnd", 0) or 0)
+    # Rotated linear dimensions measure along their native axis, not necessarily
+    # along the vector joining their extension origins. Keep this independent of
+    # displayed values; non-WCS dimensions do not supply this additional proof.
+    normal = Vec3(dim.dxf.get("extrusion", (0, 0, 1)))
+    if (dim.dxf.dimtype & 15) == 0 and normal.isclose(Vec3(0, 0, 1), abs_tol=1e-10):
+        angle = math.radians(dim.dxf.get("angle", 0))
+        if math.isfinite(angle):
+            record.geometry["native_measurement_axis"] = [math.cos(angle), math.sin(angle)]
     return record
 
 

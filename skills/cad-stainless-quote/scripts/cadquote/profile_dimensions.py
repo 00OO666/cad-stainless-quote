@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 
 from ezdxf.math import Vec3
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 
 def _skin_pair(a, b, tol):
@@ -50,7 +50,7 @@ def _skin_pair(a, b, tol):
 
 
 def bind_boundary_dimensions(points, dimension_records, *, tolerance=1e-4):
-    """Only exact vertices or vertex-anchored normal projections can bind.
+    """Bind native vertices or axis-projected, on-boundary extension origins.
 
     Equal values and nearby text never supply ownership. Each dimension can
     support at most one segment; conflicting displayed dimensions are retained.
@@ -65,9 +65,22 @@ def bind_boundary_dimensions(points, dimension_records, *, tolerance=1e-4):
         if any(p is None or len(p) < 2 for p in raw_points):
             continue
         p0, p1 = [p[:2] for p in raw_points]
-        if not all(any(math.dist(p, v) <= tolerance for v in points) for p in (p0, p1)):
+        if not all(math.isfinite(v) for p in (p0, p1) for v in p):
             continue
-        exact, projected = [], []
+        vertex_owned = all(any(math.dist(p, v) <= tolerance for v in points) for p in (p0, p1))
+        boundary = LineString(points)
+        boundary_owned = all(boundary.distance(Point(p)) <= tolerance for p in (p0, p1))
+        if not boundary_owned:
+            continue
+        axis = g.get("native_measurement_axis")
+        axis_ok = (
+            (g.get("dimtype", -1) & 15) == 0
+            and isinstance(axis, (list, tuple))
+            and len(axis) == 2
+            and all(isinstance(v, (int, float)) and math.isfinite(v) for v in axis)
+            and abs(math.hypot(*axis) - 1) <= 1e-10
+        )
+        exact, projected, boundary_projected = [], [], []
         for i, (a, b) in enumerate(zip(points, points[1:], strict=False)):
             length = math.dist(a, b)
             if length <= tolerance:
@@ -78,13 +91,23 @@ def bind_boundary_dimensions(points, dimension_records, *, tolerance=1e-4):
                     exact.append(i)
                     break
                 if (
-                    abs((p[0] - a[0]) * u[0] + (p[1] - a[1]) * u[1]) <= tolerance
+                    vertex_owned
+                    and abs((p[0] - a[0]) * u[0] + (p[1] - a[1]) * u[1]) <= tolerance
                     and abs((q[0] - b[0]) * u[0] + (q[1] - b[1]) * u[1]) <= tolerance
                     and abs((q[0] - p[0]) * u[1] - (q[1] - p[1]) * u[0]) <= tolerance
                 ):
                     projected.append(i)
                     break
-        candidates = sorted(set(exact or projected))
+                if (
+                    axis_ok
+                    and abs(axis[0] * u[1] - axis[1] * u[0]) * length <= tolerance
+                    and (math.dist(p, a) <= tolerance or math.dist(q, b) <= tolerance)
+                    and abs((p[0] - a[0]) * u[0] + (p[1] - a[1]) * u[1]) <= tolerance
+                    and abs((q[0] - b[0]) * u[0] + (q[1] - b[1]) * u[1]) <= tolerance
+                ):
+                    boundary_projected.append(i)
+                    break
+        candidates = sorted(set(exact or projected or boundary_projected))
         if not candidates:
             continue
         if len(candidates) != 1:
@@ -101,7 +124,17 @@ def bind_boundary_dimensions(points, dimension_records, *, tolerance=1e-4):
             "displayed_value": value,
             "extension_points": raw_points,
             "text_override": e.get("text_override"),
-            "binding": "EXACT_SEGMENT_ENDPOINTS" if exact else "PROFILE_VERTEX_NORMAL_PROJECTION",
+            "binding": "EXACT_SEGMENT_ENDPOINTS"
+            if exact
+            else (
+                "PROFILE_VERTEX_NORMAL_PROJECTION"
+                if projected
+                else "PROFILE_BOUNDARY_AXIS_PROJECTION"
+            ),
+            "native_measurement_axis": axis if axis_ok else None,
+            "extension_origin_boundary_distances_raw": [
+                boundary.distance(Point(p)) for p in (p0, p1)
+            ],
         }
         override = e.get("text_override")
         try:

@@ -139,8 +139,11 @@ Native group probing now includes `dimension_supported_profiles`. Within each
 leader's exact viewport it checks open straight polyline skins for constant
 signed offset, matching turns and full polygon reconstruction. A unique pair
 must have one uniquely supported skin, backed by native dimension endpoints in
-at least two nonparallel directions. Projection is allowed only when both
-extension points are vertices of that same skin. Equal values, nearest labels
+at least two nonparallel directions. Vertex-owned normal projections remain
+supported. An additional rotated-linear dimension proof uses the native WCS
+measurement axis: both extension origins must lie on the same finite skin,
+at least one must coincide with a target-segment endpoint, and their projections
+must exactly delimit that segment. The tolerance is unchanged. Equal values, nearest labels
 and a matching human answer never supply ownership.
 
 Conflicting text overrides, non-unit DIMLFAC, rounding, competing skins,
@@ -150,3 +153,21 @@ identity. The output preserves the contact skin, both raw lengths, normal
 separation, dimension handles, segment bindings and undimensioned segments.
 It remains REVIEW and does not fill a takeoff field: unknown units, physical
 count, billable run and manufacturing bend allowance are separate questions.
+
+## Model dimension scope across paper windows
+
+`cadquote.dimension_scope.probe_model_dimension_scope` is a research API for an
+explicit same-source, same-layout viewport scope. Native inverse matrices form
+the visible model polygons; both extension origins and the complete connecting
+span must belong to their union. A dimension may have `SPLIT_VIEWPORT_ORIGINS`
+without being dropped just because neither individual window contains both ends.
+Repeated displays retain one native dimension identity. Gaps in model coverage,
+hidden/frozen dimensions, invalid projections and resource caps do not yield a
+complete inventory. No paper distance is added or rescaled into the model value.
+
+The output preserves original dimension metadata, window ownership, source units
+and REVIEW state. A caller must still prove the scope's physical identity,
+material, governing measurement role, openings and instances. This API does not
+populate quotation fields and is not automatically invoked by production
+`run`/`resume`. A human spreadsheet's representative page label is not sufficient
+evidence that its aggregate quantity belongs to only that page.
