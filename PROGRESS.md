@@ -1,8 +1,18 @@
 # 项目进度与接管入口
 
-更新时间：2026-09-08。本文只记录可公开的工程进展，不包含客户图纸、报价表、截图、实体标识、实测尺寸、私有路径或客户级评测明细。
+更新时间：2026-09-09。本文只记录可公开的工程进展，不包含客户图纸、报价表、截图、实体标识、实测尺寸、私有路径或客户级评测明细。
 
 ## 当前结论
+
+### Development review update
+
+Recent development reviews examined native model-to-paper-space binding, nested insert traversal, and physical identity across repeated views. Cross-view deduplication uses shared source entities, viewport visibility, and component boundaries rather than matching labels or numerical similarity. Competing interpretations remain visible in the audit record.
+
+Counterevidence gates distinguish verified geometry from complete takeoff evidence. Missing detail associations, unresolved assembly-depth semantics, and uncertain end treatments remain under review even when candidate quantities agree with a reference. Original workbook artifacts remain separate from proposed corrections and research annotations; preservation of original values, formulas, and embedded content is a required delivery check.
+
+These findings come from development review, not held-out evaluation. They do not establish autonomous end-to-end accuracy or imply that research procedures have been released as production functionality. This progress note contains no customer artifacts or project-level measurements.
+
+### 前批：逐字段核查覆盖
 
 本次仅更新通用研发状态：逐项核查记录进一步区分检查覆盖、证据闭合和数值一致；每个字段保留已证实值、来源候选或未解决原因。未找到绑定关系不能表述为源图缺失，冲突也不能直接归咎人工。客户级结论、统计、尺寸、图号、图像和特例实现均不在本次公开内容中。
 
