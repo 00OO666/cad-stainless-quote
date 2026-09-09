@@ -5,15 +5,50 @@ Defaults are deliberately conservative: uncertain records start as REVIEW, never
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+Sha256String = Annotated[str, StringConstraints(pattern=r"^[0-9a-fA-F]{64}$")]
+
+
+class ViewDispositionReview(StrictModel):
+    reviewer: NonEmptyString
+    reviewed_at: NonEmptyString
+    reason: NonEmptyString
+
+    @field_validator("reviewed_at")
+    @classmethod
+    def timezone_required(cls, value: str) -> str:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("view disposition review requires a timezone-aware timestamp")
+        return value
+
+
+class ViewDisposition(StrictModel):
+    """A claim to validate against independent current CAD context, not a PASS override."""
+
+    state: Literal["NOT_APPLICABLE"]
+    component_id: NonEmptyString
+    basis_kind: Literal["plan_section", "plan_elevation_without_detail"]
+    basis: NonEmptyString
+    index_sha256: Sha256String
+    source_sha256: dict[NonEmptyString, Sha256String] = Field(min_length=1)
+    support_view_ids: list[NonEmptyString] = Field(min_length=2, max_length=2)
+    connection_id: NonEmptyString
+    search_id: NonEmptyString
+    evidence_ids: list[NonEmptyString] = Field(min_length=1)
+    review: ViewDispositionReview
 
 
 class ReviewStatus(StrEnum):
@@ -347,6 +382,9 @@ class TakeoffItem(StrictModel):
     plan_location: str | None = None
     elevation: str | None = None
     detail: str | None = None
+    view_dispositions: dict[Literal["elevation", "detail"], ViewDisposition] = Field(
+        default_factory=dict
+    )
     unfolded_spec: str | None = None
     width_mm: float | None = Field(default=None, ge=0)
     length_mm: float | None = Field(default=None, ge=0)

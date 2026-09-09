@@ -25,6 +25,15 @@ from .models import (
     TextNormalizationMode,
     UnfoldedSpecComparisonMode,
 )
+from .view_dispositions import (
+    VIEW_FIELDS,
+    PreparedViewContext,
+    ViewDispositionContext,
+    has_source_evidence,
+    is_view_placeholder,
+    prepare_view_context,
+    resolve_view_applicability,
+)
 
 _TEXT_FIELDS = ("mt_code", "name", "material", "plan_location", "elevation", "detail")
 _NUMERIC_FIELDS = ("width_mm", "length_mm", "quantity", "engineering_quantity")
@@ -100,6 +109,11 @@ def _identity(value: str | None) -> str | None:
 
 
 def _diagnostic_value(item: TakeoffItem, field: str) -> str | None:
+    if field in VIEW_FIELDS and (
+        field in item.view_dispositions or is_view_placeholder(getattr(item, field))
+    ):
+        # Absence of a view is not an identity anchor, even after an audited search.
+        return None
     return _normalise_text(getattr(item, field), TextNormalizationMode.CANONICAL)
 
 
@@ -367,12 +381,20 @@ def _present(value: Any) -> bool:
     return bool(str(value).strip()) if isinstance(value, str) else True
 
 
-def _required_gold_missing(item: TakeoffItem, policy: EvaluationPolicy) -> list[str]:
+def _required_gold_missing(
+    item: TakeoffItem, policy: EvaluationPolicy, context: PreparedViewContext
+) -> list[str]:
     missing: list[str] = []
     for field, rule in _enabled_rules(policy):
-        if rule.required_in_gold and not _present(getattr(item, field)):
+        present = _present(getattr(item, field))
+        if field in VIEW_FIELDS:
+            present = resolve_view_applicability(item, field, context).state in {
+                "APPLICABLE",
+                "NOT_APPLICABLE",
+            }
+        if rule.required_in_gold and not present:
             missing.append(field)
-    if not item.evidence_ids:
+    if not has_source_evidence(item):
         missing.append("source_evidence")
     return missing
 
@@ -433,6 +455,52 @@ def _compare_text(
         normalized_predicted=predicted_normalised,
         normalized_gold=gold_normalised,
     )
+
+
+def _compare_view(
+    field: str,
+    predicted: TakeoffItem,
+    gold: TakeoffItem,
+    rule: EvaluationTextFieldPolicy,
+    predicted_context: PreparedViewContext,
+    gold_context: PreparedViewContext,
+) -> dict[str, Any]:
+    predicted_view = resolve_view_applicability(predicted, field, predicted_context)
+    gold_view = resolve_view_applicability(gold, field, gold_context)
+    predicted_value, gold_value = getattr(predicted, field), getattr(gold, field)
+    details = {
+        "predicted_applicability": predicted_view.state,
+        "gold_applicability": gold_view.state,
+        "predicted_applicability_reason": predicted_view.reason,
+        "gold_applicability_reason": gold_view.reason,
+    }
+    if gold_view.state in {"INVALID", "MISSING"}:
+        return _base_result(
+            field, predicted_value, gold_value, "UNRESOLVED", f"gold_{gold_view.reason}", **details
+        )
+    if predicted_view.state in {"INVALID", "MISSING"}:
+        return _base_result(
+            field,
+            predicted_value,
+            gold_value,
+            "FAIL",
+            f"predicted_{predicted_view.reason}",
+            **details,
+        )
+    if predicted_view.state != gold_view.state:
+        return _base_result(
+            field, predicted_value, gold_value, "FAIL", "view_applicability_mismatch", **details
+        )
+    if gold_view.state == "NOT_APPLICABLE":
+        return _base_result(
+            field,
+            predicted_value,
+            gold_value,
+            "PASS",
+            "audited_not_applicable_on_both_sides",
+            **details,
+        )
+    return {**_compare_text(field, predicted_value, gold_value, rule), **details}
 
 
 def _unfolded_total(value: Any) -> Decimal:
@@ -635,7 +703,7 @@ def _compare_source_evidence(
     predicted: TakeoffItem,
     gold: TakeoffItem,
 ) -> dict[str, Any]:
-    if not gold.evidence_ids:
+    if not has_source_evidence(gold):
         return _base_result(
             "source_evidence",
             predicted.evidence_ids,
@@ -643,7 +711,7 @@ def _compare_source_evidence(
             "UNRESOLVED",
             "gold_source_evidence_missing",
         )
-    if not predicted.evidence_ids:
+    if not has_source_evidence(predicted):
         return _base_result(
             "source_evidence",
             predicted.evidence_ids,
@@ -664,12 +732,16 @@ def _compare_fields(
     predicted: TakeoffItem,
     gold: TakeoffItem,
     policy: EvaluationPolicy,
+    predicted_context: PreparedViewContext,
+    gold_context: PreparedViewContext,
 ) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     for field, rule in _enabled_rules(policy):
         predicted_value = getattr(predicted, field)
         gold_value = getattr(gold, field)
-        if isinstance(rule, EvaluationTextFieldPolicy):
+        if field in VIEW_FIELDS:
+            result = _compare_view(field, predicted, gold, rule, predicted_context, gold_context)
+        elif isinstance(rule, EvaluationTextFieldPolicy):
             result = _compare_text(field, predicted_value, gold_value, rule)
         elif isinstance(rule, EvaluationUnfoldedSpecPolicy):
             result = _compare_unfolded(predicted_value, gold_value, rule)
@@ -685,12 +757,18 @@ def _compare_fields(
 
 
 def _missing_prediction_fields(
-    gold: TakeoffItem, policy: EvaluationPolicy
+    gold: TakeoffItem, policy: EvaluationPolicy, context: PreparedViewContext
 ) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     for field, _ in _enabled_rules(policy):
         gold_value = getattr(gold, field)
-        status = "FAIL" if _present(gold_value) else "UNRESOLVED"
+        present = _present(gold_value)
+        if field in VIEW_FIELDS:
+            present = resolve_view_applicability(gold, field, context).state in {
+                "APPLICABLE",
+                "NOT_APPLICABLE",
+            }
+        status = "FAIL" if present else "UNRESOLVED"
         results[field] = _base_result(
             field,
             None,
@@ -698,7 +776,7 @@ def _missing_prediction_fields(
             status,
             "predicted_row_missing" if status == "FAIL" else "gold_value_missing",
         )
-    evidence_status = "FAIL" if gold.evidence_ids else "UNRESOLVED"
+    evidence_status = "FAIL" if has_source_evidence(gold) else "UNRESOLVED"
     results["source_evidence"] = _base_result(
         "source_evidence",
         None,
@@ -786,6 +864,8 @@ def evaluate_takeoff(
     predicted_row_ids: Iterable[str | None] | None = None,
     gold_row_ids: Iterable[str | None] | None = None,
     project_id: str = "project",
+    predicted_view_context: ViewDispositionContext | dict[str, Any] | None = None,
+    gold_view_context: ViewDispositionContext | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate one project under a versioned, auditable acceptance policy.
 
@@ -796,6 +876,8 @@ def evaluate_takeoff(
     """
 
     validated_policy = load_evaluation_policy(policy)
+    predicted_context = prepare_view_context(predicted_view_context, "predicted")
+    gold_context = prepare_view_context(gold_view_context, "gold")
     predicted_ids = _row_ids(predicted_row_ids, len(predicted), "predicted")
     gold_ids = _row_ids(gold_row_ids, len(gold), "gold")
     predicted_records = [
@@ -810,7 +892,7 @@ def evaluate_takeoff(
     invalid_gold_rows: list[dict[str, Any]] = []
     eligible_gold_indices: set[int] = set()
     for record in gold_records:
-        missing_fields = _required_gold_missing(record.item, validated_policy)
+        missing_fields = _required_gold_missing(record.item, validated_policy, gold_context)
         if missing_fields:
             invalid_gold_rows.append(
                 {
@@ -832,12 +914,16 @@ def evaluate_takeoff(
     for gold_record in sorted(gold_records, key=_record_sort_key):
         match = match_by_gold.get(gold_record.index)
         if match is None:
-            field_results = _missing_prediction_fields(gold_record.item, validated_policy)
+            field_results = _missing_prediction_fields(
+                gold_record.item, validated_policy, gold_context
+            )
         else:
             field_results = _compare_fields(
                 match.predicted.item,
                 gold_record.item,
                 validated_policy,
+                predicted_context,
+                gold_context,
             )
         for field, result in field_results.items():
             field_summary[field][result["status"]] += 1

@@ -93,6 +93,7 @@ from cadquote.stage_evidence import build_stage_evidence_manifest
 from cadquote.takeoff import build_takeoff
 from cadquote.variant_bindings import build_variant_bindings
 from cadquote.vector_probe import probe_repeated_vectors
+from cadquote.view_dispositions import prepare_view_context
 
 
 def _print(payload: Any) -> None:
@@ -222,6 +223,33 @@ def _evaluation_project_id(payload: Any, fallback: str) -> str:
     return next((str(value).strip() for value in values if value and str(value).strip()), fallback)
 
 
+def _load_evaluation_view_context(
+    path: Path | str | None,
+    side: str,
+    inputs: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Load one explicit side's context and hash exactly the bytes that were read."""
+
+    if path is None:
+        return None
+    resolved = Path(path).resolve()
+    label = f"{side}_view_context"
+    raw = resolved.read_bytes()
+    inputs[f"{label}_sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise json.JSONDecodeError(
+            f"{label} at {resolved}: {exc.msg}", exc.doc, exc.pos
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object: {resolved}")
+    prepared = prepare_view_context(payload, side)
+    if prepared.error:
+        raise ValueError(f"{label} at {resolved}: {prepared.error}")
+    return payload
+
+
 def _evaluation_batch_manifest(path: Path) -> dict[str, Any]:
     payload = _load_json(path)
     if not isinstance(payload, dict):
@@ -250,7 +278,10 @@ def _evaluation_batch_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("evaluation batch projects must be a non-empty array")
     project_ids: set[str] = set()
     projects: list[dict[str, Any]] = []
-    project_allowed = {"project_id", "predicted", "gold", "policy", "tolerance"}
+    project_allowed = {
+        "project_id", "predicted", "gold", "policy", "tolerance",
+        "predicted_view_context", "gold_view_context",
+    }
     for index, value in enumerate(raw_projects, start=1):
         if not isinstance(value, dict):
             raise ValueError(f"evaluation batch project {index} must be an object")
@@ -279,6 +310,16 @@ def _evaluation_batch_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(
                 f"evaluation batch project {project_id} tolerance must be non-negative"
             )
+        view_contexts: dict[str, str] = {}
+        for field in ("predicted_view_context", "gold_view_context"):
+            context_path = value.get(field)
+            if context_path is None:
+                continue
+            if not isinstance(context_path, str) or not context_path.strip():
+                raise ValueError(
+                    f"evaluation batch project {project_id} {field} must be a path string"
+                )
+            view_contexts[field] = context_path.strip()
         projects.append(
             {
                 "project_id": project_id,
@@ -286,6 +327,7 @@ def _evaluation_batch_manifest(path: Path) -> dict[str, Any]:
                 "gold": gold.strip(),
                 "policy": policy.strip() if isinstance(policy, str) else None,
                 "tolerance": float(tolerance),
+                **view_contexts,
             }
         )
     return {
@@ -316,7 +358,9 @@ def _assert_batch_outputs_preserve_inputs(
     manifest_base = manifest_path.parent
     inputs = {manifest_path.resolve()}
     for project in manifest["projects"]:
-        for field in ("predicted", "gold", "policy"):
+        for field in (
+            "predicted", "gold", "policy", "predicted_view_context", "gold_view_context"
+        ):
             value = project.get(field)
             if not value:
                 continue
@@ -1474,11 +1518,35 @@ def command_candidate_benchmark(args: argparse.Namespace) -> int:
 
 
 def command_evaluate(args: argparse.Namespace) -> int:
+    if args.out:
+        output_path = Path(args.out).resolve()
+        for field in (
+            "predicted", "gold", "policy", "predicted_view_context", "gold_view_context"
+        ):
+            input_path = getattr(args, field, None)
+            if input_path is not None and output_path == Path(input_path).resolve():
+                raise ValueError(f"evaluation output would overwrite {field}: {output_path}")
     predicted_payload = _load_json(args.predicted)
     gold_payload = _load_json(args.gold)
     predicted_rows, predicted_row_ids = _evaluation_rows(predicted_payload)
     gold_rows, gold_row_ids = _evaluation_rows(gold_payload)
     policy = _load_json(args.policy) if args.policy else None
+    inputs: dict[str, Any] = {
+        "predicted": str(Path(args.predicted).resolve()),
+        "gold": str(Path(args.gold).resolve()),
+        "policy": str(Path(args.policy).resolve()) if args.policy else None,
+        "predicted_sha256": sha256_file(args.predicted),
+        "gold_sha256": sha256_file(args.gold),
+        "policy_file_sha256": sha256_file(args.policy) if args.policy else None,
+        "legacy_tolerance": args.tolerance,
+    }
+    view_contexts: dict[str, dict[str, Any] | None] = {}
+    for side in ("predicted", "gold"):
+        field = f"{side}_view_context"
+        context_path = getattr(args, field, None)
+        if context_path is not None:
+            inputs[field] = str(Path(context_path).resolve())
+        view_contexts[field] = _load_evaluation_view_context(context_path, side, inputs)
     project_id = args.project_id or _evaluation_project_id(gold_payload, Path(args.gold).stem)
     report = evaluate_takeoff(
         [TakeoffItem.model_validate(value) for value in predicted_rows],
@@ -1488,7 +1556,9 @@ def command_evaluate(args: argparse.Namespace) -> int:
         predicted_row_ids=predicted_row_ids,
         gold_row_ids=gold_row_ids,
         project_id=project_id,
+        **view_contexts,
     )
+    report["inputs"] = inputs
     if args.out:
         write_json_atomic(Path(args.out), report)
     # The detailed row-key lists can be very large on real projects. Keep the
@@ -1546,6 +1616,11 @@ def command_evaluate_batch(args: argparse.Namespace) -> int:
             "gold": project["gold"],
             "policy": project["policy"],
             "legacy_tolerance": project["tolerance"],
+            **{
+                field: project[field]
+                for field in ("predicted_view_context", "gold_view_context")
+                if field in project
+            },
         }
         try:
             predicted_path = _manifest_file(
@@ -1572,6 +1647,22 @@ def command_evaluate_batch(args: argparse.Namespace) -> int:
             predicted_rows, predicted_row_ids = _evaluation_rows(predicted_payload)
             gold_rows, gold_row_ids = _evaluation_rows(gold_payload)
             policy = _load_json(policy_path) if policy_path else None
+            inputs.update(
+                {
+                    "predicted_sha256": sha256_file(predicted_path),
+                    "gold_sha256": sha256_file(gold_path),
+                    "policy_file_sha256": sha256_file(policy_path) if policy_path else None,
+                }
+            )
+            view_contexts: dict[str, dict[str, Any] | None] = {}
+            for side in ("predicted", "gold"):
+                field = f"{side}_view_context"
+                context_path = (
+                    _manifest_file(manifest_base, project[field], f"{project_id} {field}")
+                    if project.get(field) is not None
+                    else None
+                )
+                view_contexts[field] = _load_evaluation_view_context(context_path, side, inputs)
             report = evaluate_takeoff(
                 [TakeoffItem.model_validate(value) for value in predicted_rows],
                 [TakeoffItem.model_validate(value) for value in gold_rows],
@@ -1580,13 +1671,7 @@ def command_evaluate_batch(args: argparse.Namespace) -> int:
                 predicted_row_ids=predicted_row_ids,
                 gold_row_ids=gold_row_ids,
                 project_id=project_id,
-            )
-            inputs.update(
-                {
-                    "predicted_sha256": sha256_file(predicted_path),
-                    "gold_sha256": sha256_file(gold_path),
-                    "policy_file_sha256": (sha256_file(policy_path) if policy_path else None),
-                }
+                **view_contexts,
             )
             report["batch_context"] = {
                 "batch_id": manifest["batch_id"],
@@ -2187,6 +2272,16 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--project-id",
         help="本次项目标识；默认取gold元数据或文件名",
+    )
+    evaluate.add_argument(
+        "--predicted-view-context",
+        type=Path,
+        help="预测侧独立CAD视图上下文JSON；用于审核视图不适用声明，side必须为predicted",
+    )
+    evaluate.add_argument(
+        "--gold-view-context",
+        type=Path,
+        help="金标准侧独立CAD视图上下文JSON；用于审核视图不适用声明，side必须为gold",
     )
     evaluate.add_argument(
         "--tolerance",

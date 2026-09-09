@@ -4,6 +4,32 @@
 
 ## 当前结论
 
+### Audited view applicability and native longitudinal bands
+
+The evaluator now distinguishes a genuinely unnecessary view from missing
+evidence. Typed, component-bound applicability receipts are resolved against
+separate prediction/gold current CAD contexts. The CLI and batch paths preserve
+context hashes, reject wrong-side or malformed input, and protect source files
+from output overwrite. Bare placeholders, blank evidence, stale selections,
+broken relations and incomplete negative searches cannot establish a pass.
+Omissions/extras and the existing full-row gates remain unchanged.
+
+These contexts are scorer-supplied facts: hashes do not authenticate invented
+facts, and automatic CAD-to-context production is not yet integrated. This is
+not a claim that the production pipeline now handles every plan/section path.
+
+A separate REVIEW-only geometry utility unions complete native rectangular
+bands longitudinally, retaining individual source paths and gaps. It rejects
+missing completeness receipts and approximate geometry; closed outline
+perimeters, repeated overlapping outlines, and raised fixtures are not blindly
+added or deducted as takeoff lengths. Material ownership, native dimension roles
+and physical grouping remain separate requirements.
+
+Independent private source review found an annotation ambiguity and retained it
+alongside node-based same-wall construction evidence. A bounded wall subtotal is
+development research, not a complete quotation row or a project accuracy result.
+Prior predictions, workbooks, scores and acceptance policy remain unchanged.
+
 ### Native material extents and post-freeze image comparison
 
 Private development now follows a bounded ceiling assembly from its native

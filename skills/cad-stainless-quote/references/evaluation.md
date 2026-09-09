@@ -126,6 +126,46 @@ Batch micro/macro rates are diagnostic. The batch gate is `PASS` only when every
 `PASS`; otherwise `BLOCKED` takes precedence, followed by `INDETERMINATE` and `FAIL`. Thus a large
 easy project can never hide a failed or evidence-incomplete project.
 
+## Audited view applicability (evaluation only)
+
+An empty string or bare `N/A`, `无`, or `不适用` is not a drawing reference. A missing
+view is different from a view that is genuinely unnecessary. `TakeoffItem.view_dispositions`
+can record one audited `NOT_APPLICABLE` stage:
+
+- `elevation`, with `basis_kind=plan_section`: selected plan and section, a confirmed
+  plan-to-section connection, native section DIMENSION evidence, and completed negative
+  search covering both selected sheets;
+- `detail`, with `basis_kind=plan_elevation_without_detail`: selected plan and elevation,
+  their confirmed connection, native elevation DIMENSION evidence, and completed negative
+  search covering the selected elevation.
+
+See `ViewDisposition` in `models.py` and `ViewDispositionContext` in
+`view_dispositions.py` for the strict serialized contracts. Receipts require component,
+current index/source SHA-256, selected view IDs, connection/search IDs, actual evidence
+IDs, and reviewer/time/reason. The scorer independently resolves prediction and gold
+receipts against their own current selected-view contexts. It rejects missing or stale
+contexts, wrong-side inputs, broken relations, incomplete searches, conflicting references,
+reused cross-stage entities, and two non-applicable stages. `N/A` is never a row identity
+anchor. Omissions/extras and all other enabled fields still control the full-row gate.
+
+```powershell
+scripts/run.ps1 evaluate predicted.json gold.json --policy approved-policy.json `
+  --predicted-view-context predicted-current-context.json `
+  --gold-view-context gold-current-context.json --out evaluation.json
+```
+
+Batch project entries accept `predicted_view_context` and `gold_view_context` paths relative
+to the manifest. Reports retain input paths and raw-file hashes, and output paths cannot
+overwrite those inputs. Without an explicit context no context is manufactured.
+
+**Trust boundary:** these are scorer-supplied CAD facts, not authenticated by a self-declared
+hash. Build them from the current CAD index and independently reviewed stage selections;
+never copy gold context into a prediction. This evaluator does not read CAD or establish
+that arbitrary authored facts are true. This addition does not make `stage-evidence`,
+`run`/`resume`, or the quotation exporter automatically produce a plan-to-section chain.
+Do not relabel a section as an elevation. Freeze new rule/input versions before new scoring;
+preserve prior predictions and evaluations, and label known-project regression honestly.
+
 ## Additional pipeline metrics
 
 - MT/material-code occurrence recall and precision.
