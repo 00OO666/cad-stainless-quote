@@ -4,6 +4,34 @@
 
 ## 当前结论
 
+### Native cutting paths: bounded production integration
+
+The standalone context producer now uses native triangle/circular-divider
+geometry and finite endpoint-connected paths to test selected component
+crossings. It retains real arc gaps, nested transforms, selected-viewport
+visibility and parallel top-view projection planes. Straight native LEADER
+graphics are recovered from their actual vertices and dimension style; unknown
+or branching geometry remains unresolved. Proper native crossings are distinct
+from touching, overlapping bounding boxes and nearby references.
+
+Post-freeze development replay distinguishes previously discovered matching
+paths from cross-component counterexamples. This is a bounded geometry result,
+not fresh automatic component discovery, quantity correctness, or full-row
+accuracy. Opaque content and unresolved references still constrain missing-view
+claims. Existing predictions and workbooks are preserved.
+
+Negative-search handling now retains hidden or unrecognized cutting symbols
+instead of treating them as outside the component. Selected native INSERTs also
+receive a bounded descendant-visibility check before their whole-block extents
+can be evidence. Runtime source/code drift invalidates a new context receipt.
+
+The unchanged full-field evaluator has also been exercised separately. A
+commercial REVIEW status or missing price does not itself fail the quantity
+comparison; nonempty evidence IDs likewise do not establish actual CAD proof.
+Screenshot-only reference fields and unresolved physical identities need
+independent development labels, not fabricated drawing numbers or a reduced
+denominator. The end-to-end 95% acceptance target remains unproven.
+
 ### Correction: reciprocal sheet references are not physical ownership
 
 A fresh CAD-only development pass found counterevidence to an earlier local

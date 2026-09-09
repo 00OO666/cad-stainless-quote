@@ -20,6 +20,7 @@ import ezdxf
 from ezdxf import bbox as ezbbox
 from pydantic import Field, field_validator
 
+from . import native_cut_paths
 from .cad_index import index_dxf
 from .io import sha256_file, write_json_atomic
 from .linking import extract_reference_codes, extract_structured_reference_callouts
@@ -285,12 +286,71 @@ def _source_replay(index, panels, selected_sources):
     return native, actual_sheets, actual_entities, source_receipts, scan_issues, expansion.warnings
 
 
+def _native_object_visibility(
+    document, original, viewport_frozen, *, max_entities=10000, max_depth=16
+):
+    """Reject a selected block whose full bbox includes hidden/unknown children.
+
+    This deliberately does not silently substitute a visible subassembly for
+    the selected INSERT. A later selection may explicitly identify that part.
+    """
+    visited = 0
+    leaves = 0
+
+    def walk(entity, inherited_layer=None, stack=()):
+        nonlocal visited, leaves
+        visited += 1
+        _require(visited <= max_entities and len(stack) <= max_depth,
+                 "native object visibility scan incomplete: limit")
+        layer_name = str(entity.dxf.get("layer", "0"))
+        if layer_name == "0" and inherited_layer is not None:
+            layer_name = inherited_layer
+        try:
+            layer = document.layers.get(layer_name)
+        except Exception as exc:
+            raise ViewContextBuildError("native object visibility scan: missing layer") from exc
+        _require(
+            not entity.dxf.get("invisible", 0)
+            and not layer.is_off() and not layer.is_frozen()
+            and layer_name.casefold() not in viewport_frozen,
+            "hidden native object descendant cannot supply full-block geometry",
+        )
+        if entity.dxftype() == "INSERT":
+            name = str(entity.dxf.name)
+            _require(name.casefold() not in stack, "native object visibility scan: block cycle")
+            try:
+                block = document.blocks.get(name)
+            except Exception as exc:
+                raise ViewContextBuildError("native object visibility scan: missing block") from exc
+            _require(block is not None, "native object visibility scan: missing block")
+            _require(not block.block.dxf.get("flags", 0) & 12,
+                     "native object visibility scan: external block")
+            for child in block:
+                if child.dxftype() != "ATTDEF":
+                    walk(child, layer_name, (*stack, name.casefold()))
+        else:
+            leaves += 1
+
+    walk(original)
+    _require(leaves > 0, "native object visibility scan: no visible content")
+    return {"complete": True, "visited_entities": visited, "visible_leaf_entities": leaves,
+            "basis": "native_instance_layer_inheritance_and_selected_viewport_visibility"}
+
+
 class _Scope:
     def __init__(self, view, sheets, entities, native, source_documents):
         self.view = view
         self.sheet = sheets[view.sheet_id]
         self.native = native
         self.document = source_documents[self.sheet.source_file_id]
+        self.viewport = self.document.entitydb.get(self.sheet.viewport_handle)
+        _require(
+            self.viewport is not None and self.viewport.dxftype() == "VIEWPORT",
+            "selected native viewport missing",
+        )
+        self.viewport_frozen_layers = {
+            str(name).casefold() for name in self.viewport.frozen_layers
+        }
         self.visibility_cache = {}
         self.label_link_cache = {}
         self.all_panel_entities = entities
@@ -314,6 +374,13 @@ class _Scope:
         self.title_ids = set(view.title_reference_ids)
         self.anchors = [self.resolve(e) for e in view.binding_entity_ids]
         self.binding_audit = {}
+        self.cut_path_cache = {}
+        self.reference_pairs_by_parent = defaultdict(list)
+        source_entities = [
+            e for e in native.values() if e.source_file_id == self.sheet.source_file_id
+        ]
+        for pair in extract_structured_reference_callouts(source_entities):
+            self.reference_pairs_by_parent[pair.parent_insert_handle].append(pair)
         self.native_objects = []
         if view.native_object_handles:
             _require(
@@ -341,8 +408,12 @@ class _Scope:
                 _require(
                     not original.dxf.get("invisible", 0)
                     and not layer.is_off()
-                    and not layer.is_frozen(),
+                    and not layer.is_frozen()
+                    and str(original.dxf.layer).casefold() not in self.viewport_frozen_layers,
                     "hidden native object cannot bind a component",
+                )
+                visibility_proof = _native_object_visibility(
+                    doc, original, self.viewport_frozen_layers
                 )
                 extents = ezbbox.extents([original], fast=False)
                 _require(extents.has_data, "native object has no geometric extent")
@@ -361,6 +432,7 @@ class _Scope:
                         "handle": handle,
                         "bbox": box,
                         "binding_basis": "original_DXF_model_geometry_in_reviewed_bbox",
+                        "native_instance_visibility": visibility_proof,
                     }
                 )
 
@@ -486,6 +558,17 @@ class _Scope:
                 and raw.dxf.get("flags", 0) & 1
                 or layer.is_off()
                 or layer.is_frozen()
+                or (
+                    original.space == "model"
+                    and str(raw.dxf.layer).casefold() in self.viewport_frozen_layers
+                    and not (
+                        str(raw.dxf.layer) == "0"
+                        and (
+                            record.geometry.get("parent_insert_id")
+                            or record.geometry.get("parent_insert_handle")
+                        )
+                    )
+                )
             ):
                 valid = False
                 break
@@ -610,7 +693,61 @@ class _Scope:
             return "native_bbox_in_reviewed_component_bbox"
         return None
 
+    def cut_path_result(self, entity):
+        """Reopen symbol and component geometry; never accept an authored path."""
+        original = self.native[_native_id(entity)]
+        parent = original.geometry.get("parent_insert_handle")
+        pairs = self.reference_pairs_by_parent.get(parent, [])
+        if original.entity_type != "ATTRIB" or not any(
+            original.id in pair.entity_ids for pair in pairs
+        ):
+            return None
+        key = (original.space, parent)
+        if key not in self.cut_path_cache:
+            # All references are freshly indexed native attached ATTRIBs. The
+            # geometry producer rereads their actual INSERT rather than trusting
+            # caller-enriched parent, segment or intersection records.
+            references = [
+                e
+                for e in self.native.values()
+                if e.source_file_id == original.source_file_id
+                and e.space == original.space
+                and e.entity_type == "ATTRIB"
+                and e.geometry.get("parent_insert_handle") == parent
+                and any(e.id in pair.entity_ids for pair in pairs)
+            ]
+            self.cut_path_cache[key] = native_cut_paths.trace_native_cut_paths(
+                self.document,
+                reference_entities=references,
+                native_objects=self.native_objects,
+                viewport_handle=self.sheet.viewport_handle,
+            )
+        return self.cut_path_cache[key]
+
+    @staticmethod
+    def _cut_path_binding(result):
+        if not result or not result.get("supported") or not result.get("complete"):
+            return None
+        return {
+            "kind": "native_cut_path_component_crossing",
+            "proof_sha256": _hash(result),
+            "path_ids": [p["id"] for p in result["paths"]],
+            "native_symbol_parents": result["native_symbol_parents"],
+            "crossing_object_ids": result["candidate_object_ids"],
+            "coordinate_space": result["coordinate_space"],
+            "quantity_or_material_inference": False,
+        }
+
     def bound(self, entity):
+        cut = self.cut_path_result(entity)
+        if cut and (
+            cut.get("symbol_recognized")
+            or cut.get("source_symbol_evidence_present")
+            or cut.get("symbol_geometry_complete") is False
+        ):
+            # A real cutting symbol takes precedence over its text insertion.
+            # No bbox fallback may erase a wrong/disconnected/unsupported path.
+            return self._cut_path_binding(cut)
         direct = self.direct(entity)
         if direct:
             return direct
@@ -670,7 +807,7 @@ class _Scope:
                     "projected_entity_bbox": box,
                     "reviewed_object_bbox": target,
                     "bbox_separation_drawing_units": gap,
-                    "unsupported_route": "unindexed block cut-line connectivity is not implemented",
+                    "native_cut_path": self.cut_path_result(entity),
                 },
             )
         self.binding_audit[identifier] = {
@@ -904,6 +1041,11 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     Relations are inventoried as untrusted navigation candidates; only native
     paired references establish a positive connection.
     """
+    producer_paths = {
+        "producer_sha256": Path(__file__),
+        "native_cut_path_producer_sha256": Path(native_cut_paths.__file__),
+    }
+    producer_hashes = {key: sha256_file(path) for key, path in producer_paths.items()}
     paths = {
         "index": Path(index_path).resolve(),
         "panels": Path(panels_path).resolve(),
@@ -1085,6 +1227,28 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
                     if native_id in selected_refs
                     else ("OUTSIDE_COMPONENT" if binding_basis is None else "UNRESOLVED_REFERENCE")
                 )
+                cut_result = scope.cut_path_result(entity)
+                if (
+                    state == "OUTSIDE_COMPONENT"
+                    and cut_result
+                    and (
+                        not cut_result.get("complete")
+                        or cut_result.get("symbol_geometry_complete") is False
+                        or (
+                            (
+                                cut_result.get("symbol_recognized")
+                                or cut_result.get("source_symbol_evidence_present")
+                            )
+                            and any(
+                                reason != "NO_PROPER_NATIVE_OBJECT_CROSSING"
+                                for reason in cut_result.get("reason_codes", [])
+                            )
+                        )
+                    )
+                ):
+                    # Failure to trace is not proof that a reference belongs to
+                    # another component. Retain it for the negative-search gate.
+                    state = "UNRESOLVED_REFERENCE"
                 if not scope.visible(entity):
                     state = "HIDDEN_NATIVE_REFERENCE"
                 if state == "UNRESOLVED_REFERENCE":
@@ -1102,6 +1266,9 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
                         "candidate_sheet_ids": candidate_sheets,
                         "state": state,
                         "binding_basis": binding_basis,
+                        "native_cut_path_proof_sha256": _hash(cut_result)
+                        if cut_result is not None
+                        else None,
                         "reason": "native reference retained; component relation requires review"
                         if state == "UNRESOLVED_REFERENCE"
                         else "no native geometric or parent binding to reviewed component"
@@ -1169,6 +1336,17 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
                 "review": component.review.model_dump(mode="json"),
                 "views": [v.model_dump(mode="json") for v in component.views],
                 "entity_bindings": binding,
+                "native_cut_path_diagnostics": [
+                    {
+                        "view_id": scope.view.id,
+                        "native_space": key[0],
+                        "parent_insert_handle": key[1],
+                        "proof_sha256": _hash(result),
+                        "result": result,
+                    }
+                    for scope in scopes.values()
+                    for key, result in sorted(scope.cut_path_cache.items())
+                ],
                 "reference_inventory": inventory,
                 "connection_basis": {
                     "kind": "native_same_parent_reciprocal_page_view_pairs",
@@ -1188,7 +1366,7 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     receipt = {
         "schema_version": "cad-view-context-receipt/1",
         "producer_version": PRODUCER,
-        "producer_sha256": sha256_file(Path(__file__)),
+        **producer_hashes,
         "side": side,
         "path_scope": "local_run_diagnostics",
         "mutates_takeoff": False,
@@ -1214,6 +1392,10 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     _require(
         all(sha256_file(Path(s["source_path"])) == s["source_sha256"] for s in sources),
         "source changed during build",
+    )
+    _require(
+        producer_hashes == {key: sha256_file(path) for key, path in producer_paths.items()},
+        "producer code changed during build",
     )
     # A receipt must compare identically after being written/read as JSON;
     # native CAD geometry uses tuples internally, while JSON uses arrays.

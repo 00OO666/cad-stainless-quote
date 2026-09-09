@@ -199,12 +199,33 @@ Unresolved in-scope references, missing projection coverage and conflicts remain
 visible in the negative-search record instead of being erased by an input edge.
 
 This is deliberately bounded. A semantic choice still requires review; source
-replay does not itself understand the physical assembly. Unsupported unindexed
-cutting-path tracing cannot establish source-reference ownership, even when a
-human can trace the path in the original drawing. Rejected selections must not
-be enlarged or swapped just to obtain a verified receipt. Context generation
+replay does not itself understand the physical assembly. Supported native
+triangle and circular-divider symbols are traced by their actual geometry and
+finite endpoint-connected paths. A unique path must properly cross selected
+native object geometry. Touching, bbox overlap, proximity, an unresolved branch,
+or a symbol that has not been recognized cannot establish ownership. Circular
+markers retain their native arc gaps rather than reconstructing a closed circle.
+Source and object visibility includes the selected viewport's frozen layers.
+
+Paper/model association uses a validated parallel top-view projection. Receipts
+retain source and object plane Z values and explicitly do not claim a three-
+dimensional intersection. Tilt, perspective and unsupported projection remain
+incomplete. An unsupported entity may be excluded from the reachable path scope
+only through verified disjoint native bounds; this is not a declaration that the
+whole layout or a missing-view negative search has been fully interpreted.
+
+Rejected selections must not be enlarged or swapped just to obtain a verified
+receipt. The path receipt does not establish material, dimension roles, physical
+counts, quoted area, fabrication dimensions, or semantic row correctness.
+Context generation
 does not change takeoff numbers, confirm prices, automatically normalize gold,
 or integrate this path into `run`, `resume` or `stage-evidence`.
+
+The field evaluator does not fail a row merely because its commercial status is
+REVIEW/BLOCK or its price is blank. Conversely, nonempty `evidence_ids` are not
+source validation: a numeric/text match must be accompanied by a valid production
+CAD evidence chain before it is reported as a verified CAD takeoff row. Report
+missing enabled fields and unresolved ownership explicitly, not as price issues.
 
 ### Diagnostic metrics
 

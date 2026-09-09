@@ -29,10 +29,25 @@ def cad_case(tmp_path, request):
     model = doc.modelspace()
     plan_object = model.add_lwpolyline([(20, 20), (80, 20), (80, 70), (20, 70)], close=True)
     target_object = model.add_lwpolyline([(220, 20), (280, 20), (280, 70), (220, 70)], close=True)
+    if variant in {"target_nested_visible", "target_nested_frozen", "target_nested_missing_layer"}:
+        model.delete_entity(target_object)
+        doc.layers.new("NESTED_CHILD")
+        child = doc.blocks.new("OBJECT_CHILD")
+        child.add_lwpolyline([(220, 20), (280, 20), (280, 70), (220, 70)], close=True,
+                            dxfattribs={"layer": "NESTED_CHILD"})
+        outer = doc.blocks.new("OBJECT_OUTER")
+        outer.add_blockref("OBJECT_CHILD", (0, 0))
+        target_object = model.add_blockref("OBJECT_OUTER", (0, 0))
+        if variant == "target_nested_missing_layer":
+            doc.layers.remove("NESTED_CHILD")
     plan_material = model.add_text("MT-01", dxfattribs={"insert": (25, 25), "height": 2})
     model.add_text("MT-01", dxfattribs={"insert": (225, 25), "height": 2})
     dimension = model.add_linear_dim(base=(250, 80), p1=(220, 20), p2=(280, 20))
     dimension.render()
+    if variant == "target_viewport_frozen":
+        doc.layers.new("TARGET_VIEWPORT_FROZEN")
+        target_object.dxf.layer = "TARGET_VIEWPORT_FROZEN"
+        dimension.dimension.dxf.layer = "TARGET_VIEWPORT_FROZEN"
     if variant in {"unresolved", "outside", "conflict"}:
         position = (250, 40) if variant != "outside" else (290, 90)
         model.add_text("EL-09", dxfattribs={"insert": position, "height": 2})
@@ -40,6 +55,9 @@ def cad_case(tmp_path, request):
     frame.add_lwpolyline([(-5, -10), (105, -10), (105, 105), (-5, 105)], close=True)
     refblock = doc.blocks.new("REF")
     refblock.add_circle((0, 0), 1)
+    if variant.startswith("cut_"):
+        refblock.add_solid([(0, 0), (-2, -1), (-2, 1), (-2, 1)])
+        refblock.add_line((-2, 0), (-5, 0))
     refs = {}
     ref_parents = {}
     material_tag = material_leader = None
@@ -52,9 +70,13 @@ def cad_case(tmp_path, request):
         model.add_text("ELEVATION", dxfattribs={"insert": (450, 50), "height": 2})
     for name, page, center, target in layout_specs:
         layout = doc.layouts.new(name)
-        layout.add_viewport(
+        viewport = layout.add_viewport(
             center=(50, 50), size=(100, 100), view_center_point=center, view_height=100
         )
+        if name == "Section" and variant == "target_viewport_frozen":
+            viewport.frozen_layers = ["TARGET_VIEWPORT_FROZEN"]
+        if name == "Section" and variant == "target_nested_frozen":
+            viewport.frozen_layers = ["NESTED_CHILD"]
         frame_insert = layout.add_blockref("PAGE_FRAME", (0, 0))
         page_attribute = frame_insert.add_attrib(
             "SHEET_NUMBER", page, (70, -7), dxfattribs={"height": 2}
@@ -65,6 +87,19 @@ def cad_case(tmp_path, request):
         point = (40, 40) if name == "Plan" else (40, 5)
         if name == "Plan" and variant == "outside_callout":
             point = (90, 40)
+        if name == "Plan" and variant.startswith("cut_"):
+            point = (90, 90) if variant == "cut_wrong_object" else (90, 40)
+            if variant == "cut_inside_no_crossing":
+                point = (40, 40)
+            if variant == "cut_boundary_touch":
+                point = (90, 20)
+            start = (point[0] - 5, point[1])
+            if variant == "cut_gap":
+                start = (start[0] - 0.1, start[1])
+            endpoint = (30, 40) if variant == "cut_inside_no_crossing" else (0, point[1])
+            layout.add_line(start, endpoint)
+            if variant == "cut_branch":
+                layout.add_line(start, (start[0], start[1] + 20))
         if name == "Section" and variant == "clipped_title":
             point = (40, -6)
         insert = layout.add_blockref("REF", point)
@@ -100,6 +135,23 @@ def cad_case(tmp_path, request):
             extra = layout.add_text("EL-99", dxfattribs={"insert": (150, 50), "height": 2})
             if variant == "unprojected_hidden":
                 extra.dxf.invisible = 1
+        if name == "Plan" and variant == "unselected_hidden_cut":
+            extra_block = doc.blocks.new("UNSELECTED_HIDDEN_CUT")
+            arrow = extra_block.add_solid([(0, 0), (-2, -1), (-2, 1), (-2, 1)])
+            arrow.dxf.invisible = 1
+            extra_block.add_line((-2, 0), (-5, 0))
+            extra = layout.add_blockref("UNSELECTED_HIDDEN_CUT", (85, 45))
+            extra.add_attrib("SHEET_NUMBER", "EL-99", (85, 45), dxfattribs={"height": 2})
+            extra.add_attrib("#", "09", (85, 48), dxfattribs={"height": 2})
+            layout.add_line((80, 45), (0, 45))
+        if name == "Plan" and variant == "unselected_circle_divider":
+            extra_block = doc.blocks.new("UNSELECTED_CIRCLE_DIVIDER")
+            extra_block.add_circle((0, 0), 2)
+            extra_block.add_line((-2, 0), (2, 0))
+            extra = layout.add_blockref("UNSELECTED_CIRCLE_DIVIDER", (85, 45))
+            extra.add_attrib("SHEET_NUMBER", "EL-99", (85, 45), dxfattribs={"height": 2})
+            extra.add_attrib("#", "09", (85, 48), dxfattribs={"height": 2})
+            layout.add_line((83, 45), (0, 45))
         if name == "Section":
             title = "ELEVATION" if variant == "elevation_chain" else "SECTION"
             if variant == "mixed_title":
@@ -236,6 +288,78 @@ def test_native_source_produces_verifiable_context_and_receipt(cad_case):
         item, "elevation", prepare_view_context(result["context"], "predicted")
     )
     assert applicability.state == "NOT_APPLICABLE"
+
+
+@pytest.mark.parametrize("cad_case", ["cut_connected"], indirect=True)
+def test_external_symbol_binds_by_actual_cut_path_without_enlarging_bbox(cad_case):
+    result = _build(cad_case)
+    component = result["receipt"]["components"][0]
+    assert component["state"] == "VERIFIED"
+    source_ids = cad_case["data"]["components"][0]["source_reference_ids"]
+    for identifier in source_ids:
+        basis = component["entity_bindings"][identifier]["binding_basis"]
+        assert basis["kind"] == "native_cut_path_component_crossing"
+        assert basis["crossing_object_ids"]
+    proofs = [
+        proof for proof in component["native_cut_path_diagnostics"]
+        if proof["view_id"] == "plan-view"
+    ]
+    assert len(proofs) == 1  # Same-parent attributes reuse one native path scan.
+    assert proofs[0]["result"]["supported"] is True
+    assert result["receipt"]["native_cut_path_producer_sha256"]
+    assert verify_view_context_receipt(
+        cad_case["index"], cad_case["panels"], cad_case["selection"],
+        result["context"], result["receipt"], side="predicted",
+    )
+
+
+@pytest.mark.parametrize(
+    "cad_case",
+    ["cut_gap", "cut_wrong_object", "cut_inside_no_crossing", "cut_boundary_touch", "cut_branch"],
+    indirect=True,
+)
+def test_cut_path_counterevidence_is_not_overridden_by_text_or_bbox(cad_case):
+    with pytest.raises(ViewContextBuildError, match="no component binding") as error:
+        _build(cad_case)
+    assert error.value.diagnostic["native_cut_path"]["supported"] is False
+
+
+@pytest.mark.parametrize("cad_case", ["target_viewport_frozen"], indirect=True)
+def test_hidden_in_selected_viewport_cannot_supply_target_evidence(cad_case):
+    with pytest.raises(ViewContextBuildError, match="hidden native object"):
+        _build(cad_case)
+
+
+@pytest.mark.parametrize("cad_case", ["target_nested_visible"], indirect=True)
+def test_visible_nested_native_object_preserves_visibility_proof(cad_case):
+    result = _build(cad_case)
+    bindings = result["receipt"]["components"][0]["entity_bindings"].values()
+    block = next(b for b in bindings if b.get("entity_type") == "INSERT")
+    assert block["native_instance_visibility"]["complete"]
+    assert block["native_instance_visibility"]["visible_leaf_entities"] == 1
+
+
+@pytest.mark.parametrize(
+    "cad_case", ["target_nested_frozen", "target_nested_missing_layer"], indirect=True
+)
+def test_hidden_or_unknown_nested_object_cannot_supply_full_block_bbox(cad_case):
+    with pytest.raises(
+        ViewContextBuildError, match="hidden native object descendant|missing layer"
+    ):
+        _build(cad_case)
+
+
+@pytest.mark.parametrize("cad_case", ["unselected_hidden_cut"], indirect=True)
+def test_unresolved_hidden_symbol_is_not_negative_scope_exclusion(cad_case):
+    result = _build(cad_case)
+    component = result["receipt"]["components"][0]
+    assert component["state"] == "REVIEW"
+    matches = [
+        r for r in component["reference_inventory"] if "EL-99" in r["target_codes"]
+    ]
+    assert matches
+    assert all(r["state"] == "UNRESOLVED_REFERENCE" for r in matches)
+    assert result["context"]["searches"][0]["unresolved_reference_ids"]
 
 
 @pytest.mark.parametrize(
@@ -556,6 +680,46 @@ def test_unprojected_hidden_reference_is_retained_with_native_reason(cad_case):
     ]
     assert rows[0]["state"] == "HIDDEN_NATIVE_REFERENCE"
     assert "native flags" in rows[0]["reason"]
+
+
+@pytest.mark.parametrize("cad_case", ["unselected_circle_divider"], indirect=True)
+def test_unrecognized_native_circle_divider_cannot_prove_negative_search(cad_case):
+    result = _build(cad_case)
+    component = result["receipt"]["components"][0]
+    rows = [r for r in component["reference_inventory"] if r["target_codes"] == ["EL-99"]]
+    assert len(rows) == 1
+    assert rows[0]["state"] == "UNRESOLVED_REFERENCE"
+    assert component["state"] == "REVIEW"
+    assert rows[0]["entity_id"] in result["context"]["searches"][0]["unresolved_reference_ids"]
+    claim = result["disposition_claims"]["synthetic-component"]
+    item = TakeoffItem(
+        sequence=1, component_id="synthetic-component", name="Synthetic", mt_code="MT-01",
+        evidence_ids=claim["elevation"]["evidence_ids"], view_dispositions=claim,
+    )
+    applicability = resolve_view_applicability(
+        item, "elevation", prepare_view_context(result["context"], "predicted")
+    )
+    assert applicability.state != "NOT_APPLICABLE"
+
+
+@pytest.mark.parametrize("filename", ["view_context_builder.py", "native_cut_paths.py"])
+def test_producer_code_drift_during_build_cannot_issue_receipt(cad_case, monkeypatch, filename):
+    from cadquote import view_context_builder as producer
+
+    real_hash = producer.sha256_file
+    reads = 0
+
+    def changing_hash(path):
+        nonlocal reads
+        if path.name == filename:
+            reads += 1
+            if reads > 1:
+                return "0" * 64
+        return real_hash(path)
+
+    monkeypatch.setattr(producer, "sha256_file", changing_hash)
+    with pytest.raises(ViewContextBuildError, match="producer code changed during build"):
+        _build(cad_case)
 
 
 @pytest.mark.parametrize("cad_case", ["outside_callout"], indirect=True)
