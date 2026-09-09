@@ -168,6 +168,11 @@ preserve prior predictions and evaluations, and label known-project regression h
 
 ## Additional pipeline metrics
 
+For standalone native view identity and source-bound semantic diagnostics, see
+[semantic-identity.md](semantic-identity.md). Their field diagnostics are not
+complete-row acceptance or replacements for the frozen policy and full-project
+omission/extra accounting below.
+
 ### Bounded current-CAD context producer
 
 The standalone producer accepts current index/panel files and target-free,

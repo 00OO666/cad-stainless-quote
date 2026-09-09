@@ -4,6 +4,28 @@
 
 ## 当前结论
 
+### Native view identity and independent semantic diagnostics
+
+A standalone native identity reader now resolves a selected viewport's owning
+page and local title from the original paper-space frame, attached attributes
+and title graphics. It distinguishes target local numbers from source direction
+markers and title return references. Unknown, hidden, overlapping and boundary
+ownership remain explicit instead of supplying a nearest-title fallback.
+
+A separate typed diagnostic preserves raw names, locations and view references
+while comparing independently reviewed native physical instances, quoted scope,
+room identity and target views. Its application-supplied replay boundary rejects
+self-approved sidecars, stale source/review artifacts, wrong-side provenance,
+cross-component claims, suffix conflicts and duplicate native instances. Optional
+wording must be independently supported and non-conflicting. Explicit trusted
+model judgments are disclosed, not authenticated by file hashes.
+
+These helpers do not replace the existing field evaluator or promote a takeoff
+row. New known-project corrections and semantic projections remain separate
+from old frozen predictions, policies and scores. Different component families
+are being examined without human-answer inputs; unsupported unfolding and
+estimating bases remain unavailable. The end-to-end 95% target is still unproven.
+
 ### Native-page references and explicit embedded-graphic review
 
 The bounded context producer now retains and classifies native references from
