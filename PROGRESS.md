@@ -1,8 +1,34 @@
 # 项目进度与接管入口
 
-更新时间：2026-09-09。本文只记录可公开的工程进展，不包含客户图纸、报价表、截图、实体标识、实测尺寸、私有路径或客户级评测明细。
+更新时间：2026-09-10。本文只记录可公开的工程进展，不包含客户图纸、报价表、截图、实体标识、实测尺寸、私有路径或客户级评测明细。
 
 ## 当前结论
+
+### Native material extents and post-freeze image comparison
+
+Private development now follows a bounded ceiling assembly from its native
+material leader through reciprocal section references. Nominal folded dimensions,
+steel net extents, surrounding opening dimensions and physical assembly counts
+are recorded separately. Opposite outline edges and repeated lamp symbols are
+not treated as extra assemblies. An independent native-CAD review supports the
+local measurement; the frozen prediction remains unchanged.
+
+Post-freeze comparison uses the human workbook's original embedded images to
+establish physical identity, not a nearest-quantity match. The private workbook
+retains original image bytes, source notes, live formulas and separate comparison
+data. Package/anchor/aspect checks and native spreadsheet read-only recalculation
+complement table previews whose renderer omits floating pictures.
+
+This is known-project development, not unseen validation or a whole-project
+acceptance result. Image-only reference metadata, ceiling-specific view
+applicability, full physical grouping and omitted assemblies remain unresolved
+evaluation/coverage work. No difficult reference rows were removed, and local
+numerical agreement is not reported as complete-row precision or recall.
+
+The current research also distinguishes mixed-material faces from small steel
+trim, and native dimension-style rounding from raw geometric measurements.
+This update publishes documentation only; customer sources and measurements
+remain private. The existing full-row acceptance target is unchanged.
 
 ### Lettered drawing identities and native closed paper frames
 
