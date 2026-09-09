@@ -46,6 +46,24 @@ paper DIMENSION/text/leader entities onto the bounded model render. Keep its
 transform and source/image hashes. Annotated browsing boards are useful guides,
 not replacements for original drawing annotations in final proof images.
 
+### Owning page versus nearby reciprocal title
+
+Preserve letter-suffixed page/view identities. A nearby numbered view title can
+refer back to another sheet; proximity alone does not establish its own page.
+Fresh indexing records native closed paper-frame geometry separately from the
+INSERT insertion-point bbox. Prefer an entire viewport contained by that frame
+and the same parent block's page attributes. The page text may be in a separate
+title-strip rectangle of that parent, outside the drawing rectangle itself.
+
+Inspect `paper_page_association_basis` and the native frame scan provenance.
+Conflicting or empty page slots, unsupported rotations, failed/truncated scans
+and layout/source mismatches must not borrow another valid page. Old bbox-only
+associations remain explicitly unverified. Ignored graphics mean absence of a
+supported frame is not proof that the CAD has no frame. Neither native page
+containment nor a unique reciprocal route confirms a physical component or a
+billable measurement. Rebuild the index/navigation in a new run after changes;
+preserve old prediction freezes and report any lost page coverage.
+
 ### Per-set casework and evidence-role consistency
 
 When the estimating scope explicitly permits a per-set stainless subassembly,

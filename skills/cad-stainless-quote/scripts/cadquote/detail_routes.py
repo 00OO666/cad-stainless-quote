@@ -16,6 +16,7 @@ from .linking import (
     normalize_reference_code,
 )
 from .materials import find_material_codes
+from .panels import _PAGE_NUMBER_TAG_RE, _frame_contains, _native_frame_boxes
 
 
 def _visible(entity):
@@ -63,31 +64,62 @@ def _contains(outer, inner):
 def _native_page_frames(native, groups, viewports):
     frames = []
     for entity in native:
-        if entity.entity_type != "INSERT" or not entity.bbox or not entity.handle:
+        if entity.entity_type != "INSERT" or not entity.handle:
+            continue
+        if "paper_frame_scan" in entity.geometry:
+            # A failed/empty native scan is not permission to reuse INSERT extents.
+            boxes = _native_frame_boxes(entity.geometry)
+            basis = "native_closed_paper_frame_contains_entire_viewport"
+        else:
+            # Compatibility with archived indexes, explicitly not verified frames.
+            boxes = [entity.bbox] if entity.bbox else []
+            basis = "legacy_insert_bbox_contains_entire_viewport_unverified"
+        if not boxes:
             continue
         members = groups.get(
             (entity.source_file_id, entity.sheet_id, entity.space, entity.handle), []
         )
         codes = {normalize_reference_code(e.text) for e in members if e.entity_type == "ATTRIB"}
         codes.discard(None)
-        if len(codes) != 1:
+        invalid_slots = (
+            [
+                e.id
+                for e in members
+                if e.entity_type == "ATTRIB"
+                and _PAGE_NUMBER_TAG_RE.fullmatch(str(e.geometry.get("tag") or ""))
+                and normalize_reference_code(e.text) is None
+            ]
+            if "paper_frame_scan" in entity.geometry
+            else []
+        )
+        if (not codes and not invalid_slots) or (
+            len(codes) != 1 and "paper_frame_scan" not in entity.geometry
+        ):
             continue
         contained = [
             v
             for v in viewports.values()
             if (v.source_file_id, v.space) == (entity.source_file_id, entity.space)
-            and _contains(entity.bbox, v.bbox)
+            and any(_frame_contains(box, v.bbox) for box in boxes)
         ]
         if contained:
-            frames.append(
+            frames.extend(
                 {
                     "entity": entity,
-                    "code": next(iter(codes)),
+                    "code": code,
+                    "frame_bboxes": boxes,
+                    "basis": basis,
+                    "invalid_page_slot_ids": invalid_slots,
                     "viewport_handles": {v.handle for v in contained},
-                    "code_entity_ids": sorted(
-                        e.id for e in members if normalize_reference_code(e.text) in codes
+                    "code_entity_ids": sorted(invalid_slots)
+                    if code is None
+                    else sorted(
+                        e.id
+                        for e in members
+                        if e.entity_type == "ATTRIB" and normalize_reference_code(e.text) == code
                     ),
                 }
+                for code in (sorted(codes) or [None])
             )
     return frames
 
@@ -149,17 +181,45 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
             and s.viewport_handle in f["viewport_handles"]
         ]
         if frame_matches:
-            codes = {f["code"] for f in frame_matches}
+            # Verified native evidence takes precedence over old insertion extents.
+            verified = [
+                f
+                for f in frame_matches
+                if f["basis"] == "native_closed_paper_frame_contains_entire_viewport"
+            ]
+            if verified:
+                frame_matches = verified
+            codes = {f["code"] for f in frame_matches if f["code"] is not None}
+            invalid_slots = sorted({i for f in frame_matches for i in f["invalid_page_slot_ids"]})
             page_recovery[s.id] = {
                 "original_drawing_number": s.drawing_number,
                 "original_kind": s.kind,
                 "candidate_page_codes": sorted(codes),
-                "frame_handles": sorted(f["entity"].handle for f in frame_matches),
-                "frame_bboxes": [list(f["entity"].bbox) for f in frame_matches],
+                "frame_handles": sorted({f["entity"].handle for f in frame_matches}),
+                "frame_bboxes": [
+                    list(box)
+                    for box in sorted(
+                        {tuple(box) for f in frame_matches for box in f["frame_bboxes"]}
+                    )
+                ],
+                "frame_source_handles": sorted(
+                    {
+                        str(handle)
+                        for f in frame_matches
+                        for rectangle in f["entity"]
+                        .geometry.get("paper_frame_scan", {})
+                        .get("rectangles", [])
+                        for handle in rectangle["source_handles"]
+                    }
+                ),
                 "code_entity_ids": sorted({i for f in frame_matches for i in f["code_entity_ids"]}),
-                "state": "CANDIDATE",
-                "conflict": len(codes) != 1,
-                "basis": "native_title_block_contains_entire_viewport",
+                "state": "UNRESOLVED" if invalid_slots or len(codes) != 1 else "CANDIDATE",
+                "conflict": bool(invalid_slots) or len(codes) != 1,
+                "invalid_page_slot_ids": invalid_slots,
+                "issues": ["UNPARSEABLE_OR_AMBIGUOUS_PAGE_NUMBER"] if invalid_slots else [],
+                "blocks_stale_page_fallback": bool(invalid_slots) or len(codes) != 1,
+                "basis": frame_matches[0]["basis"],
+                "frame_geometry_verified": bool(verified),
             }
             for code in sorted(codes):
                 details_by_code[code].append(s)
@@ -226,8 +286,8 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
         # Include outgoing references even if the target page was not recovered.
         source_recovery = page_recovery.get(source.id)
         source_code = (
-            source_recovery["candidate_page_codes"][0]
-            if source_recovery and not source_recovery["conflict"]
+            (None if source_recovery["conflict"] else source_recovery["candidate_page_codes"][0])
+            if source_recovery
             else normalize_reference_code(source.drawing_number)
         )
         original_source_code = normalize_reference_code(source.drawing_number)
@@ -247,6 +307,7 @@ def build_detail_routes(sheets, entities, native_entities, *, max_title_gap_rati
                 p
                 for p in refs_by_panel[target.id]
                 if reference_role == "VIEW_TITLE_BACK_REFERENCE"
+                and not page_recovery.get(target.id, {}).get("conflict")
                 and p.code == source_code
                 and p.view_number == ref.view_number
             ]
@@ -466,19 +527,39 @@ def detail_routes_markdown(routes):
             + " |"
         )
     if "node_view_groups" in routes:
-        lines.extend(["", "## 完整节点视图组（独立于旧单视口判断）", "",
-                      "组图不等于一个物理构件；编号/回指矛盾与新歧义不会沿用旧单视口选择。", "",
-                      "| 来源页 | 目标页/小图 | 组导航状态 | 视口组；标题回指 |",
-                      "|---|---|---|---|"])
+        lines.extend(
+            [
+                "",
+                "## 完整节点视图组（独立于旧单视口判断）",
+                "",
+                "组图不等于一个物理构件；编号/回指矛盾与新歧义不会沿用旧单视口选择。",
+                "",
+                "| 来源页 | 目标页/小图 | 组导航状态 | 视口组；标题回指 |",
+                "|---|---|---|---|",
+            ]
+        )
         for r in routes["records"]:
             if r.get("reference_role") != "OUTGOING_CALLOUT":
                 continue
             candidates = "；".join(
                 ",".join(c["viewport_handles"]) + " / " + c["back_reference"]
-                for c in r.get("detail_group_candidates", []))
-            lines.append("| " + " | ".join(map(cell, [r.get("resolved_source_page"),
-                f"{r['target_page']} / {r['target_view']}", r.get("group_navigation_state"),
-                candidates])) + " |")
+                for c in r.get("detail_group_candidates", [])
+            )
+            lines.append(
+                "| "
+                + " | ".join(
+                    map(
+                        cell,
+                        [
+                            r.get("resolved_source_page"),
+                            f"{r['target_page']} / {r['target_view']}",
+                            r.get("group_navigation_state"),
+                            candidates,
+                        ],
+                    )
+                )
+                + " |"
+            )
     lines.extend(
         [
             "",

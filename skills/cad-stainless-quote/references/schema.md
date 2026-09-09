@@ -353,6 +353,30 @@ The required business columns are:
 
 Additional sheets store entity-level evidence, unresolved issues, price provenance, and run metadata.
 
+## Native paper-frame geometry
+
+Fresh DXF indexing attaches `CadEntity.geometry.paper_frame_scan` to native
+paper-space INSERTs with attributes. Schema `native-paper-frame/1` records
+`complete`, `completeness_scope`, `issues`, traversal limits/diagnostics and
+`rectangles` with WCS `bbox`, `corners`, native `source_handles` and nested
+`source_handle_chains`. The original INSERT `bbox` retains its insertion-point
+semantics; it is not a sheet frame.
+
+Only supported visible closed, axis-aligned line/polyline rectangles establish
+geometric containment candidates. Ignored OLE/proxy/text types are inventoried;
+completeness applies to supported frame primitives, not every possible graphic.
+An incomplete/failed scan cannot supply frame ownership. A native rectangle
+containing an entire viewport plus the same parent INSERT's page attributes
+provides page-navigation evidence, never material, dimension or quantity PASS.
+The page attribute may lie in the parent's separate title strip. Conflicting or
+unparseable page slots stay unresolved. Legacy non-native bbox associations are
+explicitly unverified and must not be described as recovered closed frames.
+
+Drawing numbers and local view numbers preserve a trailing ASCII letter as
+identity. Lettered ranges do not imply intermediate sheets, and invalid
+continuations must not create shorter aliases. Rebuild derived navigation after
+parser/frame changes; resuming a historical index cannot add absent geometry.
+
 ## Candidate-gold workbook import
 
 `gold-import` schema `1.1` keeps the canonical `TakeoffItem` separate from source-only

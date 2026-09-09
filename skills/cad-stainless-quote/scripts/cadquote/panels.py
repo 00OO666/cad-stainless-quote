@@ -75,10 +75,7 @@ def _intersects(left: BBox | None, right: BBox) -> bool:
     if left is None:
         return False
     return (
-        left[0] <= right[2]
-        and left[2] >= right[0]
-        and left[1] <= right[3]
-        and left[3] >= right[1]
+        left[0] <= right[2] and left[2] >= right[0] and left[1] <= right[3] and left[3] >= right[1]
     )
 
 
@@ -158,11 +155,7 @@ class _PaperToModelTransform:
         return cls(paper_box, model_box, scale_x, scale_y)
 
     def point(self, value: Sequence[Any] | None) -> list[float] | None:
-        if (
-            not isinstance(value, Sequence)
-            or isinstance(value, (str, bytes))
-            or len(value) < 2
-        ):
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) < 2:
             return None
         try:
             x, y = float(value[0]), float(value[1])
@@ -258,11 +251,24 @@ class _ViewportPanelSpec:
 
 @dataclass(frozen=True, slots=True)
 class _PaperPageReference:
-    code: str
+    code: str | None
     point: tuple[float, float]
     entity_id: str
     space: str
     title_texts: tuple[str, ...]
+    parent_handle: str | None = None
+    raw_text: str = ""
+    issue: str | None = None
+    source_file_id: str | None = None
+    frame_boxes: tuple[BBox, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _PaperPageSelection:
+    reference: _PaperPageReference | None
+    basis: str
+    blocks_fallback: bool = False
+    candidate_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +302,10 @@ _GENERIC_VIEW_TITLE_RE = re.compile(
     r"平面|立面|节点|大样|详图|剖面)$",
     re.I,
 )
+_PAGE_NUMBER_TAG_RE = re.compile(
+    r"^(?:(?:SHEET|DRAWING|DWG|PAGE)[_ -]?(?:NO|NUMBER|NUM)|图号|页码|图纸编号)$",
+    re.I,
+)
 
 
 def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPageReference]:
@@ -308,34 +318,57 @@ def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPa
     sibling sheet title and excluding explicitly named callout/index blocks.
     """
 
-    by_handle = {entity.handle: entity for entity in paper_entities if entity.handle}
+    by_handle = {
+        (entity.source_file_id, entity.space, entity.handle): entity
+        for entity in paper_entities
+        if entity.handle
+    }
     output: list[_PaperPageReference] = []
     for entity in paper_entities:
-        if entity.entity_type != "ATTRIB" or not entity.text:
+        if entity.entity_type != "ATTRIB" or entity.geometry.get("semantic_hidden"):
+            continue
+        # Retain an unparseable explicit page-number slot. Dropping it would
+        # let the neighbouring page become the apparent nearest valid title.
+        explicit_number_slot = bool(
+            _PAGE_NUMBER_TAG_RE.fullmatch(str(entity.geometry.get("tag") or ""))
+        )
+        if not entity.text and not explicit_number_slot:
             continue
         extracted_codes = extract_reference_codes(entity.text)
-        specificity = max(
-            ((code.count("-"), len(code)) for code in extracted_codes),
-            default=None,
-        )
-        codes = sorted(
-            code
-            for code in extracted_codes
-            if (code.count("-"), len(code)) == specificity
-        )
-        if len(codes) != 1:
+        # Extraction already suppresses substrings of longer code tokens.
+        # Distinct complete codes (including letter variants) are conflicts,
+        # not alternative spellings to discard by length or prefix depth.
+        codes = sorted(extracted_codes)
+        if not codes and not explicit_number_slot:
             continue
         parent_handle = entity.geometry.get("parent_insert_handle")
-        parent = by_handle.get(str(parent_handle)) if parent_handle else None
-        if parent is None or parent.entity_type != "INSERT":
+        parent = (
+            by_handle.get((entity.source_file_id, entity.space, str(parent_handle)))
+            if parent_handle
+            else None
+        )
+        if (
+            parent is None
+            or parent.entity_type != "INSERT"
+            or parent.geometry.get("semantic_hidden")
+        ):
+            continue
+        if (parent.source_file_id, parent.space) != (entity.source_file_id, entity.space):
             continue
         parent_name = str(parent.geometry.get("name") or "")
         if _CALLOUT_BLOCK_RE.search(parent_name):
             continue
         sibling_texts: list[str] = []
         for handle in parent.geometry.get("attribute_handles") or []:
-            sibling = by_handle.get(str(handle))
-            if sibling is not None and sibling.text and sibling.id != entity.id:
+            sibling = by_handle.get((entity.source_file_id, entity.space, str(handle)))
+            if (
+                sibling is not None
+                and sibling.text
+                and sibling.id != entity.id
+                and not sibling.geometry.get("semantic_hidden")
+                and sibling.geometry.get("parent_insert_handle") == parent.handle
+                and (sibling.source_file_id, sibling.space) == (parent.source_file_id, parent.space)
+            ):
                 sibling_texts.append(sibling.text)
         title_texts = tuple(
             dict.fromkeys(text for text in sibling_texts if _SHEET_TITLE_RE.search(text))
@@ -347,29 +380,134 @@ def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPa
             continue
         output.append(
             _PaperPageReference(
-                code=codes[0],
+                code=codes[0] if len(codes) == 1 else None,
                 point=point,
                 entity_id=entity.id,
                 space=entity.space,
                 title_texts=title_texts,
+                parent_handle=parent.handle,
+                raw_text=entity.text or "",
+                issue=None if len(codes) == 1 else "UNPARSEABLE_OR_AMBIGUOUS_PAGE_NUMBER",
+                source_file_id=entity.source_file_id,
+                frame_boxes=tuple(_native_frame_boxes(parent.geometry)),
             )
         )
-    return sorted(output, key=lambda value: (value.space, value.code, value.entity_id))
+    return sorted(output, key=lambda value: (value.space, value.code or "", value.entity_id))
+
+
+def _native_frame_boxes(geometry: Mapping[str, Any]) -> list[BBox]:
+    """Read explicit closed-frame geometry, never the INSERT insertion bbox."""
+    scan = geometry.get("paper_frame_scan")
+    if not isinstance(scan, Mapping) or scan.get("schema") != "native-paper-frame/1":
+        return []
+    if scan.get("complete") is not True or scan.get("issues"):
+        return []
+    rectangles = scan.get("rectangles")
+    if not isinstance(rectangles, list):
+        return []
+    boxes = []
+    for rectangle in rectangles:
+        if not isinstance(rectangle, Mapping) or not rectangle.get("source_handles"):
+            return []
+        if rectangle.get("axis_aligned") is False:
+            continue
+        box = _as_bbox(rectangle.get("bbox"))
+        if box is None or not all(math.isfinite(value) for value in box):
+            return []
+        boxes.append(box)
+    return sorted(set(boxes))
+
+
+def _frame_contains(outer: BBox, inner: BBox) -> bool:
+    # Only numeric round-off tolerance, not a configurable near-frame radius.
+    epsilon = max(outer[2] - outer[0], outer[3] - outer[1]) * 1e-8
+    return (
+        outer[0] - epsilon <= inner[0] <= inner[2] <= outer[2] + epsilon
+        and outer[1] - epsilon <= inner[1] <= inner[3] <= outer[3] + epsilon
+    )
 
 
 def _nearest_page_reference(
     viewport: CadEntity,
     references: Sequence[_PaperPageReference],
 ) -> _PaperPageReference | None:
+    """Compatibility wrapper; unresolved selections must not expose a page code."""
+    return _select_page_reference(viewport, references).reference
+
+
+def _select_page_reference(
+    viewport: CadEntity,
+    references: Sequence[_PaperPageReference],
+) -> _PaperPageSelection:
+    """Bounded title association, not verified page-frame or component ownership.
+
+    Indexed INSERT boxes may be insertion points, not native paper frames. Use
+    local directional candidates conservatively and preserve missing/ambiguous
+    number slots so a parser failure cannot silently borrow a different page.
+    """
     point = _entity_center(viewport)
     if point is None:
-        return None
-    candidates = [value for value in references if value.space == viewport.space]
+        return _PaperPageSelection(None, "MISSING_VIEWPORT_LOCATION", True)
+    candidates = [
+        value
+        for value in references
+        if value.space == viewport.space
+        and (value.source_file_id is None or value.source_file_id == viewport.source_file_id)
+    ]
     if not candidates:
-        return None
-    if viewport.bbox is not None:
+        return _PaperPageSelection(None, "NO_STRUCTURED_PAGE_SLOT")
+    all_local_layout = candidates
+    paper_box = _as_bbox(viewport.bbox)
+    if paper_box is not None and all(math.isfinite(v) for v in paper_box):
+        contained = [
+            value
+            for value in candidates
+            if any(_frame_contains(box, paper_box) for box in value.frame_boxes)
+        ]
+        if contained:
+            # A local view title can carry a reciprocal code, but its small
+            # annotation frame cannot own the whole physical drawing viewport.
+            # No lexical or area preference may hide conflicting owner frames.
+            results = [
+                _page_slot_result(v, candidates, "NATIVE_CLOSED_FRAME_CONTAINS_VIEWPORT")
+                for v in contained
+            ]
+            if (
+                any(result.blocks_fallback for result in results)
+                or len({v.code for v in contained}) != 1
+            ):
+                return _PaperPageSelection(
+                    None,
+                    "CONFLICTING_OR_UNPARSEABLE_NATIVE_PAGE_FRAMES",
+                    True,
+                    tuple(sorted({i for result in results for i in result.candidate_ids})),
+                )
+            winner = min(contained, key=lambda value: value.entity_id)
+            return _PaperPageSelection(
+                winner,
+                "NATIVE_CLOSED_FRAME_CONTAINS_VIEWPORT",
+                False,
+                tuple(sorted(v.entity_id for v in contained)),
+            )
         width = viewport.bbox[2] - viewport.bbox[0]
         height = viewport.bbox[3] - viewport.bbox[1]
+        candidates = [
+            value
+            for value in candidates
+            if viewport.bbox[0] - max(5.0, width * 0.08)
+            <= value.point[0]
+            <= viewport.bbox[2] + max(5.0, width)
+            and viewport.bbox[1] - max(5.0, height)
+            <= value.point[1]
+            <= viewport.bbox[3] + max(5.0, height * 0.20)
+        ]
+        if not candidates:
+            return _PaperPageSelection(
+                None,
+                "NO_LOCAL_PAGE_SLOT",
+                True,
+                tuple(sorted(v.entity_id for v in all_local_layout)),
+            )
         # Some authoring files place many complete paper sheets side-by-side
         # under one very wide viewport.  Their title blocks form a horizontal
         # sequence just below the viewport.  The panel begins with the
@@ -378,20 +516,29 @@ def _nearest_page_reference(
         horizontal_band = [
             value
             for value in candidates
-            if viewport.bbox[0] <= value.point[0]
-            <= viewport.bbox[2] + max(5.0, width * 0.03)
-            and viewport.bbox[1] - max(300.0, height * 0.75)
+            if viewport.bbox[0] <= value.point[0] <= viewport.bbox[2] + max(5.0, width * 0.03)
+            and viewport.bbox[1] - max(5.0, height * 0.75)
             <= value.point[1]
             <= viewport.bbox[3] + max(30.0, height * 0.20)
         ]
-        distinct_codes = {value.code for value in horizontal_band}
-        if len(distinct_codes) >= 2:
+        # Count positioned title slots, including unparseable ones. Requiring
+        # two *valid codes* skips the first missing page and borrows the next.
+        distinct_slots = {
+            (value.parent_handle or value.entity_id, value.point) for value in horizontal_band
+        }
+        if width >= height * 2.0 and len(distinct_slots) >= 2:
             x_values = [value.point[0] for value in horizontal_band]
             if max(x_values) - min(x_values) >= max(5.0, width * 0.10):
-                return min(
+                winner = min(
                     horizontal_band,
-                    key=lambda value: (value.point[0], value.point[1], value.code, value.entity_id),
+                    key=lambda value: (
+                        value.point[0],
+                        value.point[1],
+                        value.code or "",
+                        value.entity_id,
+                    ),
                 )
+                return _page_slot_result(winner, all_local_layout, "WIDE_PAGE_BAND_CANDIDATE")
         # Conventional title blocks sit at the lower-right of the represented
         # drawing area. Prefer that directional relationship before raw nearest
         # distance; otherwise a viewport near a page boundary can be assigned
@@ -404,14 +551,50 @@ def _nearest_page_reference(
         ]
         if directional:
             candidates = directional
-    return min(
+    else:
+        return _PaperPageSelection(None, "MISSING_VIEWPORT_EXTENT", True)
+    ordered = sorted(
         candidates,
         key=lambda value: (
             math.hypot(value.point[0] - point[0], value.point[1] - point[1]),
-            value.code,
+            value.code or "",
             value.entity_id,
         ),
     )
+    winner = ordered[0]
+    slot_result = _page_slot_result(winner, all_local_layout, "BOUNDED_DIRECTIONAL_PAGE_CANDIDATE")
+    if slot_result.blocks_fallback:
+        return slot_result
+    distance = math.hypot(winner.point[0] - point[0], winner.point[1] - point[1])
+    near_ties = [
+        v
+        for v in ordered
+        if abs(math.hypot(v.point[0] - point[0], v.point[1] - point[1]) - distance)
+        <= max(1e-6, math.hypot(width, height) * 0.01)
+    ]
+    if len({v.code for v in near_ties}) > 1:
+        return _PaperPageSelection(
+            None, "AMBIGUOUS_LOCAL_PAGE_SLOTS", True, tuple(sorted(v.entity_id for v in near_ties))
+        )
+    return slot_result
+
+
+def _page_slot_result(
+    winner: _PaperPageReference,
+    layout_references: Sequence[_PaperPageReference],
+    basis: str,
+) -> _PaperPageSelection:
+    siblings = [
+        v
+        for v in layout_references
+        if winner.parent_handle and v.parent_handle == winner.parent_handle
+    ] or [winner]
+    ids = tuple(sorted(v.entity_id for v in siblings))
+    if not winner.code or winner.issue:
+        return _PaperPageSelection(None, winner.issue or "MISSING_PAGE_NUMBER", True, ids)
+    if any(not v.code or v.issue for v in siblings) or len({v.code for v in siblings}) != 1:
+        return _PaperPageSelection(None, "CONFLICTING_TITLE_BLOCK_PAGE_NUMBERS", True, ids)
+    return _PaperPageSelection(winner, basis, False, ids)
 
 
 def _paper_entity_owner(
@@ -511,11 +694,7 @@ def _paper_annotation_radius(entities: Sequence[CadEntity]) -> dict[str, float]:
 def _leader_label_point(entity: CadEntity) -> tuple[float, float] | None:
     for key in ("label_point", "landing", "landing_point", "text_location", "text_point"):
         raw = entity.geometry.get(key)
-        if (
-            isinstance(raw, Sequence)
-            and not isinstance(raw, (str, bytes))
-            and len(raw) >= 2
-        ):
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) and len(raw) >= 2:
             try:
                 return float(raw[0]), float(raw[1])
             except (TypeError, ValueError):
@@ -523,11 +702,7 @@ def _leader_label_point(entity: CadEntity) -> tuple[float, float] | None:
     raw_vertices = entity.geometry.get("vertices") or entity.geometry.get("points")
     if isinstance(raw_vertices, Sequence) and not isinstance(raw_vertices, (str, bytes)):
         for raw in reversed(raw_vertices):
-            if (
-                isinstance(raw, Sequence)
-                and not isinstance(raw, (str, bytes))
-                and len(raw) >= 2
-            ):
+            if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) and len(raw) >= 2:
                 try:
                     return float(raw[0]), float(raw[1])
                 except (TypeError, ValueError):
@@ -538,11 +713,7 @@ def _leader_label_point(entity: CadEntity) -> tuple[float, float] | None:
 def _leader_arrow_point(entity: CadEntity) -> tuple[float, float] | None:
     for key in ("leader_target", "target", "arrowhead", "arrow_point", "arrow", "tip"):
         raw = entity.geometry.get(key)
-        if (
-            isinstance(raw, Sequence)
-            and not isinstance(raw, (str, bytes))
-            and len(raw) >= 2
-        ):
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) and len(raw) >= 2:
             try:
                 return float(raw[0]), float(raw[1])
             except (TypeError, ValueError):
@@ -550,11 +721,7 @@ def _leader_arrow_point(entity: CadEntity) -> tuple[float, float] | None:
     raw_vertices = entity.geometry.get("vertices") or entity.geometry.get("points")
     if isinstance(raw_vertices, Sequence) and not isinstance(raw_vertices, (str, bytes)):
         for raw in raw_vertices:
-            if (
-                isinstance(raw, Sequence)
-                and not isinstance(raw, (str, bytes))
-                and len(raw) >= 2
-            ):
+            if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) and len(raw) >= 2:
                 try:
                     return float(raw[0]), float(raw[1])
                 except (TypeError, ValueError):
@@ -746,6 +913,10 @@ def _paper_title_texts(viewport: CadEntity, paper_entities: Sequence[CadEntity])
     )
     candidates: list[tuple[float, str]] = []
     for entity in paper_entities:
+        if (entity.source_file_id, entity.space) != (viewport.source_file_id, viewport.space):
+            continue
+        if entity.geometry.get("semantic_hidden"):
+            continue
         if not entity.text or not _entity_in_box(entity, search):
             continue
         center_y = (
@@ -785,6 +956,10 @@ def _paper_primary_view_titles(
     )
     candidates: list[tuple[float, float, str, str]] = []
     for entity in paper_entities:
+        if (entity.source_file_id, entity.space) != (viewport.source_file_id, viewport.space):
+            continue
+        if entity.geometry.get("semantic_hidden"):
+            continue
         if entity.entity_type != "ATTRIB" or not entity.text:
             continue
         if not _entity_in_box(entity, search) or not _SHEET_TITLE_RE.search(entity.text):
@@ -862,7 +1037,7 @@ class _LocalViewAnchor:
 
 
 _LOCAL_ELEVATION_CODE_RE = re.compile(
-    r"^(?P<prefix>.*(?:^|[-_])(?:EL|E)[-_])(?P<number>\d+)$",
+    r"^(?P<prefix>.*(?:^|[-_])(?:EL|E)[-_])(?P<number>\d+)(?P<suffix>[A-Z]?)$",
     re.I,
 )
 
@@ -912,11 +1087,7 @@ def _local_view_anchors(
             continue
         specificity = max((code.count("-"), len(code)) for code in codes)
         specific_codes = sorted(
-            {
-                code
-                for code in codes
-                if (code.count("-"), len(code)) == specificity
-            }
+            {code for code in codes if (code.count("-"), len(code)) == specificity}
         )
         if len(specific_codes) != 1:
             continue
@@ -1013,10 +1184,14 @@ def _prepend_parent_page_anchor(
         return ordered
 
     parent_match = _LOCAL_ELEVATION_CODE_RE.fullmatch(parent_code)
-    first_match = _LOCAL_ELEVATION_CODE_RE.fullmatch(
-        ordered[0].code.upper().replace("_", "-")
-    )
+    first_match = _LOCAL_ELEVATION_CODE_RE.fullmatch(ordered[0].code.upper().replace("_", "-"))
     if parent_match is None or first_match is None:
+        return ordered
+    # Lettered pages are explicit identities, not a numeric predecessor rule.
+    # Preserve their native anchors; do not infer a missing lettered/base page.
+    if parent_match.group("suffix") or any(
+        re.search(r"\d[A-Z]$", anchor.code, re.I) for anchor in ordered
+    ):
         return ordered
     parent_prefix = parent_match.group("prefix").upper().replace("_", "-")
     first_prefix = first_match.group("prefix").upper().replace("_", "-")
@@ -1032,11 +1207,7 @@ def _prepend_parent_page_anchor(
             continue
         payload = evidence[len(marker) :]
         code, separator, entity_id = payload.partition("@")
-        if (
-            separator
-            and code.strip().upper().replace("_", "-") == parent_code
-            and entity_id
-        ):
+        if separator and code.strip().upper().replace("_", "-") == parent_code and entity_id:
             reference_entity_ids.append(entity_id)
     if not reference_entity_ids:
         return ordered
@@ -1091,7 +1262,12 @@ def _inherit_orphan_panel_page_codes(sheets: Sequence[Sheet]) -> list[Sheet]:
     ]
     output: list[Sheet] = []
     for sheet in sheets:
-        if sheet.drawing_number or sheet.bbox is None or sheet.kind != "elevation":
+        if (
+            sheet.drawing_number
+            or sheet.bbox is None
+            or sheet.kind != "elevation"
+            or any(value.startswith("paper_page_reference_unresolved:") for value in sheet.evidence)
+        ):
             output.append(sheet)
             continue
         center_x = (sheet.bbox[0] + sheet.bbox[2]) / 2
@@ -1113,8 +1289,7 @@ def _inherit_orphan_panel_page_codes(sheets: Sequence[Sheet]) -> list[Sheet]:
             key=lambda candidate: (
                 _vertical_gap(sheet.bbox, candidate.bbox),  # type: ignore[arg-type]
                 abs(
-                    center_x
-                    - (candidate.bbox[0] + candidate.bbox[2]) / 2  # type: ignore[index]
+                    center_x - (candidate.bbox[0] + candidate.bbox[2]) / 2  # type: ignore[index]
                 ),
                 candidate.id,
             ),
@@ -1214,9 +1389,7 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
         # code.  The arrow target owns the unit; otherwise a label just left of
         # a recovered-sheet boundary can be assigned to the neighbouring page
         # while pointing into the correct page.
-        entity_by_handle = {
-            entity.handle: entity for entity in panel_entities if entity.handle
-        }
+        entity_by_handle = {entity.handle: entity for entity in panel_entities if entity.handle}
         text_by_space: dict[str, list[CadEntity]] = defaultdict(list)
         for entity in panel_entities:
             if entity.entity_type in {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"} and entity.text:
@@ -1231,9 +1404,7 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
             winner = owner_for_x(target[0])
             owner_by_entity[leader.id] = winner
             annotation_handle = leader.geometry.get("annotation_handle")
-            annotation = (
-                entity_by_handle.get(str(annotation_handle)) if annotation_handle else None
-            )
+            annotation = entity_by_handle.get(str(annotation_handle)) if annotation_handle else None
             if annotation is None:
                 label_point = _leader_label_point(leader)
                 radius = radii.get(leader.space, 80.0)
@@ -1258,16 +1429,13 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
         x0, y0, x1, y1 = panel.bbox
         boundaries = [x0]
         boundaries.extend(
-            (left.x + right.x) / 2
-            for left, right in zip(anchors, anchors[1:], strict=False)
+            (left.x + right.x) / 2 for left, right in zip(anchors, anchors[1:], strict=False)
         )
         boundaries.append(x1)
         for index, anchor in enumerate(anchors):
             child_id = _stable_id("subview", panel.id, anchor.code, round(anchor.x, 6))
             child_entities = [
-                entity
-                for entity in panel_entities
-                if owner_by_entity.get(entity.id) == index
+                entity for entity in panel_entities if owner_by_entity.get(entity.id) == index
             ]
             child = panel.model_copy(
                 update={
@@ -1309,9 +1477,7 @@ def split_local_drawing_panels(expansion: PanelExpansion) -> PanelExpansion:
 
     expansion.sheets = _inherit_orphan_panel_page_codes(output_sheets)
     expansion.entities = output_entities
-    expansion.source_panel_counts = dict(
-        Counter(sheet.source_file_id for sheet in output_sheets)
-    )
+    expansion.source_panel_counts = dict(Counter(sheet.source_file_id for sheet in output_sheets))
     return expansion
 
 
@@ -1344,9 +1510,7 @@ def expand_viewport_panels(
         # by model bbox alone discards one viewport and its distinct paper
         # annotations (often the only elevation-index callouts).  Only collapse
         # viewports that overlap in both paper and model coordinates.
-        seen_views: set[
-            tuple[str, tuple[float, ...], tuple[float, ...] | tuple[str]]
-        ] = set()
+        seen_views: set[tuple[str, tuple[float, ...], tuple[float, ...] | tuple[str]]] = set()
         specs: list[_ViewportPanelSpec] = []
         for viewport in sorted(viewports, key=lambda entity: (entity.space, entity.id)):
             viewport_id = viewport.geometry.get("viewport_id")
@@ -1387,7 +1551,12 @@ def expand_viewport_panels(
             viewport = spec.viewport
             model_box = spec.model_box
             paper_layout = viewport.space.removeprefix("paper:")
-            page_reference = _nearest_page_reference(viewport, page_references)
+            page_selection = _select_page_reference(viewport, page_references)
+            page_reference = page_selection.reference
+            if page_selection.blocks_fallback:
+                output.warnings.append(
+                    f"{viewport.id}: unresolved paper page number ({page_selection.basis})"
+                )
             title_texts = _paper_title_texts(viewport, paper_entities)
             primary_title_texts = _paper_primary_view_titles(viewport, paper_entities)
             if page_reference is not None:
@@ -1396,12 +1565,9 @@ def expand_viewport_panels(
             selected_paper = [
                 entity
                 for entity in paper_entities
-                if entity.entity_type != "VIEWPORT"
-                and paper_owners.get(entity.id) == viewport.id
+                if entity.entity_type != "VIEWPORT" and paper_owners.get(entity.id) == viewport.id
             ]
-            semantic_texts = [
-                entity.text for entity in [*selected, *selected_paper] if entity.text
-            ]
+            semantic_texts = [entity.text for entity in [*selected, *selected_paper] if entity.text]
             filename = Path(source_names.get(source_id, source_id)).name
             classification = classify_sheet(
                 filename,
@@ -1436,6 +1602,8 @@ def expand_viewport_panels(
                 drawing_number=(
                     page_reference.code
                     if page_reference is not None
+                    else None
+                    if page_selection.blocks_fallback
                     else classification.drawing_number
                 ),
                 title=title,
@@ -1449,12 +1617,32 @@ def expand_viewport_panels(
                     f"virtual_panel:{viewport.id}",
                     f"selected_entities:{len(selected)}",
                     f"selected_paper_entities:{len(selected_paper)}",
+                    f"paper_page_association_basis:{page_selection.basis}",
                     *(
                         [
-                            f"paper_page_reference:{page_reference.code}"
-                            f"@{page_reference.entity_id}"
+                            "paper_page_reference_unresolved:"
+                            + page_selection.basis
+                            + "@"
+                            + ",".join(page_selection.candidate_ids)
+                        ]
+                        if page_selection.blocks_fallback
+                        else []
+                    ),
+                    *(
+                        [f"paper_page_reference:{page_reference.code}@{page_reference.entity_id}"]
+                        if page_reference is not None
+                        else []
+                    ),
+                    *(
+                        [
+                            f"paper_page_closed_frame:{','.join(map(str, box))}"
+                            f"@{page_reference.parent_handle}"
+                            for box in page_reference.frame_boxes
+                            if _frame_contains(box, spec.transform.paper_box)
                         ]
                         if page_reference is not None
+                        and spec.transform is not None
+                        and page_selection.basis == "NATIVE_CLOSED_FRAME_CONTAINS_VIEWPORT"
                         else []
                     ),
                 ],
@@ -1528,10 +1716,7 @@ def choose_analysis_view(
         entity
         for entity in original_entities
         if entity.source_file_id not in panel_sources
-        or (
-            entity.id not in represented_original_ids
-            and entity.entity_type != "VIEWPORT"
-        )
+        or (entity.id not in represented_original_ids and entity.entity_type != "VIEWPORT")
     ]
     required_sheet_ids = {entity.sheet_id for entity in fallback_entities if entity.sheet_id}
     sheets = list(expansion.sheets)

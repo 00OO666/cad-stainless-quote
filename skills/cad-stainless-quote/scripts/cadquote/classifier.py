@@ -9,6 +9,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .linking import (
+    _COMPACT_REF_RE,
+    _RANGE_RE,
+    _REF_RE,
+    normalize_reference_code,
+    reference_token_is_bounded,
+)
+
 
 @dataclass(slots=True)
 class ClassificationResult:
@@ -70,15 +78,15 @@ _RULES: tuple[_Rule, ...] = (
     _rule("plan", r"(?<![A-Z0-9])P-?\d{1,3}(?!\d)", 1.2, "P类图号"),
 )
 
+_LABELED_DRAWING_NUMBER_RE = re.compile(
+    r"(?<![A-Z0-9])(?:图号|DRAWING\s*(?:NO\.?|NUMBER))\s*[:：]?\s*([A-Z0-9._:/\\-]+)",
+    re.I,
+)
 _DRAWING_NUMBER_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(
-        r"(?<![A-Z0-9])"
-        r"([A-Z0-9]{1,4}(?:-[A-Z0-9]{1,4})?-\d{1,3}"
-        r"(?:\s*[~～至]\s*(?:[A-Z0-9]{1,4}(?:-[A-Z0-9]{1,4})?-)?\d{1,3})?)"
-        r"(?!\d)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:图号|DRAWING\s*(?:NO\.?|NUMBER))\s*[:：]?\s*([A-Z0-9._/-]+)", re.IGNORECASE),
+    # Keep the lexical contract shared with reference extraction, including
+    # compact families; wrapping preserves group 1 as the complete raw token.
+    re.compile(f"({_RANGE_RE.pattern}|{_REF_RE.pattern}|{_COMPACT_REF_RE.pattern})", re.I),
+    _LABELED_DRAWING_NUMBER_RE,
 )
 
 _DETAIL_VIEW_RE = re.compile(r"节点|大样|详图|剖面|DETAIL|SECTION", re.IGNORECASE)
@@ -105,14 +113,26 @@ def extract_drawing_number(values: Iterable[str]) -> str | None:
     for value in values:
         text = normalize_text(value).upper()
         for pattern in _DRAWING_NUMBER_PATTERNS:
-            match = pattern.search(text)
-            if match:
+            for match in pattern.finditer(text):
+                # An explicit label supplies the left delimiter even without
+                # whitespace after its colon; the value's right edge must
+                # still reject connected extra segments.
+                start = match.start() if pattern is _LABELED_DRAWING_NUMBER_RE else match.start(1)
+                if not reference_token_is_bounded(text, start, match.end(1)):
+                    continue
                 candidate = re.sub(r"\s+", "", match.group(1))
-                if re.match(r"MT[-_/]", candidate, re.IGNORECASE):
+                endpoints = re.split(r"[~～至]", candidate)
+                first_code = normalize_reference_code(endpoints[0])
+                if first_code is None:
                     continue
-                prefix = candidate.split("~", 1)[0].rsplit("-", 1)[0]
-                if not re.search(r"[A-Z]", prefix, re.IGNORECASE):
-                    continue
+                if len(endpoints) == 2:
+                    last = endpoints[1]
+                    if re.fullmatch(r"\d{1,4}[A-Z]?", last):
+                        last = f"{first_code.rsplit('-', 1)[0]}-{last}"
+                    if normalize_reference_code(last) is None:
+                        continue
+                # Keep historical numeric spelling/range display, while using
+                # shared validation to reject dates/materials and suffix aliases.
                 return candidate
     return None
 

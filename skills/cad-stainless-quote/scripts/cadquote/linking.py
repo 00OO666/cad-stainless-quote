@@ -24,20 +24,25 @@ from .materials import normalize_text
 from .models import CadEntity, EvidenceEdge, MtOccurrence, ReviewStatus, Sheet
 from .mt import entity_center
 
+_REFERENCE_SEPARATOR = r"[-_:/\\]"
+_REFERENCE_PREFIX = rf"(?:[A-Z0-9]{{1,4}}{_REFERENCE_SEPARATOR}){{1,2}}"
 _REF_RE = re.compile(
-    r"(?<![A-Z0-9-])(?:[A-Z0-9]{1,4}-){1,2}\d{1,4}(?![A-Z0-9]|-[A-Z0-9])",
+    rf"(?<![A-Z0-9]){_REFERENCE_PREFIX}\d{{1,4}}[A-Z]?(?![A-Z0-9])",
     re.I,
 )
 _COMPACT_REF_RE = re.compile(
-    r"(?<![A-Z0-9-])(?:(?P<section>[AB])(?P<kind>[ED])|(?P<prefix>EL|DS|DT|FD|TD|CD|P|M))"
-    r"[- ]?(?P<number>\d{1,3})(?![A-Z0-9]|-[A-Z0-9])",
+    rf"(?<![A-Z0-9])(?:(?P<section>[AB]){_REFERENCE_SEPARATOR}?(?P<kind>[ED])|"
+    r"(?P<prefix>EL|DS|DT|FD|TD|CD|P|M))"
+    r"[- ]?(?P<number>\d{1,3})(?P<suffix>[A-Z]?)(?![A-Z0-9])",
     re.I,
 )
 _RANGE_RE = re.compile(
-    r"(?<![A-Z0-9-])(?P<left>(?:[A-Z0-9]{1,4}-){1,2}\d{1,4})\s*[~～至]\s*"
-    r"(?P<right>(?:(?:[A-Z0-9]{1,4}-){1,2})?\d{1,4})(?![A-Z0-9]|-[A-Z0-9])",
+    rf"(?<![A-Z0-9])(?P<left>{_REFERENCE_PREFIX}\d{{1,4}}[A-Z]?)\s*[~～至]\s*"
+    rf"(?P<right>(?:{_REFERENCE_PREFIX})?\d{{1,4}}[A-Z]?)(?![A-Z0-9])",
     re.I,
 )
+_REFERENCE_LEFT_CONTINUATION_RE = re.compile(r"[A-Z0-9][-_:/\\.]+$", re.I)
+_REFERENCE_RIGHT_CONTINUATION_RE = re.compile(r"^[-_:/\\.]+[A-Z0-9]", re.I)
 _DETACHED_REF_PREFIX_RE = re.compile(r"^(?:[AB]-[ED]|EL|DS|DT|FD|TD|CD|P|M)-?$", re.I)
 _DETACHED_REF_NUMBER_RE = re.compile(r"^0*(\d{1,3})$")
 _GENERIC_TITLE_RE = re.compile(
@@ -52,7 +57,7 @@ _STRUCTURED_VIEW_NUMBER_RE = re.compile(
 # GC is the established project-material namespace; its family is not limited
 # to stainless/wood/glass (PF, AC, etc. must not become fictitious drawing IDs).
 # Bare PL/ST/PT may be real drawing prefixes, so never exclude them globally.
-_MATERIAL_NAMESPACE_RE = re.compile(r"^(?:GC-[A-Z]{1,4}|MT)-\d{1,4}$")
+_MATERIAL_NAMESPACE_RE = re.compile(r"^(?:GC-[A-Z]{1,4}|MT)-\d{1,4}[A-Z]?$")
 _FLOOR_NAMESPACE_RE = re.compile(r"^(B\d+F?|\d+F)[A-Z]?-", re.I)
 
 
@@ -92,7 +97,7 @@ def _stable_id(prefix: str, payload: Mapping[str, Any]) -> str:
 
 
 def normalize_reference_code(value: Any) -> str | None:
-    """Normalize common interior drawing codes (``Ａ－Ｅ－１`` → ``A-E-01``)."""
+    """Normalize drawing codes, retaining a directly attached letter suffix."""
 
     text = unicodedata.normalize("NFKC", normalize_text(value)).upper()
     text = re.sub(r"[—–－_:/／\\\s]+", "-", text).strip("-")
@@ -100,9 +105,12 @@ def normalize_reference_code(value: Any) -> str | None:
     # Material similarity remains available separately through same_mt evidence.
     if _MATERIAL_NAMESPACE_RE.fullmatch(text):
         return None
-    match = re.fullmatch(r"((?:[A-Z0-9]{1,4}-){1,2})(\d{1,4})", text)
+    match = re.fullmatch(r"((?:[A-Z0-9]{1,4}-){1,2})(\d{1,4})([A-Z]?)", text)
     if not match:
-        compact = _COMPACT_REF_RE.fullmatch(text.replace("-", ""))
+        # Join only the known section/kind boundary, not arbitrary segments:
+        # A-E7A is compact, but A-E-7-A must not become a suffix code.
+        compact_text = re.sub(r"^([AB])-([ED])", r"\1\2", text)
+        compact = _COMPACT_REF_RE.fullmatch(compact_text)
         if not compact:
             return None
         if compact.group("section"):
@@ -110,13 +118,31 @@ def normalize_reference_code(value: Any) -> str | None:
         else:
             prefix = compact.group("prefix") or ""
         number = compact.group("number")
-        return f"{prefix.upper()}-{int(number):0{max(2, len(number))}d}"
-    prefix, number = match.groups()
+        suffix = compact.group("suffix")
+        return f"{prefix.upper()}-{int(number):0{max(2, len(number))}d}{suffix}"
+    prefix, number, suffix = match.groups()
     # Accept floor prefixes such as 1F-E-03 and B1-DE-02, but never turn a
     # date-like all-numeric token (2026-03-16) into a drawing reference.
     if not re.search(r"[A-Z]", prefix, re.I):
         return None
-    return f"{prefix.rstrip('-')}-{int(number):0{max(2, len(number))}d}"
+    return f"{prefix.rstrip('-')}-{int(number):0{max(2, len(number))}d}{suffix}"
+
+
+def normalize_view_number(value: Any) -> str | None:
+    """Normalize a strict numeric local-view ID with an optional letter suffix.
+
+    This lexical helper proves no parent, visibility, or physical ownership.
+    One to three ASCII digits are accepted after NFKC, with their width kept
+    (minimum two); an attached single ASCII letter is uppercased. Standalone
+    letters and internal spaces/separators are deliberately not accepted.
+    """
+
+    text = unicodedata.normalize("NFKC", normalize_text(value)).upper()
+    match = re.fullmatch(r"([0-9]{1,3})([A-Z]?)", text)
+    if match is None:
+        return None
+    number, suffix = match.groups()
+    return f"{int(number):0{max(2, len(number))}d}{suffix}"
 
 
 def _expand_range(left: str, right: str) -> set[str]:
@@ -124,14 +150,18 @@ def _expand_range(left: str, right: str) -> set[str]:
     if left_code is None:
         return set()
     left_prefix, left_number = left_code.rsplit("-", 1)
-    if re.search(r"[A-Z]", right, re.I):
-        right_code = normalize_reference_code(right)
-    else:
+    if re.fullmatch(r"\d{1,4}[A-Z]?", right, re.I):
         right_code = normalize_reference_code(f"{left_prefix}-{right}")
+    else:
+        right_code = normalize_reference_code(right)
     if right_code is None:
         return {left_code}
     right_prefix, right_number = right_code.rsplit("-", 1)
     if left_prefix != right_prefix:
+        return {left_code, right_code}
+    # Lettered endpoints are explicit references, not a defined numeric range.
+    # Keep both intact; never int('7A') or silently expand the unsuffixed IDs.
+    if not left_number.isdecimal() or not right_number.isdecimal():
         return {left_code, right_code}
     start, end = int(left_number), int(right_number)
     if abs(end - start) > 200:
@@ -140,22 +170,41 @@ def _expand_range(left: str, right: str) -> set[str]:
     return {f"{left_prefix}-{number:02d}" for number in range(low, high + 1)}
 
 
+def reference_token_is_bounded(text: str, start: int, end: int) -> bool:
+    """Reject a drawing substring inside a longer connected ASCII identifier.
+
+    Callers pass an NFKC/dash-normalized string and offsets into that same
+    string. Explicit separator runs continue an ASCII token on either side;
+    Chinese descriptions, whitespace, commas, range marks and terminal dots
+    are delimiters. A dot joins tokens but is not a supported code separator.
+    """
+
+    return not (
+        _REFERENCE_LEFT_CONTINUATION_RE.search(text[:start])
+        or _REFERENCE_RIGHT_CONTINUATION_RE.match(text[end:])
+    )
+
+
 def extract_reference_codes(value: Any) -> set[str]:
     """Extract and expand drawing references such as ``A-E-01~A-E-16``."""
 
     text = unicodedata.normalize("NFKC", normalize_text(value)).upper()
     text = text.replace("—", "-").replace("–", "-").replace("－", "-")
     result: set[str] = set()
-    # Hyphenated ASCII segments are one token: EL-01 inside 9F-EL-01 is not a
-    # second floorless reference. A trailing hyphen before a Chinese room/title
-    # is a description separator, however, so retain 1F-EL-01 from ...-大厅.
+    # Never use a valid-looking substring of a longer ASCII identifier.
+    # A separator before a Chinese room/title is descriptive, not another ID.
     for match in _RANGE_RE.finditer(text):
-        result.update(_expand_range(match.group("left"), match.group("right")))
+        if reference_token_is_bounded(text, *match.span()):
+            result.update(_expand_range(match.group("left"), match.group("right")))
     for match in _REF_RE.finditer(text):
+        if not reference_token_is_bounded(text, *match.span()):
+            continue
         code = normalize_reference_code(match.group())
         if code:
             result.add(code)
     for match in _COMPACT_REF_RE.finditer(text):
+        if not reference_token_is_bounded(text, *match.span()):
+            continue
         code = normalize_reference_code(match.group())
         if code:
             result.add(code)
@@ -255,9 +304,13 @@ def _sheet_aliases(sheet: Sheet) -> set[str]:
 
 def _title_key(sheet: Sheet) -> str:
     title = unicodedata.normalize("NFKC", normalize_text(sheet.title)).upper()
-    title = _RANGE_RE.sub(" ", title)
-    title = _REF_RE.sub(" ", title)
-    title = _COMPACT_REF_RE.sub(" ", title)
+    for pattern in (_RANGE_RE, _REF_RE, _COMPACT_REF_RE):
+        title = pattern.sub(
+            lambda match: (
+                " " if reference_token_is_bounded(match.string, *match.span()) else match.group()
+            ),
+            title,
+        )
     title = _GENERIC_TITLE_RE.sub(" ", title)
     return re.sub(r"[^0-9A-Z\u4e00-\u9fff]+", "", title)
 

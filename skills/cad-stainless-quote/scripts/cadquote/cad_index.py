@@ -574,6 +574,12 @@ def _record_entity(
         insert = _leader_anchor_from_geometry(leader_geometry)
     elif entity_type == "INSERT":
         geometry.update(_insert_geometry(entity))
+        if space.startswith("paper:") and not virtual_context and entity.attribs:
+            # Keep INSERT.bbox's historical insertion-point semantics. Explicit
+            # native closed-frame geometry has separate provenance and limits.
+            from .paper_frames import extract_insert_frame_geometry
+
+            geometry["paper_frame_scan"] = extract_insert_frame_geometry(entity)
     elif entity_type in {"ATTRIB", "ATTDEF"}:
         geometry.update(
             {

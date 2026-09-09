@@ -4,6 +4,32 @@
 
 ## 当前结论
 
+### Lettered drawing identities and native closed paper frames
+
+Drawing and local-view identifiers now preserve a trailing letter. Shared
+lexical boundaries reject shortened aliases inside longer identifiers while
+retaining valid material exclusions and numeric-range behavior. Lettered
+range endpoints do not invent intermediate pages.
+
+Fresh indexing records visible closed paper-frame rectangles from native
+line/polyline geometry, with transformed vertices, handle chains and explicit
+resource/completeness limits. Page association uses a frame containing the
+whole viewport and the same parent block's page attributes. It no longer
+needs to mistake a nearby reciprocal view title for the owning sheet.
+The old INSERT insertion-point bbox remains unchanged. Ignored non-frame
+graphics are reported; no unsupported graphic is treated as proof of absence.
+
+Empty/conflicting page slots, incomplete scans, source/layout mismatches and
+rotated enclosing boxes have synthetic counterexamples. Independent review
+also caught a multi-code page attribute whose shorter code was being discarded;
+all distinct complete codes now remain a conflict. Legacy bbox-only navigation
+is labelled unverified, and native page recovery never confirms billable values.
+
+Development package rebuilds preserve failed intermediate experiments and
+original inputs. Native frame association improves navigation, but oversized
+viewports and unsupported/no-frame cases remain explicit. These changes do
+not establish complete-row accuracy or the project's acceptance target.
+
 ### Physical registration and per-set evidence-role review
 
 Private source review now distinguishes jogged axis labels from the actual

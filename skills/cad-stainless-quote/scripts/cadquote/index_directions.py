@@ -117,7 +117,7 @@ def extract_index_directions(
     """
     if not source_file_id or max_inserts < 1 or max_block_entities < 1:
         raise ValueError("source identity and positive resource limits are required")
-    from .linking import normalize_reference_code
+    from .linking import normalize_reference_code, normalize_view_number
 
     allowed = None
     if page_codes is not None:
@@ -154,9 +154,9 @@ def extract_index_directions(
         if allowed is None:
             eligible = any(
                 re.fullmatch(
-                    r"(?:[A-Z0-9]+-)*(?:EL|E|QS|DE|DT|D)-?\d{1,3}",
+                    r"(?:[A-Z0-9]+-)*(?:EL|E|QS|DE|DT|D)-?[0-9]{1,3}[A-Z]?",
                     a.dxf.text.strip(),
-                    re.I,
+                    re.I | re.ASCII,
                 )
                 for a in pages
             )
@@ -189,7 +189,8 @@ def extract_index_directions(
             ),
         }
         records.append(row)
-        if len(pages) != 1 or len(views) != 1 or not re.fullmatch(r"\d{1,3}", views[0].dxf.text):
+        view_number = normalize_view_number(views[0].dxf.text) if len(views) == 1 else None
+        if len(pages) != 1 or len(views) != 1 or view_number is None:
             row["reason_codes"].append("AMBIGUOUS_OR_MISSING_SAME_PARENT_ATTRIBUTES")
             continue
         row.update(
@@ -198,7 +199,12 @@ def extract_index_directions(
                 if allowed is not None
                 else pages[0].dxf.text.strip().upper()
             ),
-            view_number=views[0].dxf.text,
+            # Preserve the established numeric-only output spelling. New suffix
+            # forms use the shared lexical normalizer; raw values remain above.
+            # A page suffix and a local-view suffix are independent identifiers.
+            view_number=(
+                views[0].dxf.text if re.fullmatch(r"\d{1,3}", views[0].dxf.text) else view_number
+            ),
         )
         if not _visible(insert, doc):
             row["reason_codes"].append("HIDDEN_INSERT")
