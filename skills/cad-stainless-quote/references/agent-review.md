@@ -46,6 +46,28 @@ paper DIMENSION/text/leader entities onto the bounded model render. Keep its
 transform and source/image hashes. Annotated browsing boards are useful guides,
 not replacements for original drawing annotations in final proof images.
 
+### Per-set casework and evidence-role consistency
+
+When the estimating scope explicitly permits a per-set stainless subassembly,
+record named `width`, `body_height` and `depth` roles and the displayed axis
+order. The whole cabinet's nominal envelope can identify the set without
+claiming that every face is steel. List included steel and excluded materials;
+keep an independently identified overhead frame or fixture separate. This is
+not permission to convert an unresolved area-priced item into a per-set item.
+
+Count the bound site instances, not the product's plan/front/back/section views.
+Keep the ordinary room elevation as the site locator and dedicated product
+views as dimensional evidence. A local view number, its owning sheet and its
+back-reference can differ; preserve their roles instead of overwriting one
+with another. A shared side view does not prove that two variants share every
+section or dimension.
+
+After changing a selected node, recheck every primary and corroborating
+measurement's source sheet, viewport, handle and role. A correct stage-chain
+summary cannot repair a stale nested measurement record. Equal numerical values
+in another variant are not corroboration. Retain replaced candidates separately
+and freeze a new prediction version; do not rewrite the old freeze after scoring.
+
 ## Freeze, score and deliver
 
 Freeze predictions and their CAD/code/policy/evidence provenance before opening

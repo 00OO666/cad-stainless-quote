@@ -4,6 +4,26 @@
 
 ## 当前结论
 
+### Physical registration and per-set evidence-role review
+
+Private source review now distinguishes jogged axis labels from the actual
+axis line and applies native object-coordinate transforms before cross-view
+registration. Opposing installation faces remain distinct from billable item
+counts. Nominal section legs are retained separately from manufacturing blanks
+and unresolved material-leader ownership.
+
+The CAD-only skill guidance now distinguishes a per-set stainless subassembly's
+identification envelope from unfolded metal area. Ordinary room elevations,
+dedicated product views and section references retain separate roles. Independent
+review exposed a stale corroborating dimension after a node selection changed;
+new guidance requires checking nested evidence rather than trusting a correct
+chain summary. Revisions preserve earlier prediction freezes.
+
+These are known-sample development findings, not a new unattended resolver,
+whole-project acceptance result or unseen-generalization claim. Only general
+guidance and this progress note are public; customer data and case results stay
+private.
+
 ### CAD-only review integration and drawing-reference namespace fixes
 
 New runs and resumes now expose the complete enhanced node-navigation context
