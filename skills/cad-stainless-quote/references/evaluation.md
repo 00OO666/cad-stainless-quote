@@ -168,6 +168,46 @@ preserve prior predictions and evaluations, and label known-project regression h
 
 ## Additional pipeline metrics
 
+### Bounded current-CAD context producer
+
+The standalone producer accepts current index/panel files and target-free,
+explicitly reviewed component/view selections. It reopens each selected source,
+verifies bytes and native entity facts, and replays selected-source panels before
+issuing a context. Do not treat caller-authored index enrichment or a matching
+hash as authority to invent relationships.
+
+```powershell
+python -m cadquote.view_context_builder index.json panels.json selections.json `
+  --side predicted --relations relation-edges.json --out current-context.json `
+  --receipt context-receipt.json --claims disposition-claims.json
+```
+
+Use `ContextSelections` and `SelectedView` in `view_context_builder.py` for the
+input contract: exactly two selected views per component, native evidence IDs,
+bounded object boxes, paired source/target references and searched sheet IDs.
+Selected top-level native object handles may supply geometry missing from the
+semantic text index. The program derives their actual geometry from CAD; it does
+not trust caller-provided types or lengths. There are no target quantities,
+caller-supplied edges, or caller-authored complete/conflict flags in this schema.
+
+The result contains `context`, `receipt`, and `disposition_claims`.
+`verify_view_context_receipt()` reruns the source-backed production; the receipt
+alone is not a signature. Ordinary evidence needs native component ownership and
+visibility. A label-to-leader connection requires actual attachment, not general
+same-sheet proximity. The local target title must belong to the chosen viewport.
+Unresolved in-scope references, missing projection coverage and conflicts remain
+visible in the negative-search record instead of being erased by an input edge.
+
+This is deliberately bounded. A semantic choice still requires review; source
+replay does not itself understand the physical assembly. Unsupported unindexed
+cutting-path tracing cannot establish source-reference ownership, even when a
+human can trace the path in the original drawing. Rejected selections must not
+be enlarged or swapped just to obtain a verified receipt. Context generation
+does not change takeoff numbers, confirm prices, automatically normalize gold,
+or integrate this path into `run`, `resume` or `stage-evidence`.
+
+### Diagnostic metrics
+
 - MT/material-code occurrence recall and precision.
 - Physical component recall and duplicate rate.
 - Plan→elevation and elevation→detail edge accuracy.

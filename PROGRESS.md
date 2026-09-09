@@ -4,6 +4,40 @@
 
 ## 当前结论
 
+### Correction: reciprocal sheet references are not physical ownership
+
+A fresh CAD-only development pass found counterevidence to an earlier local
+ceiling measurement claim below. Two different sections referenced the same
+plan, but their native cutting lines crossed different assemblies. The earlier
+section association and its CAD-supported conclusion are withdrawn. Prior
+predictions, workbooks and arithmetic comparisons remain preserved as history;
+numerical agreement with a reference does not repair an incorrect drawing chain.
+
+New source review separates the actual cutting path, assembly extents, nominal
+folded estimate and fabrication blank. It also distinguishes continuation
+viewports from separate walls using the same block template. Recomputed geometry
+can agree while native material leaders still contradict a stainless ownership
+claim. Those material conflicts and ambiguous reference duplicates remain open,
+not omitted from evaluation or promoted to confirmed quantities.
+
+A standalone current-CAD context producer has passed synthetic counterexamples
+and a bounded real wrong-association rejection check. It reindexes source bytes,
+replays panel membership, checks native evidence and retains incomplete negative
+searches. It is not an automatic physical-component resolver. Unsupported cutting
+path tracing remains a rejection/review condition, not a proximity fallback.
+Full-row accuracy and the end-to-end acceptance target remain unproven.
+
+Independent review closed two false-acceptance defects: caller-added index
+geometry cannot supply native ownership, and conflicting native view titles
+cannot establish a missing-stage exemption. The local suite passes 1,611 tests
+with two skips, including 48 producer tests. These are software checks, not
+business accuracy; the real case retained unbound references and incomplete
+searches and did not receive a positive context. Installed consumers must use
+the matching complete CAD runtime, not a new producer mixed with an older core.
+
+The sections below are historical stage reports; the correction above takes
+precedence over the earlier local ceiling-support claim.
+
 ### Audited view applicability and native longitudinal bands
 
 The evaluator now distinguishes a genuinely unnecessary view from missing

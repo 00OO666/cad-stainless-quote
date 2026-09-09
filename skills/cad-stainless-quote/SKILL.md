@@ -42,6 +42,7 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 - For an accuracy check, run `scripts/run.ps1 evaluate <predicted-json> <gold-json> --policy <versioned-policy-json> --out <report-json>`. Use the project's latest approved versioned policy. The bundled template has pending tolerances; do not replace already-confirmed project settings with its null values or ask the user to confirm the same rules again.
 - For a held-out suite, run `scripts/run.ps1 evaluate-batch <manifest-json> --out <batch-dir>`. Inspect every project gate in addition to the JSON/Markdown aggregate; the batch may PASS only when every project PASSes.
 - For genuinely non-applicable views, use the audited `view_dispositions` evaluation contract in [references/evaluation.md](references/evaluation.md), with independently prepared prediction/gold current CAD contexts. Bare `N/A` and blank evidence never pass. This is an evaluator capability, not automatic plan-to-section support in `run`/`resume` or `stage-evidence`.
+- `python -m cadquote.view_context_builder` is a standalone, bounded source-replay producer for those contexts. Supply independently reviewed target-free selections and inspect its receipt and negative-search limits. It is not wired into automatic takeoff; unsupported native cutting-path ownership must remain rejected/reviewed, never replaced by same-page proximity. See [references/evaluation.md](references/evaluation.md).
 - For an explicitly selected native rectangular finish band, `cadquote.linear_band.summarize_rectangular_band` computes a REVIEW-only longitudinal interval union from complete native geometry. It does not identify stainless material, classify gaps as doors, infer units, assign assembly count, or use the closed outline perimeter as length. Bind materials, dimensions and same-wall construction before adopting any subtotal.
 - A CLI exit code of 2 can mean a safe BLOCK result, not a crash; inspect the printed `status`/`safe_outcome` and `<run-dir>/issues.json`.
 - Read [references/workflow.md](references/workflow.md) before adjudicating REVIEW/BLOCK items.
@@ -84,6 +85,27 @@ Run the deterministic pipeline first; use model reasoning only to rank or resolv
 27. Keep the visible quantity column as the confirmed physical/billable count. When CAD proves that the engineering quantity uses another displayed axis or an internal topology multiplier, use the audited `engineering_quantity_expression` confirmation; bind its basis to CAD entities on the selected chain. Never distort the visible quantity, copy a human target, or use an unaudited free formula to obtain a match.
 28. Candidate-gold cleanup may preserve a workbook's `reported_quantity` and derive an integer `effective_quantity` from the workbook's authoritative engineering quantity only when the unit formula and displayed dimensions yield one unique positive integer. Record `quantity_source=derived_from_engineering_quantity` and the derivation basis. This repair is for audited human-gold normalization only; blind prediction and production CAD takeoff must never infer quantity from a target engineering quantity.
 29. A stainless-steel screen with artistic-glass infill is one `single_line_composite` quotation item, not separate steel and glass rows. Use `width_mm*length_mm*quantity/1000000` for the whole elevation projection; a third axis or construction depth is descriptive only. Local same-component screen and glass evidence must create a composite candidate even before a reviewer supplies `composite_assembly`; keep that candidate at least REVIEW (or BLOCK when other hard evidence is missing) with price and amount blank until confirmed. Commercial PASS requires native horizontal/vertical DIMENSION endpoints spanning a bounded INSERT already bound to the MT occurrence; generic WD/HT attributes, proximity, or a largest-value heuristic are insufficient. The material display and evidence must identify both materials by exact code and name, the note must state that glass is included, and missing identity or same-component evidence keeps the item REVIEW/BLOCK. A stainless-only price entry cannot match it. One glass evidence entity may belong to only one physical component/quotation row; competing ownership is REVIEW/BLOCK, never duplicated evidence.
+
+## Native ownership and corrected evidence
+
+Native references that happen to name the same sheet are only candidates. Before
+using a section, bind the source symbol through its actual cutting/leader path to
+the selected physical component and identify the target's specific local view,
+not merely its owning page. A neighboring section with the same reciprocal page
+must remain a countercandidate; unsupported path tracing is not a confirmed edge.
+
+Keep nominal quoted unfolded width separate from fabrication blank width and
+bend allowance. When explicit segment dimensions and symmetry evidence support
+the complete quoted fold, preserve that nominal sum and any inner/outer drawn
+profile discrepancies; an unknown manufacturing neutral axis does not erase an
+otherwise supported nominal estimate. Apply the user's approved dimensional
+quantity formula, and do not silently change a folded-area item into a linear
+quantity. Never switch calculation basis to make a reference value match.
+
+If new source evidence disproves a previously supported association, append an
+explicit correction to the project handoff and withdraw the support claim.
+Preserve the original frozen prediction, score and workbook as history. Do not
+continue counting an arithmetic match whose physical evidence chain was wrong.
 
 ## Outputs
 
