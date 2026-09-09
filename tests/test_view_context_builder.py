@@ -33,8 +33,11 @@ def cad_case(tmp_path, request):
         model.delete_entity(target_object)
         doc.layers.new("NESTED_CHILD")
         child = doc.blocks.new("OBJECT_CHILD")
-        child.add_lwpolyline([(220, 20), (280, 20), (280, 70), (220, 70)], close=True,
-                            dxfattribs={"layer": "NESTED_CHILD"})
+        child.add_lwpolyline(
+            [(220, 20), (280, 20), (280, 70), (220, 70)],
+            close=True,
+            dxfattribs={"layer": "NESTED_CHILD"},
+        )
         outer = doc.blocks.new("OBJECT_OUTER")
         outer.add_blockref("OBJECT_CHILD", (0, 0))
         target_object = model.add_blockref("OBJECT_OUTER", (0, 0))
@@ -52,7 +55,8 @@ def cad_case(tmp_path, request):
         position = (250, 40) if variant != "outside" else (290, 90)
         model.add_text("EL-09", dxfattribs={"insert": position, "height": 2})
     frame = doc.blocks.new("PAGE_FRAME")
-    frame.add_lwpolyline([(-5, -10), (105, -10), (105, 105), (-5, 105)], close=True)
+    frame_right = 205 if variant.startswith("secondary_title") else 105
+    frame.add_lwpolyline([(-5, -10), (frame_right, -10), (frame_right, 105), (-5, 105)], close=True)
     refblock = doc.blocks.new("REF")
     refblock.add_circle((0, 0), 1)
     if variant.startswith("cut_"):
@@ -165,6 +169,55 @@ def cad_case(tmp_path, request):
                 title_attribute.dxf.flags = 1
         else:
             layout.add_text("PLAN", dxfattribs={"insert": (10, 3), "height": 2})
+        if name == "Plan" and variant in {
+            "unprojected_other_page",
+            "unprojected_other_page_boundary",
+        }:
+            other_frame = layout.add_blockref("PAGE_FRAME", (300, 100))
+            other_frame.add_attrib("SHEET_NUMBER", "PL-02", (370, 93), dxfattribs={"height": 2})
+            other_frame.add_attrib("SHEET_TITLE", "OTHER PLAN", (330, 93), dxfattribs={"height": 2})
+            x = 340 if variant == "unprojected_other_page" else 401
+            layout.add_text("EL-99", dxfattribs={"insert": (x, 150), "height": 2})
+        if name == "Section" and variant.startswith("secondary_title"):
+            model.add_line((430, 30), (470, 70))
+            model.add_text("SECONDARY SECTION", dxfattribs={"insert": (450, 50), "height": 2})
+            layout.add_viewport(
+                center=(165, 50), size=(60, 70), view_center_point=(450, 50), view_height=70
+            )
+            caption_block = doc.blocks.new("NATIVE_SECONDARY_VIEW_TITLE")
+            caption_block.add_circle((0, 0), 2)
+            line_end = 24 if variant == "secondary_title_caption_rule" else 2
+            caption_block.add_line((-2, 0), (line_end, 0))
+            if variant == "secondary_title_cut":
+                caption_block.add_solid([(0, 0), (-2, -1), (-2, 1), (-2, 1)])
+            if variant == "secondary_title_line_arrow":
+                for start, end in (
+                    ((-3, 0), (-5, -1)),
+                    ((-5, -1), (-5, 1)),
+                    ((-5, 1), (-3, 0)),
+                    ((-5, 0), (-8, 0)),
+                ):
+                    caption_block.add_line(start, end)
+                layout.add_line((157, 11), (40, 40))
+            caption = layout.add_blockref(caption_block.name, (165, 11))
+            code = "PL-09" if variant == "secondary_title_wrong_plan" else "PL-01"
+            caption.add_attrib("SHEET_NUMBER", code, (165, 11), dxfattribs={"height": 2})
+            caption.add_attrib("#", "09", (165, 14), dxfattribs={"height": 2})
+            caption.add_attrib("ROLE", "SECTION", (175, 14), dxfattribs={"height": 2})
+            scale = caption.add_attrib(
+                "CAPTION", "SECTION SCALE:1/1", (165, 7), dxfattribs={"height": 2}
+            )
+            if variant == "secondary_title_hidden_scale":
+                doc.layers.new("HIDDEN_SCALE").off()
+                scale.dxf.layer = "HIDDEN_SCALE"
+        if name == "Plan" and variant.startswith("fastener_"):
+            note = {
+                "fastener_instruction": "M8膨胀螺栓固定",
+                "fastener_reference": "参见M8膨胀螺栓固定详图",
+                "fastener_mixed": "M8膨胀螺栓固定，参见 EL-99",
+                "fastener_duplicate_reference": "M8膨胀螺栓固定；M-08",
+            }[variant]
+            layout.add_mtext(note, dxfattribs={"insert": (140, 150), "char_height": 2})
     source = tmp_path / "synthetic.dxf"
     doc.saveas(source)
     indexed = index_dxf(source)
@@ -175,8 +228,10 @@ def cad_case(tmp_path, request):
         "sheets": [s.model_dump(mode="json") for s in panels.sheets],
         "entities": [e.model_dump(mode="json") for e in panels.entities],
     }
-    assert len(panels.sheets) == len(layout_specs)
-    by_layout = {s.layout.split("#")[0]: s for s in panels.sheets}
+    assert len(panels.sheets) == len(layout_specs) + int(variant.startswith("secondary_title"))
+    by_layout = {}
+    for sheet in panels.sheets:
+        by_layout.setdefault(sheet.layout.split("#")[0], sheet)
     by_handle = {e.handle: e.id for e in indexed.entities if e.handle}
     source_ids = [by_handle[e.dxf.handle] for e in refs["Plan"]]
     target_ids = [by_handle[e.dxf.handle] for e in refs["Section"]]
@@ -301,15 +356,20 @@ def test_external_symbol_binds_by_actual_cut_path_without_enlarging_bbox(cad_cas
         assert basis["kind"] == "native_cut_path_component_crossing"
         assert basis["crossing_object_ids"]
     proofs = [
-        proof for proof in component["native_cut_path_diagnostics"]
+        proof
+        for proof in component["native_cut_path_diagnostics"]
         if proof["view_id"] == "plan-view"
     ]
     assert len(proofs) == 1  # Same-parent attributes reuse one native path scan.
     assert proofs[0]["result"]["supported"] is True
     assert result["receipt"]["native_cut_path_producer_sha256"]
     assert verify_view_context_receipt(
-        cad_case["index"], cad_case["panels"], cad_case["selection"],
-        result["context"], result["receipt"], side="predicted",
+        cad_case["index"],
+        cad_case["panels"],
+        cad_case["selection"],
+        result["context"],
+        result["receipt"],
+        side="predicted",
     )
 
 
@@ -354,9 +414,7 @@ def test_unresolved_hidden_symbol_is_not_negative_scope_exclusion(cad_case):
     result = _build(cad_case)
     component = result["receipt"]["components"][0]
     assert component["state"] == "REVIEW"
-    matches = [
-        r for r in component["reference_inventory"] if "EL-99" in r["target_codes"]
-    ]
+    matches = [r for r in component["reference_inventory"] if "EL-99" in r["target_codes"]]
     assert matches
     assert all(r["state"] == "UNRESOLVED_REFERENCE" for r in matches)
     assert result["context"]["searches"][0]["unresolved_reference_ids"]
@@ -693,8 +751,12 @@ def test_unrecognized_native_circle_divider_cannot_prove_negative_search(cad_cas
     assert rows[0]["entity_id"] in result["context"]["searches"][0]["unresolved_reference_ids"]
     claim = result["disposition_claims"]["synthetic-component"]
     item = TakeoffItem(
-        sequence=1, component_id="synthetic-component", name="Synthetic", mt_code="MT-01",
-        evidence_ids=claim["elevation"]["evidence_ids"], view_dispositions=claim,
+        sequence=1,
+        component_id="synthetic-component",
+        name="Synthetic",
+        mt_code="MT-01",
+        evidence_ids=claim["elevation"]["evidence_ids"],
+        view_dispositions=claim,
     )
     applicability = resolve_view_applicability(
         item, "elevation", prepare_view_context(result["context"], "predicted")
@@ -702,7 +764,15 @@ def test_unrecognized_native_circle_divider_cannot_prove_negative_search(cad_cas
     assert applicability.state != "NOT_APPLICABLE"
 
 
-@pytest.mark.parametrize("filename", ["view_context_builder.py", "native_cut_paths.py"])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "view_context_builder.py",
+        "native_cut_paths.py",
+        "native_reference_scope.py",
+        "native_graphic_review.py",
+    ],
+)
 def test_producer_code_drift_during_build_cannot_issue_receipt(cad_case, monkeypatch, filename):
     from cadquote import view_context_builder as producer
 
@@ -720,6 +790,121 @@ def test_producer_code_drift_during_build_cannot_issue_receipt(cad_case, monkeyp
     monkeypatch.setattr(producer, "sha256_file", changing_hash)
     with pytest.raises(ViewContextBuildError, match="producer code changed during build"):
         _build(cad_case)
+
+
+@pytest.mark.parametrize(
+    "cad_case", ["unprojected_other_page", "unprojected_other_page_boundary"], indirect=True
+)
+def test_original_other_page_scope_is_audited_without_erasing_boundary_reference(cad_case):
+    result = _build(cad_case)
+    component = result["receipt"]["components"][0]
+    rows = [r for r in component["reference_inventory"] if r["target_codes"] == ["EL-99"]]
+    assert len(rows) == 1
+    proof = rows[0]["native_page_scope"]
+    assert proof and proof["proves_component_or_target_view_ownership"] is False
+    if proof["exclude_from_selected_scope"]:
+        assert rows[0]["state"] == "OTHER_NATIVE_PAGE"
+        assert proof["reference_page_owners"][0]["page_code"] == "PL-02"
+        assert proof["selected_page_owners"][0]["page_code"] == "PL-01"
+        assert (
+            rows[0]["entity_id"] not in result["context"]["searches"][0]["unresolved_reference_ids"]
+        )
+        assert component["state"] == "VERIFIED"
+    else:
+        assert rows[0]["state"] == "UNPROJECTED_NATIVE_REFERENCE_SCOPE_UNRESOLVED"
+        assert rows[0]["entity_id"] in result["context"]["searches"][0]["unresolved_reference_ids"]
+        assert component["state"] == "REVIEW"
+    native = next(e for e in cad_case["indexed"].entities if e.text == "EL-99")
+    assert proof["exclude_from_selected_scope"] == (native.insert[0] == 340)
+
+
+@pytest.mark.parametrize(
+    "cad_case", ["fastener_instruction", "fastener_reference", "fastener_mixed"], indirect=True
+)
+def test_native_fastener_instruction_does_not_erase_explicit_references(cad_case):
+    result = _build(cad_case)
+    rows = [
+        r
+        for r in result["receipt"]["components"][0]["reference_inventory"]
+        if "M-08" in r["target_codes"]
+    ]
+    assert len(rows) == 1
+    entity = next(e for e in cad_case["indexed"].entities if e.id == rows[0]["entity_id"])
+    is_instruction = entity.text == "M8膨胀螺栓固定"
+    assert (rows[0]["state"] == "NON_REFERENCE_CONSTRUCTION_NOTE") == is_instruction
+    assert result["context"]["searches"][0]["complete"] == is_instruction
+
+
+@pytest.mark.parametrize(
+    "cad_case",
+    ["secondary_title", "secondary_title_wrong_plan", "secondary_title_cut"],
+    indirect=True,
+)
+def test_title_metadata_requires_actual_native_role_viewport_and_connected_plan(cad_case):
+    result = _build(cad_case)
+    inventory = result["receipt"]["components"][0]["reference_inventory"]
+    rows = [
+        r
+        for r in inventory
+        if (r.get("native_semantic_scope") or {}).get("kind")
+        == "native_same_parent_view_title_backreference"
+    ]
+    document = ezdxf.readfile(cad_case["source"])
+    title_block = document.blocks.get("NATIVE_SECONDARY_VIEW_TITLE")
+    has_cut = any(e.dxftype() == "SOLID" for e in title_block)
+    has_wrong_plan = any(e.text == "PL-09" for e in cad_case["indexed"].entities)
+    assert len(rows) == int(not has_cut and not has_wrong_plan)
+    if rows:
+        assert rows[0]["native_semantic_scope"]["local_view_number"] == "09"
+        assert rows[0]["native_semantic_scope"]["backreference_page"] == "PL-01"
+        assert rows[0]["state"] == "NATIVE_VIEW_TITLE_BACKREFERENCE"
+        assert result["context"]["searches"][0]["complete"] is True
+    else:
+        assert result["context"]["searches"][0]["complete"] is False
+
+
+@pytest.mark.parametrize("cad_case", ["fastener_duplicate_reference"], indirect=True)
+def test_fastener_note_cannot_erase_a_second_identical_reference(cad_case):
+    result = _build(cad_case)
+    rows = result["receipt"]["components"][0]["reference_inventory"]
+    row = next(row for row in rows if row["target_codes"] == ["M-08"])
+    assert row["state"] == "UNPROJECTED_NATIVE_REFERENCE_SCOPE_UNRESOLVED"
+    assert row["native_semantic_scope"] is None
+    assert result["receipt"]["components"][0]["state"] == "REVIEW"
+    assert result["context"]["searches"][0]["complete"] is False
+
+
+@pytest.mark.parametrize("cad_case", ["secondary_title_hidden_scale"], indirect=True)
+def test_title_metadata_cannot_use_off_layer_scale_attribute(cad_case):
+    result = _build(cad_case)
+    rows = result["receipt"]["components"][0]["reference_inventory"]
+    assert not any(row["state"] == "NATIVE_VIEW_TITLE_BACKREFERENCE" for row in rows)
+    assert any(row["state"] == "UNPROJECTED_NATIVE_REFERENCE_SCOPE_UNRESOLVED" for row in rows)
+    assert result["receipt"]["components"][0]["state"] == "REVIEW"
+    assert result["context"]["searches"][0]["complete"] is False
+
+
+@pytest.mark.parametrize("cad_case", ["secondary_title_line_arrow"], indirect=True)
+def test_title_metadata_cannot_hide_an_arrow_drawn_with_lines(cad_case):
+    result = _build(cad_case)
+    rows = result["receipt"]["components"][0]["reference_inventory"]
+    assert not any(row["state"] == "NATIVE_VIEW_TITLE_BACKREFERENCE" for row in rows)
+    assert any(row["state"] == "UNPROJECTED_NATIVE_REFERENCE_SCOPE_UNRESOLVED" for row in rows)
+    assert result["receipt"]["components"][0]["state"] == "REVIEW"
+    assert result["context"]["searches"][0]["complete"] is False
+
+
+@pytest.mark.parametrize("cad_case", ["secondary_title_caption_rule"], indirect=True)
+def test_native_circle_diameter_may_extend_as_a_caption_rule(cad_case):
+    result = _build(cad_case)
+    rows = result["receipt"]["components"][0]["reference_inventory"]
+    row = next(row for row in rows if row["state"] == "NATIVE_VIEW_TITLE_BACKREFERENCE")
+    geometry = row["native_semantic_scope"]["native_title_geometry"]
+    assert geometry["circle_radius"] == 2
+    assert geometry["line_end"][0] == 24
+    assert geometry["additional_line_or_arrow_primitives"] is False
+    assert result["receipt"]["components"][0]["state"] == "VERIFIED"
+    assert result["context"]["searches"][0]["complete"] is True
 
 
 @pytest.mark.parametrize("cad_case", ["outside_callout"], indirect=True)
@@ -811,3 +996,81 @@ def test_same_page_same_back_reference_still_requires_correct_native_viewport(tm
         _verify_target_title_owner(scope, pairs[valid])
         with pytest.raises(ViewContextBuildError, match="native viewport"):
             _verify_target_title_owner(scope, pairs[invalid])
+
+
+@pytest.mark.parametrize("output_flag", ["--out", "--receipt"])
+@pytest.mark.parametrize("artifact_role", ["original_content", "reviewed_image"])
+def test_invalid_graphic_review_still_protects_declared_artifact_inputs(
+    cad_case, tmp_path, output_flag, artifact_role
+):
+    import hashlib
+
+    from cadquote.view_context_builder import main
+
+    protected = tmp_path / "declared-review-input.bin"
+    original_bytes = b"SYNTHETIC ORIGINAL REVIEW INPUT: MUST NOT BE OVERWRITTEN"
+    protected.write_bytes(original_bytes)
+    original_sha = hashlib.sha256(original_bytes).hexdigest()
+    other = tmp_path / "other-review-input.bin"
+    other.write_bytes(original_bytes)
+    assets = {
+        role: {"path": str(protected if role == artifact_role else other), "sha256": original_sha}
+        for role in ("original_content", "reviewed_image")
+    }
+    # This definition is deliberately absent from the original CAD. Its review
+    # cannot be accepted, but declared inputs must remain protected nonetheless.
+    bundle = _write(
+        tmp_path / "invalid-graphic-review.json",
+        {
+            "schema_version": "cad-view-graphic-reviews/1",
+            "sources": [
+                {
+                    "source_file_id": cad_case["indexed"].source_file_id,
+                    "review": {
+                        "schema_version": "native-graphic-review/1",
+                        "source_sha256": hashlib.sha256(
+                            cad_case["source"].read_bytes()
+                        ).hexdigest(),
+                        "review": {
+                            "reviewer": "synthetic regression",
+                            "reviewed_at": "2026-01-01T00:00:00Z",
+                            "reason": "Invalid review does not authorize overwriting its inputs.",
+                        },
+                        "definitions": [
+                            {
+                                "handle": "DOES_NOT_EXIST",
+                                "owner_block": "FAKE",
+                                "payload_bytes": len(original_bytes),
+                                "payload_sha256": original_sha,
+                                "semantic_classification": "NON_REFERENCE_GRAPHIC",
+                                **assets,
+                            }
+                        ],
+                        "instances": [],
+                    },
+                }
+            ],
+        },
+    )
+    context_path = protected if output_flag == "--out" else tmp_path / "result-context.json"
+    receipt_path = protected if output_flag == "--receipt" else tmp_path / "result-receipt.json"
+    with pytest.raises(ViewContextBuildError, match="output overwrites input/source"):
+        main(
+            [
+                str(cad_case["index"]),
+                str(cad_case["panels"]),
+                str(cad_case["selection"]),
+                "--side",
+                "predicted",
+                "--graphic-reviews",
+                str(bundle),
+                "--out",
+                str(context_path),
+                "--receipt",
+                str(receipt_path),
+            ]
+        )
+    assert protected.read_bytes() == original_bytes
+    assert other.read_bytes() == original_bytes
+    assert not (tmp_path / "result-context.json").exists()
+    assert not (tmp_path / "result-receipt.json").exists()

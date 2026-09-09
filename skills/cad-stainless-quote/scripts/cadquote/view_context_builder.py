@@ -12,15 +12,17 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import ezdxf
 from ezdxf import bbox as ezbbox
 from pydantic import Field, field_validator
 
-from . import native_cut_paths
+from . import native_cut_paths, native_graphic_review, native_reference_scope
 from .cad_index import index_dxf
 from .io import sha256_file, write_json_atomic
 from .linking import extract_reference_codes, extract_structured_reference_callouts
@@ -95,6 +97,27 @@ def _read(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def _declared_graphic_artifact_paths(bundle):
+    """Protect even invalid/unapproved review inputs from CLI output overwrite."""
+    output = set()
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("sources"), list):
+        return output
+    for entry in bundle["sources"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("review"), dict):
+            continue
+        definitions = entry["review"].get("definitions")
+        if not isinstance(definitions, list):
+            continue
+        for definition in definitions:
+            if not isinstance(definition, dict):
+                continue
+            for role in ("original_content", "reviewed_image"):
+                asset = definition.get(role)
+                if isinstance(asset, dict) and isinstance(asset.get("path"), str) and asset["path"]:
+                    output.add(Path(asset["path"]).resolve())
+    return output
+
+
 def _require(condition, message):
     if not condition:
         raise ViewContextBuildError(message)
@@ -137,6 +160,40 @@ def _within(outer, inner):
     return bool(inner and _contains(outer, inner[:2]) and _contains(outer, inner[2:]))
 
 
+def _fastener_construction_note(entity, codes):
+    """Do not confuse an explicit metric fastener fixing instruction with a page ID."""
+    if entity.entity_type not in {"TEXT", "MTEXT"}:
+        return None
+    value = entity.text or ""
+    if re.search(r"参见|详见|索引|详图|图号|\b(?:SEE|DETAIL|DRAWING|SHEET)\b", value, re.I):
+        return None
+    matches = list(
+        re.finditer(
+            r"(?<![A-Z0-9])M(?P<size>[1-9]\d{0,2})\s*(?:膨胀)?螺栓\s*(?:固定|连接|紧固|锚固)",
+            value,
+            re.I,
+        )
+    )
+    excluded = {f"M-{int(m['size']):02d}" for m in matches}
+    if not codes or codes != excluded:
+        return None
+    # Code sets discard multiplicity: a second, independent M-08 must not be
+    # erased merely because M8 already occurred inside a fastener instruction.
+    residual = list(value)
+    for match in matches:
+        residual[match.start() : match.end()] = " " * (match.end() - match.start())
+    if extract_reference_codes("".join(residual)):
+        return None
+    return {
+        "kind": "explicit_metric_fastener_fixing_instruction",
+        "entity_id": entity.id,
+        "handle": entity.handle,
+        "native_text": value,
+        "matched_terms": [m.group(0) for m in matches],
+        "not_material_or_dimension_extraction": True,
+    }
+
+
 def _native_id(entity):
     return str(entity.geometry.get("original_entity_id") or entity.id)
 
@@ -161,7 +218,7 @@ def _core(entity):
     }
 
 
-def _source_replay(index, panels, selected_sources):
+def _source_replay(index, panels, selected_sources, graphic_reviews=None):
     """Reindex immutable bytes; compare native facts and replay panel membership."""
     source_records = index.get("sources")
     _require(isinstance(source_records, list) and source_records, "missing index sources")
@@ -227,6 +284,7 @@ def _source_replay(index, panels, selected_sources):
         # panel replay use the fresh CAD records, including absent geometry keys.
         native.extend(fresh_entities.values())
         sheets.extend(fresh.sheets)
+        warning_batches = {}
         for label, value in (("source", source), ("fresh", fresh.to_dict())):
             if value.get("block_expansion_truncated") or value.get("recovered"):
                 scan_issues.append(f"{fid}:{label}:truncated_or_recovered")
@@ -234,17 +292,31 @@ def _source_replay(index, panels, selected_sources):
                 scan_issues.append(f"{fid}:{label}:audit_errors")
             # Encoding repair is fully audited; every other indexing warning
             # conservatively makes a negative search incomplete.
-            scan_issues.extend(
-                f"{fid}:{label}:{w}"
+            warning_batches[label] = [
+                str(w)
                 for w in value.get("warnings", [])
                 if not str(w).startswith("raw UTF-8 text recovery applied")
+            ]
+        graphic_audit = None
+        remaining = warning_batches
+        if graphic_reviews and fid in graphic_reviews:
+            graphic_audit = native_graphic_review.classify_native_graphic_warnings(
+                path, warning_batches, graphic_reviews[fid]
             )
+            remaining = graphic_audit["remaining"]
+            scan_issues.extend(
+                f"{fid}:graphic_review:{issue}" for issue in graphic_audit["review_issues"]
+            )
+        for label, warnings in remaining.items():
+            scan_issues.extend(f"{fid}:{label}:{warning}" for warning in warnings)
         source_receipts.append(
             {
                 "source_file_id": fid,
                 "source_path": str(path),
                 "source_sha256": actual_hash,
                 "native_entity_count": len(old_entities),
+                "index_warning_batches": warning_batches,
+                "native_graphic_review": graphic_audit,
             }
         )
     expansion = expand_viewport_panels(
@@ -300,8 +372,10 @@ def _native_object_visibility(
     def walk(entity, inherited_layer=None, stack=()):
         nonlocal visited, leaves
         visited += 1
-        _require(visited <= max_entities and len(stack) <= max_depth,
-                 "native object visibility scan incomplete: limit")
+        _require(
+            visited <= max_entities and len(stack) <= max_depth,
+            "native object visibility scan incomplete: limit",
+        )
         layer_name = str(entity.dxf.get("layer", "0"))
         if layer_name == "0" and inherited_layer is not None:
             layer_name = inherited_layer
@@ -311,7 +385,8 @@ def _native_object_visibility(
             raise ViewContextBuildError("native object visibility scan: missing layer") from exc
         _require(
             not entity.dxf.get("invisible", 0)
-            and not layer.is_off() and not layer.is_frozen()
+            and not layer.is_off()
+            and not layer.is_frozen()
             and layer_name.casefold() not in viewport_frozen,
             "hidden native object descendant cannot supply full-block geometry",
         )
@@ -323,8 +398,10 @@ def _native_object_visibility(
             except Exception as exc:
                 raise ViewContextBuildError("native object visibility scan: missing block") from exc
             _require(block is not None, "native object visibility scan: missing block")
-            _require(not block.block.dxf.get("flags", 0) & 12,
-                     "native object visibility scan: external block")
+            _require(
+                not block.block.dxf.get("flags", 0) & 12,
+                "native object visibility scan: external block",
+            )
             for child in block:
                 if child.dxftype() != "ATTDEF":
                     walk(child, layer_name, (*stack, name.casefold()))
@@ -333,24 +410,27 @@ def _native_object_visibility(
 
     walk(original)
     _require(leaves > 0, "native object visibility scan: no visible content")
-    return {"complete": True, "visited_entities": visited, "visible_leaf_entities": leaves,
-            "basis": "native_instance_layer_inheritance_and_selected_viewport_visibility"}
+    return {
+        "complete": True,
+        "visited_entities": visited,
+        "visible_leaf_entities": leaves,
+        "basis": "native_instance_layer_inheritance_and_selected_viewport_visibility",
+    }
 
 
 class _Scope:
-    def __init__(self, view, sheets, entities, native, source_documents):
+    def __init__(self, view, sheets, entities, native, source_documents, *, reference_scope=None):
         self.view = view
         self.sheet = sheets[view.sheet_id]
         self.native = native
         self.document = source_documents[self.sheet.source_file_id]
+        self.reference_scope = reference_scope
         self.viewport = self.document.entitydb.get(self.sheet.viewport_handle)
         _require(
             self.viewport is not None and self.viewport.dxftype() == "VIEWPORT",
             "selected native viewport missing",
         )
-        self.viewport_frozen_layers = {
-            str(name).casefold() for name in self.viewport.frozen_layers
-        }
+        self.viewport_frozen_layers = {str(name).casefold() for name in self.viewport.frozen_layers}
         self.visibility_cache = {}
         self.label_link_cache = {}
         self.all_panel_entities = entities
@@ -829,8 +909,15 @@ class _Scope:
             "entity_type": original.entity_type,
         }
 
-    def unprojected_references(self, selected_refs):
+    def unprojected_references(self, selected_refs, *, connected_plan_page=None):
         """Keep unknown native paper records unresolved when projection omits them."""
+        if self.reference_scope is None:
+            self.reference_scope = native_reference_scope.NativeReferenceScope(
+                self.document,
+                source_file_id=self.sheet.source_file_id,
+                native_entities=self.native.values(),
+                sheets=self.sheets.values(),
+            )
         viewport = next(
             (
                 e
@@ -864,6 +951,8 @@ class _Scope:
             codes = extract_reference_codes(entity.text)
             if not codes:
                 continue
+            page_scope = None
+            semantic_scope = None
             if entity.id in selected_refs:
                 state, reason = "SELECTED_CONNECTION", "verified native title omitted by clipping"
             elif not self.visible(entity):
@@ -879,11 +968,33 @@ class _Scope:
                     "native record belongs to other replayed panels",
                 )
             else:
-                state = "UNPROJECTED_NATIVE_REFERENCE_SCOPE_UNRESOLVED"
-                reason = (
-                    "native paper reference has no verified panel or component-scope association"
-                )
-                issues.append(f"{self.sheet.id}:unprojected_native_reference:{entity.id}")
+                page_scope = self.reference_scope.classify(entity, self.sheet)
+                semantic_scope = _fastener_construction_note(entity, codes)
+                if semantic_scope:
+                    state = "NON_REFERENCE_CONSTRUCTION_NOTE"
+                    reason = "metric fastener fixing text, not a drawing index"
+                elif page_scope.get("exclude_from_selected_scope") is True:
+                    state = "OTHER_NATIVE_PAGE"
+                    reason = (
+                        "complete native reference and parent belong to a "
+                        "different verified paper frame"
+                    )
+                else:
+                    semantic_scope = _native_title_backreference(
+                        self, entity, page_scope, connected_plan_page
+                    )
+                    if semantic_scope:
+                        state = "NATIVE_VIEW_TITLE_BACKREFERENCE"
+                        reason = (
+                            "native local-view title returns to the already connected plan page"
+                        )
+                    else:
+                        state = "UNPROJECTED_NATIVE_REFERENCE_SCOPE_UNRESOLVED"
+                        reason = (
+                            "native paper reference has no verified panel "
+                            "or component-scope association"
+                        )
+                        issues.append(f"{self.sheet.id}:unprojected_native_reference:{entity.id}")
             output.append(
                 {
                     "entity_id": entity.id,
@@ -903,6 +1014,8 @@ class _Scope:
                     ),
                     "state": state,
                     "binding_basis": None,
+                    "native_page_scope": page_scope,
+                    "native_semantic_scope": semantic_scope,
                     "reason": reason,
                 }
             )
@@ -1033,7 +1146,147 @@ def _verify_target_title_owner(scope, pair):
     )
 
 
-def build_view_context(index_path, panels_path, selections_path, *, side, relations_path=None):
+def _native_title_rule_geometry(parent):
+    """Accept one circle and a straight diameter/title rule, never extra lines.
+
+    A rule may extend beyond one side of the circle beneath a view caption.
+    A type whitelist alone also permits outlined arrows made from LINEs, so
+    preserve the actual primitive count and diameter geometry in the proof.
+    """
+    children = list(parent.block())
+    if len(children) > 1000 or any(
+        child.dxftype() not in {"CIRCLE", "LINE", "ATTDEF", "TEXT", "MTEXT"} for child in children
+    ):
+        return None
+    circles = [child for child in children if child.dxftype() == "CIRCLE"]
+    lines = [child for child in children if child.dxftype() == "LINE"]
+    if len(circles) != 1 or len(lines) != 1:
+        return None
+    circle, line = circles[0], lines[0]
+    center = tuple(circle.dxf.center)
+    start, end = tuple(line.dxf.start), tuple(line.dxf.end)
+    radius = float(circle.dxf.radius)
+    extrusion = tuple(circle.dxf.extrusion)
+    if (
+        not all(math.isfinite(v) for v in (*center, *start, *end, radius, *extrusion))
+        or radius <= 0
+        or extrusion != (0.0, 0.0, 1.0)
+    ):
+        return None
+    tolerance = max(radius, 1.0) * 1e-8
+    if any(
+        abs(point[1] - center[1]) > tolerance or abs(point[2] - center[2]) > tolerance
+        for point in (start, end)
+    ):
+        return None
+    left, right = sorted((start[0] - center[0], end[0] - center[0]))
+    if (
+        left > -radius + tolerance
+        or right < radius - tolerance
+        or not (abs(left + radius) <= tolerance or abs(right - radius) <= tolerance)
+    ):
+        return None
+    return {
+        "basis": "one_native_circle_and_one_collinear_diameter_caption_rule",
+        "circle_handle": circle.dxf.handle,
+        "circle_center": center,
+        "circle_radius": radius,
+        "line_handle": line.dxf.handle,
+        "line_start": start,
+        "line_end": end,
+        "additional_line_or_arrow_primitives": False,
+    }
+
+
+def _native_title_backreference(scope, entity, page_scope, connected_plan_page):
+    """Recognize a native titled subview's return code, not a new source cut."""
+    if (
+        not connected_plan_page
+        or scope.view.role not in {"section", "elevation"}
+        or entity.entity_type != "ATTRIB"
+        or page_scope.get("classification") != "CURRENT_NATIVE_PAGE_RETAINED"
+    ):
+        return None
+    parent_handle = entity.geometry.get("parent_insert_handle")
+    pairs = [
+        p
+        for p in scope.reference_pairs_by_parent.get(parent_handle, [])
+        if entity.id in p.entity_ids and p.code == connected_plan_page
+    ]
+    if len(pairs) != 1:
+        return None
+    pair = pairs[0]
+    if _title_kind(scope, pair) != scope.view.role:
+        return None
+    parent = scope.document.entitydb.get(parent_handle)
+    if parent is None or parent.dxftype() != "INSERT" or parent.block() is None:
+        return None
+    geometry = _native_title_rule_geometry(parent)
+    if geometry is None:
+        return None
+    try:
+        # Native title references are paper-space records: viewport freezing
+        # applies to model content, not to the paper caption itself.
+        geometry_visibility = _native_object_visibility(scope.document, parent, set())
+        attrs = [
+            attribute
+            for attribute in parent.attribs
+            if (native := scope.native_by_handle.get((entity.space, attribute.dxf.handle)))
+            is not None
+            and scope.visible(native)
+        ]
+    except (ViewContextBuildError, KeyError):
+        return None
+    role_text = {"section": "SECTION", "elevation": "ELEVATION"}[scope.view.role]
+    texts = [a.dxf.text.strip() for a in attrs]
+    if role_text not in texts or not any(
+        "SCALE" in t.upper() and ("图" in t or role_text in t.upper()) for t in texts
+    ):
+        return None
+    owners = []
+    for sheet in scope.sheets.values():
+        if sheet.source_file_id != scope.sheet.source_file_id:
+            continue
+        candidate = SimpleNamespace(
+            sheet=sheet,
+            sheets=scope.sheets,
+            native=scope.native,
+            native_by_handle=scope.native_by_handle,
+            visible=scope.visible,
+        )
+        try:
+            if _page(candidate) != _page(scope):
+                continue
+            _verify_target_title_owner(candidate, pair)
+        except ViewContextBuildError:
+            continue
+        owners.append(sheet)
+    if len(owners) != 1:
+        return None
+    return {
+        "kind": "native_same_parent_view_title_backreference",
+        "parent_insert_handle": parent_handle,
+        "native_attribute_handles": [a.dxf.handle for a in attrs],
+        "native_attribute_texts": texts,
+        "native_title_geometry": geometry,
+        "native_title_geometry_visibility": geometry_visibility,
+        "local_view_number": pair.view_number,
+        "backreference_page": pair.code,
+        "owner_sheet_id": owners[0].id,
+        "owner_viewport_handle": owners[0].viewport_handle,
+        "does_not_prove_component_ownership": True,
+    }
+
+
+def build_view_context(
+    index_path,
+    panels_path,
+    selections_path,
+    *,
+    side,
+    relations_path=None,
+    graphic_reviews_path=None,
+):
     """Return context, generation receipt and separate disposition claims.
 
     No quantities, prices, TakeoffItems, policies or input files are changed.
@@ -1044,6 +1297,8 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     producer_paths = {
         "producer_sha256": Path(__file__),
         "native_cut_path_producer_sha256": Path(native_cut_paths.__file__),
+        "native_reference_scope_producer_sha256": Path(native_reference_scope.__file__),
+        "native_graphic_review_producer_sha256": Path(native_graphic_review.__file__),
     }
     producer_hashes = {key: sha256_file(path) for key, path in producer_paths.items()}
     paths = {
@@ -1053,6 +1308,8 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     }
     if relations_path is not None:
         paths["relations"] = Path(relations_path).resolve()
+    if graphic_reviews_path is not None:
+        paths["graphic_reviews"] = Path(graphic_reviews_path).resolve()
     hashes = {key: sha256_file(path) for key, path in paths.items()}
     index, panels = _read(paths["index"]), _read(paths["panels"])
     selection = ContextSelections.model_validate(_read(paths["selections"]))
@@ -1065,8 +1322,27 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     selected_sids = {v.sheet_id for c in selection.components for v in c.views}
     _require(selected_sids.issubset(initial_sheets), "selected sheet absent from panels")
     source_ids = {initial_sheets[sid].source_file_id for sid in selected_sids}
+    graphic_reviews = {}
+    if "graphic_reviews" in paths:
+        review_bundle = _read(paths["graphic_reviews"])
+        _require(
+            isinstance(review_bundle, dict)
+            and set(review_bundle) == {"schema_version", "sources"}
+            and review_bundle["schema_version"] == "cad-view-graphic-reviews/1"
+            and isinstance(review_bundle["sources"], list),
+            "invalid explicit graphic-review bundle",
+        )
+        for entry in review_bundle["sources"]:
+            _require(
+                isinstance(entry, dict)
+                and set(entry) == {"source_file_id", "review"}
+                and entry["source_file_id"] in source_ids
+                and entry["source_file_id"] not in graphic_reviews,
+                "graphic review source missing, duplicated or outside selected sources",
+            )
+            graphic_reviews[entry["source_file_id"]] = entry["review"]
     native_list, sheets, entities, sources, scan_issues, panel_warnings = _source_replay(
-        index, panels, source_ids
+        index, panels, source_ids, graphic_reviews
     )
     native = _unique(native_list, "verified native entity")
     context = {
@@ -1081,6 +1357,12 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
     }
     claims, component_receipts, owned_native = {}, [], {}
     source_documents = {s["source_file_id"]: ezdxf.readfile(s["source_path"]) for s in sources}
+    reference_scopes = {
+        fid: native_reference_scope.NativeReferenceScope(
+            document, source_file_id=fid, native_entities=native_list, sheets=sheets.values()
+        )
+        for fid, document in source_documents.items()
+    }
     for component in selection.components:
         role_map = {view.role: view for view in component.views}
         second_role = "section" if component.basis_kind == "plan_section" else "elevation"
@@ -1092,7 +1374,14 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
             len({v.sheet_id for v in component.views}) == 2, "two views require distinct panels"
         )
         scopes = {
-            role: _Scope(view, sheets, entities, native, source_documents)
+            role: _Scope(
+                view,
+                sheets,
+                entities,
+                native,
+                source_documents,
+                reference_scope=reference_scopes[sheets[view.sheet_id].source_file_id],
+            )
             for role, view in role_map.items()
         }
         plan, target = scopes["plan"], scopes[second_role]
@@ -1278,7 +1567,9 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
                         else "verified selected positive connection",
                     }
                 )
-            unprojected, missing_issues = scope.unprojected_references(selected_refs)
+            unprojected, missing_issues = scope.unprojected_references(
+                selected_refs, connected_plan_page=_page(plan)
+            )
             inventory.extend(unprojected)
             component_scan_issues.extend(missing_issues)
             for candidate in unprojected:
@@ -1394,6 +1685,14 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
         "source changed during build",
     )
     _require(
+        all(
+            Path(asset["path"]).is_file() and sha256_file(Path(asset["path"])) == asset["sha256"]
+            for source in sources
+            for asset in (source.get("native_graphic_review") or {}).get("reviewed_artifacts", [])
+        ),
+        "reviewed graphic artifact changed during build",
+    )
+    _require(
         producer_hashes == {key: sha256_file(path) for key, path in producer_paths.items()},
         "producer code changed during build",
     )
@@ -1407,11 +1706,24 @@ def build_view_context(index_path, panels_path, selections_path, *, side, relati
 
 
 def verify_view_context_receipt(
-    index_path, panels_path, selections_path, context, receipt, *, side, relations_path=None
+    index_path,
+    panels_path,
+    selections_path,
+    context,
+    receipt,
+    *,
+    side,
+    relations_path=None,
+    graphic_reviews_path=None,
 ):
     """Reproduce all CAD facts, rejecting drift and caller-edited contexts/receipts."""
     current = build_view_context(
-        index_path, panels_path, selections_path, side=side, relations_path=relations_path
+        index_path,
+        panels_path,
+        selections_path,
+        side=side,
+        relations_path=relations_path,
+        graphic_reviews_path=graphic_reviews_path,
     )
     _require(current["context"] == context, "context differs from verified CAD rebuild")
     _require(current["receipt"] == receipt, "receipt differs from verified CAD rebuild")
@@ -1425,18 +1737,39 @@ def main(argv=None):
     parser.add_argument("selections")
     parser.add_argument("--side", choices=("predicted", "gold"), required=True)
     parser.add_argument("--relations")
+    parser.add_argument(
+        "--graphic-reviews", help="Explicit source/payload/instance-bound semantic reviews"
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--claims")
     args = parser.parse_args(argv)
+    declared_graphic_inputs = (
+        _declared_graphic_artifact_paths(_read(args.graphic_reviews))
+        if args.graphic_reviews
+        else set()
+    )
     result = build_view_context(
-        args.index, args.panels, args.selections, side=args.side, relations_path=args.relations
+        args.index,
+        args.panels,
+        args.selections,
+        side=args.side,
+        relations_path=args.relations,
+        graphic_reviews_path=args.graphic_reviews,
     )
     outputs = [Path(p).resolve() for p in (args.out, args.receipt, args.claims) if p]
     inputs = {
-        Path(p).resolve() for p in (args.index, args.panels, args.selections, args.relations) if p
+        Path(p).resolve()
+        for p in (args.index, args.panels, args.selections, args.relations, args.graphic_reviews)
+        if p
     }
     inputs.update(Path(s["source_path"]).resolve() for s in result["receipt"]["sources"])
+    inputs.update(declared_graphic_inputs)
+    inputs.update(
+        Path(asset["path"]).resolve()
+        for source in result["receipt"]["sources"]
+        for asset in (source.get("native_graphic_review") or {}).get("reviewed_artifacts", [])
+    )
     _require(
         len(set(outputs)) == len(outputs) and not set(outputs) & inputs,
         "output overwrites input/source",

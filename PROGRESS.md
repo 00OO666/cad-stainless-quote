@@ -4,6 +4,29 @@
 
 ## 当前结论
 
+### Native-page references and explicit embedded-graphic review
+
+The bounded context producer now retains and classifies native references from
+other verified paper frames, visible local-view title backreferences, and explicit
+fastener construction notes. It does not discard a reference merely because it
+was clipped out of a selected viewport. Boundary ambiguity, hidden title evidence,
+extra arrow geometry and independent repeated reference text remain unresolved.
+
+Embedded OLE warnings can be reviewed against the exact original payload and
+complete active instance inventory. Source and reindex warning multiplicities,
+native transforms, reviewed artifacts and code/source hashes are checked; all
+original warnings remain in the receipt. This is an explicit content-review
+contract, not automatic graphic understanding or an all-OLE whitelist. Invalid
+reviews still block and their declared artifacts cannot be overwritten by output.
+
+Separate CAD-only development predictions now carry original plan, ordinary
+elevation, product-view and local-section images alongside bounded takeoff
+claims. Independent original-geometry audits distinguish physical correspondence
+from unresolved original directional callouts. Frozen full-field comparison is
+unchanged: partial numeric agreement and text-label differences do not count as
+complete correct rows. Known-project research is not unseen validation; the
+end-to-end 95% target remains unproven.
+
 ### Native cutting paths: bounded production integration
 
 The standalone context producer now uses native triangle/circular-divider

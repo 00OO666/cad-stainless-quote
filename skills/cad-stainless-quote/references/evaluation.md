@@ -227,7 +227,59 @@ source validation: a numeric/text match must be accompanied by a valid productio
 CAD evidence chain before it is reported as a verified CAD takeoff row. Report
 missing enabled fields and unresolved ownership explicitly, not as price issues.
 
-### Diagnostic metrics
+### Native-page scope and explicit embedded-graphic review
+
+The context producer retains unprojected references in its negative-search
+inventory. `native_reference_scope` can classify a reference as belonging to
+another native page only when the reference and its supported parent geometry
+are strictly inside a unique closed original frame with a native page identity.
+Boundary contact, overlapping frames, unknown bounds and missing identity stay
+unresolved. This is a negative scope decision, not component ownership.
+
+A visible native view title's return reference is metadata only with a unique
+same-page viewport owner, actual same-parent role/caption attributes and a
+supported original circle-and-diameter title rule. Extra arrow linework and
+hidden captions are not title evidence. An explicit metric-bolt fixing note can
+avoid a false drawing-code match only if removing the matched fastener spans
+leaves no other reference, including a second occurrence of the same code.
+
+OLE warnings are blocking by default. When the actual payload has been safely
+extracted and its active image content explicitly reviewed as non-reference
+graphics, supply a separate private review file:
+
+```powershell
+python -m cadquote.view_context_builder index.json panels.json selections.json `
+  --side predicted --graphic-reviews graphic-reviews.json `
+  --out current-context.json --receipt context-receipt.json
+```
+
+The wrapper has `schema_version=cad-view-graphic-reviews/1` and `sources`, each
+with `source_file_id` and a `review` object. The nested manifest has
+`schema_version=native-graphic-review/1`, `source_sha256`, reviewer/time/reason,
+`definitions`, and every active `instance`. Each reviewed definition identifies
+the native handle, owner block, exact payload hash/size, original payload file,
+reviewed image file, both file hashes, and explicit
+`semantic_classification=NON_REFERENCE_GRAPHIC`. Instances retain layout, space,
+handle/block chains, native transforms, and original/transformed bounds.
+See `native_graphic_review.py` for the strict native inventory fields.
+
+The producer independently reopens the source and checks every definition and
+active instance, exact source/reindex warning multiplicity, artifacts and
+runtime code hashes. It keeps the classified original warnings in the receipt.
+Invalid or incomplete reviews remain blocking even if no warning remains in a
+particular batch. Output protection includes all declared review artifacts,
+including those in an invalid review. Unsupported instance recursion, external
+references or extra/unrecognized warnings are not covered by this review.
+
+Semantic classification is a trusted, explicitly recorded review, not automatic
+OCR or authenticated by a hash. Do not waive all OLE objects, activate embedded
+objects, or use a customer's block name/content hash as a public whitelist.
+Non-graphical proxy dictionaries are also not proof that unknown dynamic
+semantics were interpreted. Store customer content, review manifests and
+specific audit findings privately. A verified bounded context still says
+nothing by itself about whole-project completeness or full-row accuracy.
+
+### Diagnostic metric definitions
 
 - MT/material-code occurrence recall and precision.
 - Physical component recall and duplicate rate.
