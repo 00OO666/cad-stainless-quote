@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import runpy
 import site
 import sys
@@ -56,6 +57,14 @@ def as_path(value):
     return Path(os.fsdecode(value)).resolve()
 
 
+def is_platform_null_device(value):
+    """Recognize only the OS null-device spelling, never a similar project path."""
+    if not isinstance(value, (str, bytes, os.PathLike)):
+        return False
+    value = os.fsdecode(value)
+    return value.lower() == os.devnull.lower() if os.name == "nt" else value == os.devnull
+
+
 def prepare_fd_resolver():
     """Load Windows handle functions before the hook; never guess an fd's path."""
     if os.name == "nt":
@@ -99,7 +108,33 @@ def runtime_roots():
         values.update(site.getsitepackages())
     except AttributeError:
         pass
+    # Isolated runners can inject installed packages through their startup path
+    # without changing sysconfig's prefix. Do not admit arbitrary path entries.
+    values.update(
+        value
+        for value in sys.path
+        if value and Path(value).name in {"site-packages", "dist-packages"}
+    )
     return sorted({as_path(value) for value in values if value}, key=str)
+
+
+def install_native_windows_version_probe():
+    """Avoid old platform.win32_ver shell probes without permitting subprocesses."""
+    if os.name != "nt" or not hasattr(platform, "_syscmd_ver"):
+        return None
+    original = platform._syscmd_ver
+
+    def native_version(
+        system="", release="", version="", supported_platforms=("win32", "win16", "dos")
+    ):
+        if sys.platform not in supported_platforms:
+            return system, release, version
+        windows = sys.getwindowsversion()
+        version_parts = windows.platform_version or windows[:3]
+        return "Microsoft", "Windows", ".".join(str(part) for part in version_parts)
+
+    platform._syscmd_ver = native_version
+    return original
 
 
 def font_roots():
@@ -236,6 +271,24 @@ class Boundary:
 
     def on_open(self, args):
         try:
+            reads, writes, truncates = open_access(args[1], args[2])
+            if is_platform_null_device(args[0]):
+                # Some Windows runtime versions open bare "nul" with O_RDWR.
+                # It has no project bytes or persistent writes; do not grant
+                # this exception to other devices, aliases, or lookalike paths.
+                self.record(
+                    "open",
+                    "ALLOWED",
+                    basis="null_device",
+                    path=os.devnull,
+                    mode=args[1],
+                    flags=args[2],
+                    reads=reads,
+                    writes=writes,
+                    inside_project=False,
+                    filesystem_data=False,
+                )
+                return
             if (
                 args[1] is None
                 and type(args[0]) is not int
@@ -247,7 +300,6 @@ class Boundary:
                     "open", "relative os.open path has ambiguous dir_fd", raw_args=repr(args)
                 )
             path = self.path(args[0])
-            reads, writes, truncates = open_access(args[1], args[2])
         except BoundaryViolation:
             raise
         except (OSError, ValueError, TypeError, IndexError) as error:
@@ -448,6 +500,13 @@ def run(args):
     target_exit = 0
     old_argv, old_path, old_cwd = sys.argv, sys.path.copy(), Path.cwd()
     boundary.phase = "target"
+    original_windows_probe = install_native_windows_version_probe()
+    if original_windows_probe is not None:
+        boundary.record(
+            "runtime_compatibility",
+            "NATIVE_API",
+            basis="platform Windows version uses sys.getwindowsversion, not shell probes",
+        )
     try:
         os.chdir(root)
         sys.argv = [str(script), *target_args]
@@ -465,6 +524,8 @@ def run(args):
             "traceback": traceback.format_exc(),
         }
     finally:
+        if original_windows_probe is not None:
+            platform._syscmd_ver = original_windows_probe
         sys.argv, sys.path = old_argv, old_path
         os.chdir(old_cwd)
     boundary.phase = "source_hash_after"
@@ -513,6 +574,7 @@ def run(args):
             and event.get("reads")
             and event["decision"] == "ALLOWED"
             and event.get("basis") != "code_or_import"
+            and event.get("filesystem_data") is not False
         ],
         "open_events_are_attempts_not_byte_counts": True,
         "events": boundary.events.copy(),

@@ -132,6 +132,67 @@ class ReplayAuditTests(unittest.TestCase):
         payload = self.assert_denied("import os\nos.open('input.dxf', os.O_RDONLY)\n")
         self.assertTrue(any("ambiguous dir_fd" in item["reason"] for item in payload["violations"]))
 
+    def test_exact_platform_null_device_is_not_project_data(self):
+        result, payload = self.run_case(
+            "import os\n"
+            "fd = os.open(os.devnull, os.O_RDWR)\n"
+            "assert os.read(fd, 8) == b''\n"
+            "assert os.write(fd, b'synthetic') == 9\n"
+            "os.close(fd)\n"
+            "with open(os.devnull, 'wb') as stream:\n stream.write(b'synthetic')\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        null_events = [event for event in payload["events"] if event.get("basis") == "null_device"]
+        self.assertEqual(len(null_events), 2)
+        self.assertTrue(all(event["decision"] == "ALLOWED" for event in null_events))
+        self.assertTrue(all(event["filesystem_data"] is False for event in null_events))
+        self.assertFalse(payload["project_data_reads"])
+
+    def test_null_device_exception_rejects_lookalikes_and_descriptors(self):
+        self.assertTrue(audit.is_platform_null_device(os.devnull))
+        for value in ("null", "nul.json", "NUL.json", "deps/nul", "./nul", "CON", 0, 2):
+            with self.subTest(value=value):
+                self.assertFalse(audit.is_platform_null_device(value))
+        self.assert_denied("import os\nos.open('nul.json', os.O_RDWR | os.O_CREAT)\n")
+        if os.name == "nt":
+            self.assertTrue(audit.is_platform_null_device("NUL"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows-native runtime compatibility")
+    def test_windows_version_probe_needs_no_child_process_or_pipe(self):
+        result, payload = self.run_case(
+            "import platform, sys\n"
+            "version = platform.win32_ver()[1]\n"
+            "assert version and all(part.isdigit() for part in version.split('.'))\n"
+            "native = platform._syscmd_ver()[2]\n"
+            "assert native == '.'.join(map(str, sys.getwindowsversion().platform_version))\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(payload["violations"])
+        self.assertTrue(
+            any(event["event"] == "runtime_compatibility" for event in payload["events"])
+        )
+
+    def test_pipe_descriptors_do_not_gain_null_device_exception(self):
+        self.assert_denied("import os\nr, w = os.pipe()\nos.fdopen(r, 'rb')\n")
+
+    def test_startup_package_root_does_not_exempt_project_json(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            packages = root / "site-packages"
+            packages.mkdir()
+            with patch.object(audit.sys, "path", [str(packages), str(root / "arbitrary")]):
+                runtime = audit.runtime_roots()
+            self.assertIn(packages, runtime)
+            self.assertNotIn(root / "arbitrary", runtime)
+            # Exercise the project-first policy without installing a global hook.
+            boundary = object.__new__(audit.Boundary)
+            boundary.root, boundary.out_root = root, root / "out"
+            boundary.sources, boundary.created = set(), set()
+            boundary.runtime = runtime
+            self.assertIsNone(boundary.readable(packages / "private.json"))
+
     def test_runtime_dxf_and_plot_libraries_use_current_output(self):
         result, payload = self.run_case(
             "from pathlib import Path\nimport ezdxf\n"

@@ -35,6 +35,12 @@ report retains every rejection and the full target exception without truncation.
 Integer file descriptors are resolved to their actual filesystem paths. Use
 absolute paths with `os.open`: its Python audit event omits `dir_fd`, so relative
 `os.open` calls are rejected. Ordinary `open` calls may use relative paths.
+The exact operating-system null device (`nul` on Windows, `/dev/null` on POSIX)
+is allowed and logged separately because it has no project data or persistent
+output. Similar filenames and other device names receive no exception.
+On Windows, legacy `platform` version queries use `sys.getwindowsversion()`
+instead of spawning shell commands. This compatibility step is recorded in the
+audit; subprocesses and unresolved pipe descriptors remain blocked.
 Links and child-process execution are outside this diagnostic and are blocked.
 
 The command exits with `0` for `AUDITED_PASS` and `2` for a failed audit or setup.
