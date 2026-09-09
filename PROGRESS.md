@@ -4,6 +4,14 @@
 
 ## 当前结论
 
+### Dimension-scope regression coverage
+
+Added synthetic tests for adjacent substrate and metal profiles that share a horizontal span but occupy different vertical intervals. The tests cover translation, reflection, vertex and dimension-endpoint reversal, equal-valued dimensions at unrelated origins, and input preservation. The existing binding function passes these cases; this change adds regression coverage rather than introducing a new production resolver.
+
+Development diagnostics now explicitly distinguish hidden symbol branches from drawable geometry and separate external section paths from the reference-symbol envelope. These diagnostics are not a new production feature. Neither a bounding-box intersection nor its absence establishes component ownership or proves that a detail does not exist.
+
+Mixed physical groups and fabrication-profile interpretations remain separate from numeric agreement. Customer evidence stays private; no case measurements, drawings, workbooks, or project accuracy statistics are included. This update does not establish held-out CAD-to-quotation accuracy.
+
 ### Development review update
 
 Recent development reviews examined native model-to-paper-space binding, nested insert traversal, and physical identity across repeated views. Cross-view deduplication uses shared source entities, viewport visibility, and component boundaries rather than matching labels or numerical similarity. Competing interpretations remain visible in the audit record.
