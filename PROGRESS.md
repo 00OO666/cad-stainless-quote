@@ -4,6 +4,20 @@
 
 ## 当前结论
 
+### Room-scoped count review and measurement-basis separation
+
+Private review now tests opposing-end construction and orthogonal view bindings
+before treating a return edge as another billable screen. Counts are limited to
+the explicitly bound room and physical measurement group; a background assembly
+count is not a glass cutting-piece count. Confirming that count does not resolve
+gross-versus-net area, so an unresolved measurement basis continues to block the
+main quantity result while a separately labelled geometric candidate is retained.
+
+The narrow workbook update preserves prior evidence and unrelated cells. This is
+reviewed development work, not a released automatic rule, a changed acceptance
+policy or a new whole-row accuracy claim. Customer data and case-specific code
+remain private; the installed skill and production pipeline are unchanged.
+
 ### Candidate resolution and auditable calculation drafts
 
 Private development now distinguishes a resolved dimension role, a calculable
