@@ -432,6 +432,7 @@ def command_run(args: argparse.Namespace) -> int:
         currency=args.currency,
         tax_included=args.tax_included,
         render_evidence=not args.no_render,
+        export_workbook=not getattr(args, "no_workbook", False),
         stainless_code_families=sorted(stainless_families),
         review_code_families=sorted(review_families),
     )
@@ -448,6 +449,7 @@ def command_resume(args: argparse.Namespace) -> int:
         currency=args.currency,
         tax_included=args.tax_included,
         render_evidence=not args.no_render,
+        export_workbook=not getattr(args, "no_workbook", False),
     )
     _print(_pipeline_cli_summary(result))
     return 0 if result.status.value in {"PASS", "REVIEW"} else 2
@@ -1722,6 +1724,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="追加只进入低置信审核的材料代号家族（可重复）",
     )
     run.add_argument("--no-render", action="store_true", help="跳过MT局部证据图渲染")
+    run.add_argument("--no-workbook", action="store_true", help="只生成JSON审图资料，不导出Excel")
     run.set_defaults(handler=command_run)
 
     resume = subparsers.add_parser("resume", help="复用已有索引和候选，重跑审核、计价和导出")
@@ -1736,6 +1739,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="要求价格含税口径true/false（默认继承原运行）",
     )
     resume.add_argument("--no-render", action="store_true", help="跳过MT局部证据图渲染")
+    resume.add_argument(
+        "--no-workbook", action="store_true", help="只生成JSON审图资料，不导出Excel"
+    )
     resume.set_defaults(handler=command_resume)
 
     ingest = subparsers.add_parser("ingest", help="安全复制或解包输入")

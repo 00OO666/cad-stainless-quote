@@ -60,6 +60,7 @@ from .mt import (
 from .panels import PanelExpansion, choose_analysis_view, expand_viewport_panels
 from .pricing import apply_price, load_price_book
 from .render import render_regions
+from .route_review_context import load_route_review_context
 from .takeoff import TakeoffBuildResult, build_takeoff
 from .vector_probe import probe_repeated_vectors
 
@@ -116,12 +117,14 @@ class PipelineResult:
     counts: dict[str, int] = field(default_factory=dict)
     issues: list[RunIssue] = field(default_factory=list)
     paths: dict[str, str] = field(default_factory=dict)
+    workbook_export: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status.value,
             "run_dir": self.run_dir,
             "quote_path": self.quote_path,
+            "workbook_export": self.workbook_export,
             "manifest_path": self.manifest_path,
             "counts": self.counts,
             "issues": [issue.model_dump(mode="json") for issue in self.issues],
@@ -951,6 +954,7 @@ def _build_review_pack(
     material_mentions: Sequence[MaterialMention] = (),
     material_mention_edges: Sequence[EvidenceEdge] = (),
     vector_probe_payload: Mapping[str, Any] | None = None,
+    route_review_context: Mapping[str, Any] | None = None,
     issues: Sequence[RunIssue] = (),
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1343,6 +1347,7 @@ def _build_review_pack(
             ],
         },
         "vector_quantity_evidence": dict(vector_probe_payload or {}),
+        "detail_route_context": dict(route_review_context or {}),
         "evidence_catalog": {
             "source_files": {
                 source_id: _source_ref(source_by_id[source_id])
@@ -2323,6 +2328,7 @@ def run_pipeline(
     tax_included: bool | None = None,
     ingest_limits: IngestLimits | None = None,
     render_evidence: bool = True,
+    export_workbook: bool = True,
     stainless_code_families: Sequence[str] | None = None,
     review_code_families: Sequence[str] | None = None,
 ) -> PipelineResult:
@@ -2338,6 +2344,12 @@ def run_pipeline(
         directory.mkdir(parents=True, exist_ok=True)
     issues: list[RunIssue] = []
     result = PipelineResult(status=ReviewStatus.BLOCK, run_dir=str(root), issues=issues)
+    workbook_export = {
+        "enabled": export_workbook,
+        "state": "ENABLED" if export_workbook else "SKIPPED",
+        "reason": None if export_workbook else "requested_json_review_only",
+    }
+    result.workbook_export = workbook_export
     stainless_families = tuple(
         DEFAULT_STAINLESS_CODE_FAMILIES
         if stainless_code_families is None
@@ -2428,6 +2440,7 @@ def run_pipeline(
         detail_routes, build_node_view_groups(sheets, route_native))
     detail_routes["native_frame_context"] = route_context
     write_json_atomic(detail_route_path, detail_routes)
+    route_review_context = load_route_review_context(root, sheets, freshly_generated=True)
 
     workbook_materials, material_issues = _load_materials(
         ingest.files,
@@ -2653,9 +2666,11 @@ def run_pipeline(
             material_mentions=material_mentions,
             material_mention_edges=material_mention_edges,
             vector_probe_payload=vector_probe_payload,
+            route_review_context=route_review_context,
             issues=issues,
             metadata={
                 "run_mode": "full",
+                "workbook_export": workbook_export,
                 "input_sha256": ingest.input_sha256,
                 "excel_evidence": excel_evidence_metadata,
                 **price_metadata,
@@ -2695,7 +2710,7 @@ def run_pipeline(
             **price_metadata,
         },
         evidence_records=excel_evidence_records if render_evidence else None,
-    )
+    ) if export_workbook else None
     write_json_atomic(
         output_dir / "takeoff.json",
         [item.model_dump(mode="json") for item in priced_items],
@@ -2720,6 +2735,7 @@ def run_pipeline(
         issues=issues,
         metadata={
             "conversion": conversion.to_dict(),
+            "workbook_export": workbook_export,
             "drawing_catalog": {
                 "schema_version": drawing_catalog.get("schema_version"),
                 "json": str(drawing_catalog_path),
@@ -2767,7 +2783,7 @@ def run_pipeline(
 
     status = _overall_status(priced_items, issues)
     result.status = status
-    result.quote_path = str(quote_path)
+    result.quote_path = str(quote_path) if quote_path is not None else None
     result.manifest_path = str(manifest_path)
     result.counts = manifest.metadata["counts"]  # type: ignore[assignment]
     result.paths = {
@@ -2816,6 +2832,7 @@ def resume_pipeline(
     currency: str | None = None,
     tax_included: bool | None = None,
     render_evidence: bool = True,
+    export_workbook: bool = True,
 ) -> PipelineResult:
     """Re-run review, pricing and export using immutable stage snapshots.
 
@@ -2825,6 +2842,11 @@ def resume_pipeline(
     """
 
     root = Path(run_dir).expanduser().resolve()
+    workbook_export = {
+        "enabled": export_workbook,
+        "state": "ENABLED" if export_workbook else "SKIPPED",
+        "reason": None if export_workbook else "requested_json_review_only",
+    }
     analysis_dir = root / "analysis"
     index_path = root / "index" / "cad_index.json"
     panels_path = analysis_dir / "panels.json"
@@ -2879,6 +2901,7 @@ def resume_pipeline(
         original_entities,
         panel_expansion,
     )
+    route_review_context = load_route_review_context(root, sheets)
     snapshot_materials = [
         MaterialSpec.model_validate(value)
         for value in json.loads(materials_path.read_text(encoding="utf-8"))
@@ -3070,9 +3093,11 @@ def resume_pipeline(
             material_mentions=material_mentions,
             material_mention_edges=material_mention_edges,
             vector_probe_payload=vector_probe_payload,
+            route_review_context=route_review_context,
             issues=issues,
             metadata={
                 "run_mode": "resume",
+                "workbook_export": workbook_export,
                 "resumed_at": resumed_at,
                 "reused_snapshots": [str(path) for path in required],
                 "pricing_context_audit": pricing_audit_event,
@@ -3114,7 +3139,7 @@ def resume_pipeline(
             **price_metadata,
         },
         evidence_records=excel_evidence_records if render_evidence else None,
-    )
+    ) if export_workbook else None
     write_json_atomic(
         output_dir / "takeoff.json",
         [item.model_dump(mode="json") for item in priced_items],
@@ -3179,6 +3204,7 @@ def resume_pipeline(
         issues=issues,
         metadata={
             **previous_metadata,
+            "workbook_export": workbook_export,
             "conversion": conversion_metadata,
             "counts": counts,
             "last_resumed_at": resumed_at,
@@ -3203,7 +3229,8 @@ def resume_pipeline(
     result = PipelineResult(
         status=_overall_status(priced_items, issues),
         run_dir=str(root),
-        quote_path=str(quote_path),
+        quote_path=str(quote_path) if quote_path is not None else None,
+        workbook_export=workbook_export,
         manifest_path=str(manifest_path),
         counts=counts,
         issues=issues,

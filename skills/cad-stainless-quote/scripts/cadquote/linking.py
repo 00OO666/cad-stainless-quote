@@ -25,17 +25,17 @@ from .models import CadEntity, EvidenceEdge, MtOccurrence, ReviewStatus, Sheet
 from .mt import entity_center
 
 _REF_RE = re.compile(
-    r"(?<![A-Z0-9])(?:[A-Z0-9]{1,4}-){1,2}\d{1,4}(?![A-Z0-9])",
+    r"(?<![A-Z0-9-])(?:[A-Z0-9]{1,4}-){1,2}\d{1,4}(?![A-Z0-9]|-[A-Z0-9])",
     re.I,
 )
 _COMPACT_REF_RE = re.compile(
-    r"(?<![A-Z0-9])(?:(?P<section>[AB])(?P<kind>[ED])|(?P<prefix>EL|DS|DT|FD|TD|CD|P|M))"
-    r"[- ]?(?P<number>\d{1,3})(?![A-Z0-9])",
+    r"(?<![A-Z0-9-])(?:(?P<section>[AB])(?P<kind>[ED])|(?P<prefix>EL|DS|DT|FD|TD|CD|P|M))"
+    r"[- ]?(?P<number>\d{1,3})(?![A-Z0-9]|-[A-Z0-9])",
     re.I,
 )
 _RANGE_RE = re.compile(
-    r"(?P<left>(?:[A-Z0-9]{1,4}-){1,2}\d{1,4})\s*[~～至]\s*"
-    r"(?P<right>(?:(?:[A-Z0-9]{1,4}-){1,2})?\d{1,4})",
+    r"(?<![A-Z0-9-])(?P<left>(?:[A-Z0-9]{1,4}-){1,2}\d{1,4})\s*[~～至]\s*"
+    r"(?P<right>(?:(?:[A-Z0-9]{1,4}-){1,2})?\d{1,4})(?![A-Z0-9]|-[A-Z0-9])",
     re.I,
 )
 _DETACHED_REF_PREFIX_RE = re.compile(r"^(?:[AB]-[ED]|EL|DS|DT|FD|TD|CD|P|M)-?$", re.I)
@@ -49,6 +49,23 @@ _STRUCTURED_VIEW_NUMBER_RE = re.compile(
     r"^(?:0*(?P<number>\d{1,3})(?P<suffix>[A-Z]?)|(?P<letter>[A-D]))$",
     re.I,
 )
+# GC is the established project-material namespace; its family is not limited
+# to stainless/wood/glass (PF, AC, etc. must not become fictitious drawing IDs).
+# Bare PL/ST/PT may be real drawing prefixes, so never exclude them globally.
+_MATERIAL_NAMESPACE_RE = re.compile(r"^(?:GC-[A-Z]{1,4}|MT)-\d{1,4}$")
+_FLOOR_NAMESPACE_RE = re.compile(r"^(B\d+F?|\d+F)[A-Z]?-", re.I)
+
+
+def _floor_namespace(sheet: Sheet) -> str | None:
+    """Only explicit drawing-number floor prefixes, never title/name guesses."""
+    code = normalize_reference_code(sheet.drawing_number)
+    match = _FLOOR_NAMESPACE_RE.match(code or "")
+    if not match:
+        return None
+    floor = match.group(1).upper()
+    if floor.startswith("B"):
+        return f"B{int(floor[1:].removesuffix('F'))}"
+    return f"{int(floor.removesuffix('F'))}F"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +96,10 @@ def normalize_reference_code(value: Any) -> str | None:
 
     text = unicodedata.normalize("NFKC", normalize_text(value)).upper()
     text = re.sub(r"[—–－_:/／\\\s]+", "-", text).strip("-")
+    # These established material-code namespaces are not drawing references.
+    # Material similarity remains available separately through same_mt evidence.
+    if _MATERIAL_NAMESPACE_RE.fullmatch(text):
+        return None
     match = re.fullmatch(r"((?:[A-Z0-9]{1,4}-){1,2})(\d{1,4})", text)
     if not match:
         compact = _COMPACT_REF_RE.fullmatch(text.replace("-", ""))
@@ -125,6 +146,9 @@ def extract_reference_codes(value: Any) -> set[str]:
     text = unicodedata.normalize("NFKC", normalize_text(value)).upper()
     text = text.replace("—", "-").replace("–", "-").replace("－", "-")
     result: set[str] = set()
+    # Hyphenated ASCII segments are one token: EL-01 inside 9F-EL-01 is not a
+    # second floorless reference. A trailing hyphen before a Chinese room/title
+    # is a description separator, however, so retain 1F-EL-01 from ...-大厅.
     for match in _RANGE_RE.finditer(text):
         result.update(_expand_range(match.group("left"), match.group("right")))
     for match in _REF_RE.finditer(text):
@@ -178,9 +202,7 @@ def extract_structured_reference_callouts(
                 default=None,
             )
             codes = {
-                code
-                for code in extracted_codes
-                if (code.count("-"), len(code)) == specificity
+                code for code in extracted_codes if (code.count("-"), len(code)) == specificity
             }
             for code in codes:
                 references[code].add(entity.id)
@@ -339,9 +361,7 @@ def _confirmed_map(
         for key, value in iterator:
             if isinstance(key, Sequence) and not isinstance(key, (str, bytes)) and len(key) == 2:
                 basis = (
-                    value
-                    if isinstance(value, Sequence) and not isinstance(value, str)
-                    else [value]
+                    value if isinstance(value, Sequence) and not isinstance(value, str) else [value]
                 )
                 result[(str(key[0]), str(key[1]))] = [str(item) for item in basis if item]
         return result
@@ -394,6 +414,18 @@ def _rank_relation(
             explicit_drawing_codes = sorted(set(source_refs) & target_drawing_codes)
             pair = (source.id, target.id)
             is_confirmed = pair in confirmed
+            source_floor, target_floor = _floor_namespace(source), _floor_namespace(target)
+            if (
+                source_floor
+                and target_floor
+                and source_floor != target_floor
+                and not explicit_drawing_codes
+                and not is_confirmed
+            ):
+                # Same material or title across floors cannot establish a route.
+                # Only the actual target drawing number (not a short title alias)
+                # can supply an explicit cross-floor exception.
+                continue
             basis: list[str] = []
             score = 0.02  # direction/type prior only
 
@@ -407,9 +439,7 @@ def _rank_relation(
                     basis.append(f"explicit_reference:{code}@{handles}")
                     if code in explicit_drawing_codes:
                         basis.append(f"drawing_sheet_reference:{code}@{handles}")
-                    basis.extend(
-                        sorted(source_reference_context.get(source.id, {}).get(code, ()))
-                    )
+                    basis.extend(sorted(source_reference_context.get(source.id, {}).get(code, ())))
 
             common_mt = sorted(source_mt & mt_by_sheet.get(target.id, set()))
             if common_mt:
@@ -497,9 +527,7 @@ def _rank_relation(
             or any(value.startswith("drawing_sheet_reference:") for value in edge.basis)
             or any(value.startswith("confirmed:") for value in edge.basis)
         ]
-        weak_candidates = [
-            edge for edge in ranked if edge not in explicit_or_confirmed
-        ]
+        weak_candidates = [edge for edge in ranked if edge not in explicit_or_confirmed]
         result.extend(explicit_or_confirmed)
         result.extend(weak_candidates[:top_k])
     return result
@@ -531,9 +559,7 @@ def rank_evidence_edges(
     mt_by_sheet, rooms_by_sheet = _occurrence_metadata(occurrence_list)
 
     source_entity_refs: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    source_reference_context: dict[str, dict[str, set[str]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
+    source_reference_context: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     entity_list = list(entities)
     for entity in entity_list:
         if not entity.sheet_id or not entity.text:
@@ -556,9 +582,7 @@ def rank_evidence_edges(
     plans = [sheet for sheet in sheet_list if sheet.kind in {"plan", "elevation_index"}]
     elevations = [sheet for sheet in sheet_list if sheet.kind == "elevation"]
     details = [
-        sheet
-        for sheet in sheet_list
-        if sheet.kind in {"detail", "door", "ceiling", "floor"}
+        sheet for sheet in sheet_list if sheet.kind in {"detail", "door", "ceiling", "floor"}
     ]
 
     edges = _rank_relation(

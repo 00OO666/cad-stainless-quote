@@ -4,6 +4,30 @@
 
 ## 当前结论
 
+### CAD-only review integration and drawing-reference namespace fixes
+
+New runs and resumes now expose the complete enhanced node-navigation context
+in the review pack, with source, index, panel, route and version consistency
+checks. Missing historical receipts and drift stay explicitly unavailable;
+candidate navigation does not select a physical component or mutate quantities.
+A JSON-only switch skips workbook export without touching existing workbooks.
+
+Drawing-reference retrieval now separates material namespaces from drawing
+codes and prevents a long drawing code from generating a misleading short
+suffix alias. Known cross-floor weak matches are rejected; genuine explicit
+full-page references remain review candidates. Synthetic counterexamples cover
+short-title bypasses and valid bare drawing prefixes.
+
+A standalone experimental freeze/replay contract checks declared CAD inputs,
+formula and count consistency, evidence files, and normalized output changes.
+It is file bookkeeping, not OS isolation, semantic validation or an accuracy
+claim. The skill now routes CAD-only work into model-guided semantic review
+instead of treating a candidate-only pipeline result as a finished takeoff.
+
+Known-sample cold-start and original-CAD visual review are ongoing. No new
+end-to-end accuracy or unseen generalization result is claimed. Customer data,
+case-specific scripts, images, policies and results remain private.
+
 ### Complete review coverage without conflating partial and accepted quantities
 
 The private development review now carries explicit calculation scenarios for
