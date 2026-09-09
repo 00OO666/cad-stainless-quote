@@ -4,6 +4,14 @@
 
 ## 当前结论
 
+### Repeatable development replay and file-access diagnostics
+
+Added an optional [file-boundary audit](devtools/replay-boundary-audit/README.md) for developer replay scripts. It records observable Python file access, restricts data inputs to declared sources, separates fresh outputs from preexisting results, and retains source hashes and denied attempts. Synthetic tests exercise direct opens, descriptors, hard links, child-process attempts, and generated CAD/plot outputs. This is not an operating-system sandbox, a security guarantee, or a blind-accuracy certificate.
+
+Private development work now separates semantic CAD retrieval, repeated calculation, frozen predictions, native drawing crops, and subsequent reference comparison. Field-level uncertainty and per-instance facts are retained across the replay comparison; equal totals alone do not establish repeatability. Duplicate boundaries, unresolved units, hidden title blocks, source-version mismatches, and geometry-versus-measurement roles remain explicit gates.
+
+The case-specific extractors, query configuration, customer artifacts, and local scoring remain private. This release adds developer diagnostics rather than a new production quotation resolver; the installed skill and production pipeline are unchanged. Known-sample replay is not whole-package discovery and does not establish held-out accuracy.
+
 ### Dimension-scope regression coverage
 
 Added synthetic tests for adjacent substrate and metal profiles that share a horizontal span but occupy different vertical intervals. The tests cover translation, reflection, vertex and dimension-endpoint reversal, equal-valued dimensions at unrelated origins, and input preservation. The existing binding function passes these cases; this change adds regression coverage rather than introducing a new production resolver.

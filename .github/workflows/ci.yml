@@ -31,5 +31,8 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      - name: Test optional replay file-boundary diagnostic
+        run: python -B devtools/replay-boundary-audit/test_audit_replay.py
+
       - name: Run lint checks
         run: python -m ruff check .
