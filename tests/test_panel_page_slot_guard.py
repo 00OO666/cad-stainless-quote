@@ -253,3 +253,26 @@ def test_one_page_attribute_must_not_drop_shorter_distinct_code(tag, value):
     result = expand(block, title_block("nearby", "FOO-E-77", (315, 190)))
     assert result.sheets[0].drawing_number is None
     assert any("UNPARSEABLE_NATIVE_PAGE_FRAMES" in e for e in result.sheets[0].evidence)
+
+
+@pytest.mark.parametrize(
+    "text", ["拆除墙体尺寸图", "地坪布置图", "灯具控制连线图", "DEMOLITION DIMENSIONS"]
+)
+@pytest.mark.parametrize("tag", ["TYPE_X_家具平面图", "SHEET_TITLE"])
+def test_native_frame_title_field_retains_non_keyword_actual_title(text, tag):
+    block = framed_title("sheet", "FOO-D-42", (850, 20), (80, 0, 900, 440))
+    block[1].geometry["tag"] = "CUSTOM_CODE_FIELD"
+    block[2].text = text
+    block[2].geometry["tag"] = tag
+    result = expand(block)
+    assert result.sheets[0].drawing_number == "FOO-D-42"
+    # The template describes the field, not the current drawing's classification.
+    assert "TYPE_X_家具平面图" not in (result.sheets[0].title or "")
+
+
+def test_title_template_semantics_without_native_frame_are_not_extra_page_proof():
+    block = title_block("sheet", "FOO-D-42", (850, 20))
+    block[2].text = "DEMOLITION DIMENSIONS"
+    block[2].geometry["tag"] = "TYPE_X_家具平面图"
+    result = expand(block)
+    assert not any("NATIVE_CLOSED_FRAME" in e for e in result.sheets[0].evidence)

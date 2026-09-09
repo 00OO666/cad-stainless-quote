@@ -358,7 +358,9 @@ def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPa
         parent_name = str(parent.geometry.get("name") or "")
         if _CALLOUT_BLOCK_RE.search(parent_name):
             continue
+        frame_boxes = tuple(_native_frame_boxes(parent.geometry))
         sibling_texts: list[str] = []
+        framed_title_fields: list[str] = []
         for handle in parent.geometry.get("attribute_handles") or []:
             sibling = by_handle.get((entity.source_file_id, entity.space, str(handle)))
             if (
@@ -370,8 +372,22 @@ def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPa
                 and (sibling.source_file_id, sibling.space) == (parent.source_file_id, parent.space)
             ):
                 sibling_texts.append(sibling.text)
+                # A reusable title-block template can label its title field
+                # with drawing semantics even when the current text is e.g.
+                # demolition dimensions or lighting controls. This helps find
+                # its page identity only; the template tag is not the view kind.
+                tag = str(sibling.geometry.get("tag") or "")
+                if frame_boxes and (
+                    _SHEET_TITLE_RE.search(tag) or _STRONG_VIEW_TITLE_TAG_RE.search(tag)
+                ):
+                    framed_title_fields.append(sibling.text)
         title_texts = tuple(
-            dict.fromkeys(text for text in sibling_texts if _SHEET_TITLE_RE.search(text))
+            dict.fromkeys(
+                [
+                    *(text for text in sibling_texts if _SHEET_TITLE_RE.search(text)),
+                    *framed_title_fields,
+                ]
+            )
         )
         if not title_texts:
             continue
@@ -389,7 +405,7 @@ def _paper_page_references(paper_entities: Sequence[CadEntity]) -> list[_PaperPa
                 raw_text=entity.text or "",
                 issue=None if len(codes) == 1 else "UNPARSEABLE_OR_AMBIGUOUS_PAGE_NUMBER",
                 source_file_id=entity.source_file_id,
-                frame_boxes=tuple(_native_frame_boxes(parent.geometry)),
+                frame_boxes=frame_boxes,
             )
         )
     return sorted(output, key=lambda value: (value.space, value.code or "", value.entity_id))

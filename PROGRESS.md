@@ -16,6 +16,10 @@ line/polyline geometry, with transformed vertices, handle chains and explicit
 resource/completeness limits. Page association uses a frame containing the
 whole viewport and the same parent block's page attributes. It no longer
 needs to mistake a nearby reciprocal view title for the owning sheet.
+Native framed title fields also retain pages whose actual titles use demolition,
+lighting-control or other wording outside the ordinary title keyword list.
+Template field semantics identify the title slot; they never replace the actual
+drawing title or classify its current view type.
 The old INSERT insertion-point bbox remains unchanged. Ignored non-frame
 graphics are reported; no unsupported graphic is treated as proof of absence.
 
