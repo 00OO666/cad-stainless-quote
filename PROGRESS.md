@@ -4,6 +4,28 @@
 
 ## 当前结论
 
+### Candidate resolution and auditable calculation drafts
+
+Private development now distinguishes a resolved dimension role, a calculable
+per-instance result, an aggregate quantity and a fully verified quotation row.
+Repeated views of the same source component are retained for traceability but
+are not summed as separate physical objects. Proposed corrections are kept
+apart from the original reference workbook and its evaluation denominator.
+
+The development delivery adapter produces formula-based calculation drafts
+with native CAD evidence in a separate image sheet and row-level navigation.
+Image bytes remain unchanged; deduplicated embedding reduces memory use
+without discarding evidence references. Verification covers missing, textual,
+zero and fractional counts, formula recalculation, image relationships and
+immutable inputs. An original PNG and an embedded shape are not by themselves
+proof that a crop satisfies the complete evidence contract.
+
+This is a private, known-sample research and delivery update, not a new
+production resolver. Customer-specific adapters, drawings, images, dimensions,
+results and local accuracy statistics are not published. The installed skill
+and production pipeline are unchanged; unresolved physical quantities stay
+blank and no new autonomous accuracy claim is made.
+
 ### Exact native index scope and semantic-binding research
 
 The native index-direction CLI/API now accepts an explicit, canonical list of
