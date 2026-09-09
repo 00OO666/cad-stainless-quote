@@ -4,6 +4,26 @@
 
 ## 当前结论
 
+### Exact native index scope and semantic-binding research
+
+The native index-direction CLI/API now accepts an explicit, canonical list of
+drawing page codes, covering custom sheet families without silently broadening
+legacy discovery. Material namespaces are excluded, including non-metal codes.
+Same-parent attributes, visibility, unique arrow geometry and viewport mapping
+remain separate gates. Synthetic tests cover custom families, canonical exact
+matching, material-code rejection and ambiguous or hidden symbols. See
+[navigation usage and limits](docs/detail-navigation.md).
+
+Private development now traces visible section paths connected outside an index
+block, rather than assuming all reference geometry lives inside that block.
+Native plan titles with additional words are retained during research discovery.
+Repeated outlines, nested projected boundaries and numerical cross-view agreement
+still do not by themselves establish material ownership, local units or quantity.
+These research modules and case findings remain private; they are not new
+automatic quotation resolvers. The optional index API is implemented in source,
+but the installed personal skill is unchanged and no end-to-end accuracy or
+human-time-saving percentage is claimed.
+
 ### Repeatable development replay and file-access diagnostics
 
 Added an optional [file-boundary audit](devtools/replay-boundary-audit/README.md) for developer replay scripts. It records observable Python file access, restricts data inputs to declared sources, separates fresh outputs from preexisting results, and retains source hashes and denied attempts. Synthetic tests exercise direct opens, descriptors, hard links, child-process attempts, and generated CAD/plot outputs. This is not an operating-system sandbox, a security guarantee, or a blind-accuracy certificate.

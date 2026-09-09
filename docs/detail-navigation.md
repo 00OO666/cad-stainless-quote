@@ -64,6 +64,27 @@ All pricing, measurement, physical binding and screenshot confirmation gates rem
 family, in addition to circular curved-base hatches. Unsupported or competing
 arrows remain unresolved; a resolved arrow vector is not a confirmed view binding.
 
+For a custom drawing-code family, the CLI accepts repeated `--page-code` arguments
+and the Python API accepts `page_codes=[...]`. Obtain these exact codes from the
+native sheet catalogue; do not supply a material number or infer a code from a
+dimension. Without this option the legacy family filter is unchanged. With it,
+canonical exact matching is used, not a prefix or numerical-nearest match. The
+reserved `GC-*` and `MT-*` material namespaces are rejected, including non-metal
+materials. Canonical drawing references currently support one or two prefix
+segments of up to four alphanumeric characters each; longer custom prefixes are
+not supported by this interface.
+
+```powershell
+scripts/run.ps1 index-directions drawing.dxf --source-file-id file-id --layout Layout1 --page-code B7-ZE-82 --page-code B7-WE-83 --out review/index-directions.json
+```
+
+The explicit scope cannot bypass same-parent attribute ownership, unique arrow
+geometry, visibility, native viewport projection or resource limits. The output
+retains requested codes, raw values and the selection basis. It remains REVIEW:
+a recognised arrow/page pair is neither a billable instance nor an accepted
+plan-to-component binding. This optional CLI/API is not automatically invoked
+by the production quotation workflow.
+
 Tests use synthetic CAD only. Runtime manifests and drawing images are private;
 none belong in this repository. Navigation success is not end-to-end accuracy or
 evidence of a particular percentage of human time saved.

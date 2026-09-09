@@ -789,6 +789,7 @@ def command_index_directions(args: argparse.Namespace) -> int:
         ezdxf.readfile(args.dxf), source_file_id=args.source_file_id,
         layout_name=args.layout, max_inserts=args.max_inserts,
         max_block_entities=args.max_block_entities,
+        page_codes=getattr(args, "page_codes", None),
     )
     result.update(source_path=str(args.dxf.resolve()), source_sha256=source_hash)
     write_json_atomic(args.out, result)
@@ -1874,6 +1875,10 @@ def build_parser() -> argparse.ArgumentParser:
     index_directions.add_argument("--out", type=Path, required=True)
     index_directions.add_argument("--max-inserts", type=int, default=2000)
     index_directions.add_argument("--max-block-entities", type=int, default=256)
+    index_directions.add_argument(
+        "--page-code", action="append", dest="page_codes",
+        help="精确原生图号，可重复；支持自定义图号族，不代表构件归属已确认",
+    )
     index_directions.set_defaults(handler=command_index_directions)
 
     takeoff = subparsers.add_parser("takeoff", help="组装构件并生成尺寸候选/算量草稿")

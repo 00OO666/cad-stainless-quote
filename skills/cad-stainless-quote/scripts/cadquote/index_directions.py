@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from copy import deepcopy
 
 from ezdxf.math import Vec3, bulge_to_arc
@@ -101,15 +102,33 @@ def extract_index_directions(
     layout_name: str,
     max_inserts: int = 2000,
     max_block_entities: int = 256,
+    page_codes: Sequence[str] | None = None,
 ):
     """Inspect only a named native layout; never read human rows or dimensions.
 
-    Current family: circular callout plus filled, curved-base radial arrowhead.
+    Supported symbols: circular callout with a radial wedge or five-point chevron.
     Native INSERT matrix supplies rotation, base point and reflection. Geometry
     is in layout WCS. A separate viewport mapping is required for model use.
+
+    Optional page_codes are exact drawing references from a caller's native
+    sheet inventory. They permit project-defined families without widening the
+    default regex to arbitrary material codes or dimension labels. An allowlist
+    is retrieval scope, never evidence that a component belongs to that sheet.
     """
     if not source_file_id or max_inserts < 1 or max_block_entities < 1:
         raise ValueError("source identity and positive resource limits are required")
+    from .linking import normalize_reference_code
+
+    allowed = None
+    if page_codes is not None:
+        if isinstance(page_codes, (str, bytes)) or not page_codes:
+            raise ValueError("page_codes requires a nonempty sequence of exact drawing codes")
+        allowed = set()
+        for value in page_codes:
+            code = normalize_reference_code(value) if isinstance(value, str) else None
+            if code is None or re.match(r"^(?:MT|GC)-", code):
+                raise ValueError("page_codes contains an invalid or material reference")
+            allowed.add(code)
     layout = doc.layouts.get(layout_name)
     records, truncated = [], False
     examined = 0
@@ -132,10 +151,18 @@ def extract_index_directions(
             or re.fullmatch(r"E\d+", a.dxf.tag.upper())
         ]
         # No proximity join, and no forced page-code rewrite between code families.
-        if not any(
-            re.fullmatch(r"(?:[A-Z0-9]+-)*(?:EL|E|QS|DE|DT|D)-?\d{1,3}", a.dxf.text.strip(), re.I)
-            for a in pages
-        ):
+        if allowed is None:
+            eligible = any(
+                re.fullmatch(
+                    r"(?:[A-Z0-9]+-)*(?:EL|E|QS|DE|DT|D)-?\d{1,3}",
+                    a.dxf.text.strip(),
+                    re.I,
+                )
+                for a in pages
+            )
+        else:
+            eligible = any(normalize_reference_code(a.dxf.text) in allowed for a in pages)
+        if not eligible:
             continue
         row = {
             "source_file_id": source_file_id,
@@ -157,12 +184,22 @@ def extract_index_directions(
             "physical_component_id": None,
             "physical_quantity": None,
             "view_binding_confirmed": False,
+            "page_selection_basis": (
+                "EXACT_NATIVE_PAGE_QUERY" if allowed is not None else "LEGACY_REFERENCE_FAMILY"
+            ),
         }
         records.append(row)
         if len(pages) != 1 or len(views) != 1 or not re.fullmatch(r"\d{1,3}", views[0].dxf.text):
             row["reason_codes"].append("AMBIGUOUS_OR_MISSING_SAME_PARENT_ATTRIBUTES")
             continue
-        row.update(page_code=pages[0].dxf.text.strip().upper(), view_number=views[0].dxf.text)
+        row.update(
+            page_code=(
+                normalize_reference_code(pages[0].dxf.text)
+                if allowed is not None
+                else pages[0].dxf.text.strip().upper()
+            ),
+            view_number=views[0].dxf.text,
+        )
         if not _visible(insert, doc):
             row["reason_codes"].append("HIDDEN_INSERT")
             continue
@@ -255,6 +292,7 @@ def extract_index_directions(
         "truncated": truncated,
         "inserts_examined": min(examined, max_inserts),
         "limits": {"max_inserts": max_inserts, "max_block_entities": max_block_entities},
+        "requested_page_codes": sorted(allowed) if allowed is not None else None,
         "summary": dict(Counter(r["geometry_state"] for r in records)),
         "records": records,
     }
