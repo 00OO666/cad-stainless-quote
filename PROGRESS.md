@@ -4,6 +4,28 @@
 
 ## 当前结论
 
+### Complete review coverage without conflating partial and accepted quantities
+
+The private development review now carries explicit calculation scenarios for
+local subcomponents, conditional whole-assembly projections, alternative
+measurement policies and excluded wrong-object matches. A whole-assembly draft
+may be presented under a clearly stated policy; that does not convert it into
+verified net material, a production-ready row or an accepted business rule.
+Partial geometry remains separate from the original row's unresolved total.
+
+Independent source review caught two important failure modes: collinear viewing
+symbols do not prove that the viewed objects are identical, and a dimension to
+an intermediate datum need not cover a lower structural return. Such corrections
+are retained as counterexamples, not selected by closeness to a reference total.
+Workbook validation preserves original evidence bytes, all prior row identities
+and image references while checking count drivers, measurement-policy guards,
+native recalculation and source immutability.
+
+This is a known-sample research delivery, not a newly released automatic
+resolver. The installed skill, production pipeline and historical acceptance
+results remain unchanged. Only this generic progress note is public; customer
+inputs, evidence, measured values, case-specific scripts and results stay private.
+
 ### Room-scoped count review and measurement-basis separation
 
 Private review now tests opposing-end construction and orthogonal view bindings
